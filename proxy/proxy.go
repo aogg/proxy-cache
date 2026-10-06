@@ -493,7 +493,8 @@ func etagNotModified(r *http.Request, h http.Header) bool {
 	if r.Method != http.MethodGet {
 		return false
 	}
-	etag := h.Get("ETag")
+	// RFC 9110：If-None-Match 按弱比较语义匹配，两侧统一剥掉 W/ 前缀后再比对。
+	etag := strings.TrimPrefix(h.Get("ETag"), "W/")
 	inm := r.Header.Get("If-None-Match")
 	if etag == "" || inm == "" {
 		return false
