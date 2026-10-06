@@ -1,0 +1,22 @@
+# 版本库与本文件本身
+.git
+.gitignore
+.dockerignore
+
+# 运行时与本地文件（不打入镜像上下文）
+cache/
+config.yaml
+*.log
+tmp/
+.hermes/
+
+# 本地编译产物
+proxy-cache
+proxy-cache.exe
+bin/
+dist/
+
+# 测试产物
+*.test
+*.out
+coverage.*

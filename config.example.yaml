@@ -1,0 +1,77 @@
+# ============================================================================
+# proxy-cache 配置示例
+# 复制为 config.yaml 后按需修改；启动: ./proxy-cache -c config.yaml
+# 所有时长支持: 30s / 30m / 1h30m（Go duration）、纯数字（按秒）、2d（天）、1w（周）
+# ============================================================================
+
+# HTTP 服务监听地址
+listen: "0.0.0.0:8080"
+
+# 回源请求（含 url-redirect 候选请求）的总超时
+timeout: 60s
+
+# 全局上游代理（http/https/socks5 地址），所有回源请求都会走它；留空表示直连
+# 域名规则里可用 http-proxy 单独覆盖
+http-proxy: ""
+# http-proxy: "http://127.0.0.1:7890"
+
+# url-redirect 候选的成功判据：
+#   status  - HTTP 200 即算成功
+#   content - HTTP 200 且 body 非空才算成功（默认，防止镜像返回空内容/软 404）
+success-check: content
+
+# 所有 url-redirect 候选都失败后，是否回退直接请求原始 URL
+fallback-direct: true
+
+# url-redirect：回源镜像/上游代理模板列表
+# $1（或 ${1}）会被替换为原始目标 URL，例如：
+#   https://hk.gh-proxy.org/$1 + https://raw.githubusercontent.com/a/b
+#   => https://hk.gh-proxy.org/https://raw.githubusercontent.com/a/b
+# 按 round-robin 轮换起始下标逐个尝试（第 1 个请求从第 1 条开始，第 2 个请求从第 2 条开始……），
+# 只要有一个候选通过 success-check 即返回并写缓存；候选全部失败时按 fallback-direct 处理
+url-redirect:
+  - https://hk.gh-proxy.org/$1
+  - https://gh-proxy.com/$1
+  - https://mirror.ghproxy.com/$1
+
+# 缓存配置
+cache:
+  enabled: true              # 是否启用缓存
+  path: ./cache-data         # 缓存目录（默认 ./cache-data；命名避免与源码 cache/ 包目录混用）
+  ttl: 30m                   # 默认缓存时长（域名规则可覆盖）
+  clean-interval: 10m    # 后台过期清理扫描间隔（<=0 关闭；读取命中过期条目时也会惰性删除）
+
+# 域名/URL 规则（自上而下，第一条命中的规则生效）
+# match 为正则表达式，对请求的完整目标 URL 做非锚定匹配，两种写法均可：
+#   .*https://[^.]+\.githubusercontent\.com
+#   raw\.githubusercontent\.com
+domain-rules:
+  - name: githubusercontent
+    match: '.*https://[^.]+\.githubusercontent\.com'
+    cache:
+      enabled: true
+      ttl: 6h                # raw 文件内容较稳定，缓存更久
+    # ---- 以下均为可选覆盖项，不写则沿用全局配置 ----
+    # http-proxy: "http://127.0.0.1:7890"   # 该规则的回源走指定代理
+    # success-check: status                  # 该规则 200 即算成功
+    # fallback-direct: false                 # 候选全败时不回退直连
+    # timeout: 120s                          # 该规则回源超时
+    # url-redirect:                          # 该规则专用候选列表（设为 [] 表示该规则直连回源）
+    #   - https://gh-proxy.com/$1
+
+  - name: github-release
+    match: 'github\.com/[^/]+/[^/]+/releases/download/'
+    cache:
+      ttl: 1h                # release 附件缓存 1 小时
+
+  - name: github-archive
+    match: 'github\.com/[^/]+/[^/]+/(archive|releases)/'
+    cache:
+      enabled: false         # zip/tar 大文件不走缓存
+
+# 允许/拒绝列表（正则，对完整目标 URL 匹配，优先级高于缓存与回源）
+# deny-list 命中即拒绝（403）；allow-list 非空时为白名单模式（未命中即拒绝 403）
+allow-list: []
+#  - 'https://raw\.githubusercontent\.com/'
+deny-list: []
+#  - 'example\.com'

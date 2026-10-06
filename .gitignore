@@ -1,0 +1,26 @@
+# 运行时缓存目录（默认 ./cache-data）
+cache-data/
+
+# 若手工把 cache.path 改为 ./cache：忽略目录内运行时文件，但保留源码文件
+/cache/*
+!/cache/cache.go
+
+# 本地私有配置（示例见 config.example.yaml，含私有代理地址时勿提交）
+config.yaml
+
+# 编译产物
+proxy-cache
+proxy-cache.exe
+*.exe
+bin/
+dist/
+
+# 日志与临时文件
+*.log
+tmp/
+.hermes/
+
+# Go 测试/覆盖率产物
+*.test
+*.out
+coverage.*
