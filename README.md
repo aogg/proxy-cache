@@ -12,7 +12,7 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **本地文件缓存**：目标 URL 的 sha256 作为缓存键，命中返回 `X-Cache: HIT`，未命中回源后写缓存返回 `X-Cache: MISS`；TTL 过期自动失效（惰性删除 + 后台扫描），写入原子替换、并发安全，内置 singleflight 防缓存击穿
 - **url-redirect 多上游轮询回源**：`$1` 模板展开为多个候选代理 URL，round-robin **起始下标逐请求轮换**（第 1 个请求从第 1 条开始、第 2 个从第 2 条开始……），逐个尝试直到通过成功判据；全部失败可回退直连原始 URL
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）
-- **域名规则（domain-rules）**：正则匹配目标 URL，命中后覆盖 `cache.enabled`、`cache.ttl`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`timeout` 等配置
+- **域名规则（domain-rules）**：正则匹配目标 URL，命中后覆盖 `cache.enabled`、`cache.ttl`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`timeout` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
 - **上游代理支持**：全局与规则级 `http-proxy`（http/https/socks5），所有回源请求（含 url-redirect 候选请求）均可走代理
 - **allow-list / deny-list**：正则白/黑名单访问控制（deny 优先，allow 非空即白名单模式）
 - **可观测性**：`X-Cache`（HIT/MISS/BYPASS）与 `X-Proxy-Upstream`（本次内容来源）响应头、结构化日志、`/healthz` 健康检查
@@ -124,6 +124,7 @@ docker run -d --name proxy-cache \
 | --- | --- | --- |
 | `name` | string | 规则名（可选，用于日志/`X-Cache` 观测） |
 | `match` | string | **必填**，正则表达式，对请求的**完整目标 URL** 做非锚定匹配，如 `.*https://[^.]+\.githubusercontent\.com` 或 `raw\.githubusercontent\.com` |
+| `exclude` | string[] | 排除正则列表（可选，支持多项）。`match` 命中后再逐个检查（同样对完整目标 URL 非锚定匹配），**任一命中即排除该规则**（视为不匹配，继续向下尝试后续规则）；全部不命中才应用本规则 |
 | `cache.enabled` | bool | 覆盖该规则的缓存开关 |
 | `cache.ttl` | duration | 覆盖该规则的缓存时长（必须 >0） |
 | `http-proxy` | string | 该规则回源走指定代理（覆盖全局） |
@@ -133,6 +134,8 @@ docker run -d --name proxy-cache \
 | `timeout` | duration | 该规则回源超时 |
 
 规则覆盖项均为「可选」：不写则沿用全局配置；**第一条命中的规则生效**（不做多规则叠加）。
+
+`exclude` 链式落位语义：某规则 match 命中但被 exclude 排除时，该规则视为不匹配，匹配流程**继续向下**尝试后续规则；后续规则也不命中（或同样被排除）则走全局默认配置。例如：githubusercontent 规则缓存 6h，exclude 掉 `dongchengjie/airport` 仓库后，该仓库的请求不再套用 6h 缓存，而是落到下一条规则或全局默认 `cache.ttl: 30m`。
 
 ## 配置示例
 
@@ -157,6 +160,8 @@ cache:
 domain-rules:
   - name: githubusercontent
     match: '.*https://[^.]+\.githubusercontent\.com'
+    exclude:                     # match 命中后任一 exclude 命中即排除本规则，
+      - 'dongchengjie/airport'   # 该仓库不套用 6h 缓存，落到下一条规则或全局默认
     cache:
       enabled: true
       ttl: 6h                # raw 内容缓存 6 小时

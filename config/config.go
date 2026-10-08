@@ -86,12 +86,18 @@ type RuleCache struct {
 
 // DomainRule 单条域名/URL 规则。match 为正则表达式，对请求的完整目标 URL 做
 // 非锚定匹配（因此 `.*https://[^.]+\.githubusercontent\.com` 与 `raw\.githubusercontent\.com`
-// 两种写法均可）；规则自上而下，第一条命中的规则生效。
+// 两种写法均可）；exclude 为可选的排除正则列表（同样对完整目标 URL 非锚定匹配），
+// match 命中后任一 exclude 命中即视为不匹配、继续向下尝试后续规则；
+// 规则自上而下，第一条命中的规则生效。
 type DomainRule struct {
 	// Name 规则名（可选，仅用于日志与观测）。
 	Name string `yaml:"name"`
 	// Match 匹配目标 URL 的正则表达式（必填）。
 	Match string `yaml:"match"`
+	// Exclude 排除正则列表（可选，可配置多个）：match 命中后逐个检查，
+	// 任一命中即排除该规则（视为不匹配，继续向下尝试后续规则）；
+	// 全部不命中才应用该规则。
+	Exclude []string `yaml:"exclude"`
 	// Cache 该规则下的缓存覆盖项（enabled / ttl）。
 	Cache RuleCache `yaml:"cache"`
 	// HTTPProxy 该规则回源时使用的上游代理（覆盖全局 http-proxy；空串表示直连）。
@@ -105,8 +111,10 @@ type DomainRule struct {
 	// Timeout 该规则回源请求的总超时。
 	Timeout *Duration `yaml:"timeout"`
 
-	// re 是 Match 编译后的正则（Validate 阶段填充，不参与 YAML 解析）。
-	re *regexp.Regexp
+	// re 是 Match 编译后的正则；excludeRe 是 Exclude 逐项编译后的正则列表
+	//（均在 Validate 阶段填充，不参与 YAML 解析）。
+	re        *regexp.Regexp
+	excludeRe []*regexp.Regexp
 }
 
 // label 返回规则的可读标识（优先 name，否则 match 原文）。
@@ -115,6 +123,20 @@ func (r *DomainRule) label() string {
 		return r.Name
 	}
 	return r.Match
+}
+
+// matches 判断该规则是否命中目标 URL：match 命中且该规则所有 exclude
+// 均不命中。任一 exclude 命中即视为不匹配（该规则被排除）。
+func (r *DomainRule) matches(targetURL string) bool {
+	if r.re == nil || !r.re.MatchString(targetURL) {
+		return false
+	}
+	for _, ex := range r.excludeRe {
+		if ex.MatchString(targetURL) {
+			return false // 命中任一 exclude，该规则被排除
+		}
+	}
+	return true
 }
 
 // CacheConfig 全局缓存配置。
@@ -263,6 +285,19 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("domain-rules[%d] (%s) 的 match 正则无效: %w", i, r.label(), err)
 		}
 		r.re = re
+		// exclude 正则逐个编译缓存（与 match 同样对完整目标 URL 非锚定匹配）
+		r.excludeRe = make([]*regexp.Regexp, 0, len(r.Exclude))
+		for j, pat := range r.Exclude {
+			pat = strings.TrimSpace(pat)
+			if pat == "" {
+				return fmt.Errorf("domain-rules[%d] (%s) 的 exclude 第 %d 项为空", i, r.label(), j)
+			}
+			ex, err := regexp.Compile(pat)
+			if err != nil {
+				return fmt.Errorf("domain-rules[%d] (%s) 的 exclude 第 %d 项正则无效: %w", i, r.label(), j, err)
+			}
+			r.excludeRe = append(r.excludeRe, ex)
+		}
 		// 规则级覆盖项合法性
 		if r.Cache.TTL != nil && r.Cache.TTL.D() <= 0 {
 			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.ttl 必须大于 0", i, r.label())
@@ -331,7 +366,9 @@ func (c *Config) ResolveOptions(targetURL string) Options {
 	// //////////////////  应用第一条命中的域名规则覆盖项  start  ////////////////////////////////////////////////
 	for i := range c.DomainRules {
 		r := &c.DomainRules[i]
-		if r.re == nil || !r.re.MatchString(targetURL) {
+		// match 命中且该规则所有 exclude 均不命中才应用；
+		// 被 exclude 排除的规则视为不匹配，继续向下尝试后续规则。
+		if !r.matches(targetURL) {
 			continue
 		}
 		if r.Cache.Enabled != nil {

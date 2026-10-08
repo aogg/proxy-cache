@@ -45,9 +45,19 @@ cache:
 # match 为正则表达式，对请求的完整目标 URL 做非锚定匹配，两种写法均可：
 #   .*https://[^.]+\.githubusercontent\.com
 #   raw\.githubusercontent\.com
+# exclude（可选）为排除正则列表，同样对完整目标 URL 非锚定匹配：
+#   match 命中后再逐个检查 exclude，任一命中即排除本规则（视为不匹配），
+#   继续向下尝试后续规则（都不命中则走全局默认配置）
 domain-rules:
   - name: githubusercontent
     match: '.*https://[^.]+\.githubusercontent\.com'
+    # 排除列表（可选，支持多个、支持正则）：下面示例让 dongchengjie/airport 仓库
+    # 不套用本规则的 6h 缓存，落到下一条规则（github-release / github-archive）
+    # 或全局默认配置（ttl: 30m）
+    exclude:
+      - 'dongchengjie/airport'
+      # - 'someuser/somerepo'   # 支持配置多个，任一命中即排除
+      # - '/branches/'          # 支持任意正则
     cache:
       enabled: true
       ttl: 6h                # raw 文件内容较稳定，缓存更久
