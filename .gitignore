@@ -5,6 +5,7 @@ cache-data/
 /cache/*
 !/cache/cache.go
 !/cache/manager.go
+!/cache/manager_test.go
 
 # 本地私有配置（示例见 config.example.yaml，含私有代理地址时勿提交）
 config.yaml
