@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -60,13 +61,23 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	diskCache, err := cache.New(cfg.Cache.Path)
-	if err != nil {
-		return err
+	// 缓存管理器：按目录复用 Cache 实例（全局目录 + 各规则独立目录），janitor 随信号 ctx 取消退出
+	cacheMgr := cache.NewManager(ctx)
+	// 启动预热：一次性创建全部可能被写入的缓存目录并启动各自后台清理，失败直接终止启动
+	//（含全局关闭缓存、命中规则才开启的规则独立目录）
+	activeDirs := cfg.ActiveCacheDirs()
+	preheatDirs := make([]string, 0, len(activeDirs))
+	for dir := range activeDirs {
+		preheatDirs = append(preheatDirs, dir)
 	}
-	diskCache.StartJanitor(ctx, cfg.Cache.CleanInterval.D())
+	sort.Strings(preheatDirs) // 排序保证预热与日志输出顺序稳定
+	for _, dir := range preheatDirs {
+		if _, err := cacheMgr.Acquire(dir, activeDirs[dir]); err != nil {
+			return err
+		}
+	}
 
-	srv, err := proxy.New(cfg, diskCache, logger)
+	srv, err := proxy.New(cfg, cacheMgr, logger)
 	if err != nil {
 		return err
 	}
@@ -90,12 +101,20 @@ func run() error {
 		"listen", ln.Addr().String(),
 		"config", path,
 		"cache_enabled", cfg.Cache.Enabled,
-		"cache_path", cfg.Cache.Path,
+		"cache_dirs", len(activeDirs),
 		"cache_ttl", cfg.Cache.TTL.String(),
 		"url_redirect", len(cfg.URLRedirect),
 		"domain_rules", len(cfg.DomainRules),
 		"http_proxy", cfg.HTTPProxy,
 	)
+	// 逐目录输出缓存预热结果（source 标明全局目录还是规则独立目录）
+	for _, dir := range preheatDirs {
+		source := "rule" // 规则独立缓存目录
+		if dir == cfg.Cache.Path {
+			source = "global"
+		}
+		logger.Info("缓存目录已就绪", "dir", dir, "clean_interval", activeDirs[dir].String(), "source", source)
+	}
 	logger.Info("使用示例: curl -i http://" + displayAddr(ln.Addr()) + "/https://raw.githubusercontent.com/user/repo/main/README.md")
 	// //////////////////  启动 HTTP 服务  end  ////////////////////////////////////////////////
 

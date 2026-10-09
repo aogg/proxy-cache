@@ -77,11 +77,19 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 }
 
 // RuleCache 域名规则中的缓存覆盖项；指针为 nil 表示该项不覆盖、沿用全局配置。
+// 规则可配独立缓存目录（cache.path）与独立清理间隔（cache.clean-interval），
+// 支持「全局 cache.enabled: false 关闭缓存、命中规则的流量按规则开启并写入各自目录」。
 type RuleCache struct {
 	// Enabled 覆盖缓存开关。
 	Enabled *bool `yaml:"enabled"`
 	// TTL 覆盖该规则的缓存时长。
 	TTL *Duration `yaml:"ttl"`
+	// Path 覆盖该规则的缓存目录（独立目录，实现按规则分目录缓存）；
+	// trim 后为空表示未配置、沿用全局 cache.path。
+	Path *string `yaml:"path"`
+	// CleanInterval 覆盖该规则缓存目录的后台过期清理扫描间隔；
+	// 非 nil 且 <0 视为配置错误（Validate 拒绝），0 表示关闭该目录的后台清理。
+	CleanInterval *Duration `yaml:"clean-interval"`
 }
 
 // DomainRule 单条域名/URL 规则。match 为正则表达式，对请求的完整目标 URL 做
@@ -188,6 +196,10 @@ type Options struct {
 	CacheEnabled bool
 	// CacheTTL 该请求的缓存时长。
 	CacheTTL time.Duration
+	// CachePath 该请求读写缓存使用的目录（规则可配独立目录；未配置沿用全局 cache.path）。
+	CachePath string
+	// CacheCleanInterval 该请求生效的缓存后台清理扫描间隔（<=0 表示关闭后台清理）。
+	CacheCleanInterval time.Duration
 	// HTTPProxy 该请求回源使用的上游代理（空串表示直连）。
 	HTTPProxy string
 	// URLRedirect 该请求生效的 url-redirect 模板列表。
@@ -302,6 +314,10 @@ func (c *Config) Validate() error {
 		if r.Cache.TTL != nil && r.Cache.TTL.D() <= 0 {
 			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.ttl 必须大于 0", i, r.label())
 		}
+		// cache.path 允许为空（trim 后空 = 未配置，沿用全局 cache.path），无需校验
+		if r.Cache.CleanInterval != nil && r.Cache.CleanInterval.D() < 0 {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.clean-interval 必须大于等于 0", i, r.label())
+		}
 		if r.HTTPProxy != nil && strings.TrimSpace(*r.HTTPProxy) != "" {
 			if err := validateProxyAddr(*r.HTTPProxy); err != nil {
 				return fmt.Errorf("domain-rules[%d] (%s) 的 http-proxy 无效: %w", i, r.label(), err)
@@ -353,13 +369,15 @@ func (c *Config) fallbackDirect() bool {
 func (c *Config) ResolveOptions(targetURL string) Options {
 	// //////////////////  全局默认值  start  ////////////////////////////////////////////////
 	o := Options{
-		CacheEnabled:   c.Cache.Enabled,
-		CacheTTL:       c.Cache.TTL.D(),
-		HTTPProxy:      strings.TrimSpace(c.HTTPProxy),
-		URLRedirect:    c.URLRedirect,
-		SuccessCheck:   c.SuccessCheck,
-		FallbackDirect: c.fallbackDirect(),
-		Timeout:        c.Timeout.D(),
+		CacheEnabled:       c.Cache.Enabled,
+		CacheTTL:           c.Cache.TTL.D(),
+		CachePath:          c.Cache.Path,
+		CacheCleanInterval: c.Cache.CleanInterval.D(),
+		HTTPProxy:          strings.TrimSpace(c.HTTPProxy),
+		URLRedirect:        c.URLRedirect,
+		SuccessCheck:       c.SuccessCheck,
+		FallbackDirect:     c.fallbackDirect(),
+		Timeout:            c.Timeout.D(),
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
@@ -376,6 +394,15 @@ func (c *Config) ResolveOptions(targetURL string) Options {
 		}
 		if r.Cache.TTL != nil {
 			o.CacheTTL = r.Cache.TTL.D()
+		}
+		// 规则可配独立缓存目录：trim 后非空才覆盖（空 = 未配置，沿用全局 cache.path）
+		if r.Cache.Path != nil {
+			if p := strings.TrimSpace(*r.Cache.Path); p != "" {
+				o.CachePath = p
+			}
+		}
+		if r.Cache.CleanInterval != nil {
+			o.CacheCleanInterval = r.Cache.CleanInterval.D()
 		}
 		if r.HTTPProxy != nil {
 			o.HTTPProxy = strings.TrimSpace(*r.HTTPProxy)
@@ -397,6 +424,46 @@ func (c *Config) ResolveOptions(targetURL string) Options {
 	}
 	// //////////////////  应用第一条命中的域名规则覆盖项  end  ////////////////////////////////////////////////
 	return o
+}
+
+// ActiveCacheDirs 返回当前配置下可能被写入的缓存目录 -> 生效清理间隔，供启动预热使用
+//（启动时按此逐目录创建 Cache 实例并启动各自后台清理）。必须在 Validate 之后调用：
+//   - 全局 cache.enabled 为 true 时包含全局 cache.path + 全局 clean-interval；
+//   - 逐条规则判定其命中后缓存是否开启（规则 cache.enabled 显式值优先，否则沿用全局值），
+//     开启则取其生效 path（未配置沿用全局 path）与生效 clean-interval（未配置沿用全局）；
+//   - 同一路径首次出现的清理间隔生效（与 cache.Manager 按目录复用实例的语义一致）。
+func (c *Config) ActiveCacheDirs() map[string]time.Duration {
+	dirs := make(map[string]time.Duration)
+	if c.Cache.Enabled {
+		dirs[c.Cache.Path] = c.Cache.CleanInterval.D()
+	}
+	for i := range c.DomainRules {
+		r := &c.DomainRules[i]
+		// 规则 cache.enabled 显式值优先，否则沿用全局开关
+		enabled := c.Cache.Enabled
+		if r.Cache.Enabled != nil {
+			enabled = *r.Cache.Enabled
+		}
+		if !enabled {
+			continue
+		}
+		// 生效 path：规则未配置（trim 后为空）沿用全局目录
+		path := c.Cache.Path
+		if r.Cache.Path != nil {
+			if p := strings.TrimSpace(*r.Cache.Path); p != "" {
+				path = p
+			}
+		}
+		// 生效 clean-interval：规则未配置沿用全局值
+		clean := c.Cache.CleanInterval.D()
+		if r.Cache.CleanInterval != nil {
+			clean = r.Cache.CleanInterval.D()
+		}
+		if _, ok := dirs[path]; !ok { // 同一路径首次出现的清理间隔生效
+			dirs[path] = clean
+		}
+	}
+	return dirs
 }
 
 // CheckACL 校验目标 URL 是否被 allow-list / deny-list 放行：

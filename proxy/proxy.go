@@ -42,8 +42,8 @@ var forwardRequestHeaders = []string{
 type Server struct {
 	// cfg 已校验的运行期只读配置。
 	cfg *config.Config
-	// cache 文件缓存（可为 nil 表示禁用缓存，简化外部注入）。
-	cache *cache.Cache
+	// caches 按目录复用缓存实例的管理器（nil 表示禁用缓存，简化外部注入）。
+	caches *cache.Manager
 	// log 结构化日志器。
 	log *slog.Logger
 	// rr url-redirect 轮询起始下标计数器：第 1 个使用该列表的请求从 0 开始，
@@ -56,11 +56,12 @@ type Server struct {
 }
 
 // New 创建 Server：预编译全局与各域名规则用到的上游代理客户端。
-func New(cfg *config.Config, diskCache *cache.Cache, logger *slog.Logger) (*Server, error) {
+// caches 传 nil 表示禁用缓存；多目录场景由 Manager 按生效目录复用实例。
+func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{cfg: cfg, cache: diskCache, log: logger}
+	s := &Server{cfg: cfg, caches: caches, log: logger}
 
 	// 收集全部可能用到的上游代理地址（空串代表直连），各建一个可复用 Client
 	proxySet := map[string]struct{}{"": {}}
@@ -188,6 +189,19 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	cacheable := eff.CacheEnabled && eff.CacheTTL > 0 &&
 		r.Header.Get("Range") == "" && !clientNoCache(r)
 
+	// 解析本请求生效的缓存实例：规则可配独立缓存目录，按生效目录向管理器获取（复用已预热实例）；
+	// 获取失败时本次请求降级为直接回源（BYPASS），不中断服务
+	var disk *cache.Cache
+	if cacheable {
+		c, err := s.cacheFor(eff)
+		if err != nil {
+			s.log.Warn("获取缓存实例失败，本次请求降级为直接回源", "dir", eff.CachePath, "err", err)
+			cacheable = false
+		} else {
+			disk = c
+		}
+	}
+
 	if !cacheable {
 		// //////////////////  不走缓存：直接按生效配置回源  start  ////////////////////////////////////////////////
 		e, err := s.fetchViaCandidates(r, target, eff)
@@ -201,8 +215,8 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	}
 
 	// //////////////////  查缓存：命中直接回放  start  ////////////////////////////////////////////////
-	if s.cache != nil {
-		if e, ok := s.cache.Get(key); ok {
+	if disk != nil {
+		if e, ok := disk.Get(key); ok {
 			s.serveEntry(w, r, e, "HIT", eff, start)
 			return
 		}
@@ -210,6 +224,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	// //////////////////  查缓存：命中直接回放  end  ////////////////////////////////////////////////
 
 	// //////////////////  未命中：单飞回源并写缓存  start  ////////////////////////////////////////////////
+	// 单飞 key 仍为目标 URL 的 sha256：同一 URL 永远命中同一规则/目录，必然落同一缓存实例
 	e, err := s.flight.Do(key, func() (*cache.Entry, error) {
 		ent, ferr := s.fetchViaCandidates(r, target, eff)
 		if ferr != nil {
@@ -218,8 +233,8 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		// 仅缓存满足成功判据的 200 响应
 		if ent.Status == http.StatusOK && checkSuccess(ent, eff.SuccessCheck) {
 			ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目
-			if s.cache != nil {
-				if serr := s.cache.Set(key, ent); serr != nil {
+			if disk != nil {
+				if serr := disk.Set(key, ent); serr != nil {
 					s.log.Warn("写入缓存失败", "key", key, "target", target, "err", serr)
 				}
 			}
@@ -232,6 +247,15 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	}
 	s.serveEntry(w, r, e, "MISS", eff, start)
 	// //////////////////  未命中：单飞回源并写缓存  end  ////////////////////////////////////////////////
+}
+
+// cacheFor 返回该请求生效的缓存实例（按生效目录向管理器获取，同目录复用）；
+// caches 为 nil（禁用缓存）时返回 (nil, nil)。目录创建失败时返回错误，由调用方降级处理。
+func (s *Server) cacheFor(eff config.Options) (*cache.Cache, error) {
+	if s.caches == nil {
+		return nil, nil
+	}
+	return s.caches.Acquire(eff.CachePath, eff.CacheCleanInterval)
 }
 
 // fetchViaCandidates 回源获取目标内容：

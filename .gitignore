@@ -4,6 +4,7 @@ cache-data/
 # 若手工把 cache.path 改为 ./cache：忽略目录内运行时文件，但保留源码文件
 /cache/*
 !/cache/cache.go
+!/cache/manager.go
 
 # 本地私有配置（示例见 config.example.yaml，含私有代理地址时勿提交）
 config.yaml

@@ -36,7 +36,7 @@ url-redirect:
 
 # 缓存配置
 cache:
-  enabled: true              # 是否启用缓存
+  enabled: true              # 是否启用缓存（全局关闭后仍可在 domain-rules 内按规则开启，见下方场景示例）
   path: ./cache-data         # 缓存目录（默认 ./cache-data；命名避免与源码 cache/ 包目录混用）
   ttl: 30m                   # 默认缓存时长（域名规则可覆盖）
   clean-interval: 10m    # 后台过期清理扫描间隔（<=0 关闭；读取命中过期条目时也会惰性删除）
@@ -61,6 +61,8 @@ domain-rules:
     cache:
       enabled: true
       ttl: 6h                # raw 文件内容较稳定，缓存更久
+      # path: ./cache-raw            # 规则独立缓存目录（不写沿用全局 cache.path；写独立目录即按规则分目录缓存）
+      # clean-interval: 30m          # 该目录的后台清理间隔（不写沿用全局 cache.clean-interval；<=0 关闭）
     # ---- 以下均为可选覆盖项，不写则沿用全局配置 ----
     # http-proxy: "http://127.0.0.1:7890"   # 该规则的回源走指定代理
     # success-check: status                  # 该规则 200 即算成功
@@ -78,6 +80,18 @@ domain-rules:
     match: 'github\.com/[^/]+/[^/]+/(archive|releases)/'
     cache:
       enabled: false         # zip/tar 大文件不走缓存
+
+  # ---- 场景示例：全局关缓存，仅命中规则的流量开启独立缓存 ----
+  # 把上面全局 cache.enabled 改为 false 后，取消本块注释即可：
+  # 未命中任何规则的流量不缓存（BYPASS），命中本规则的流量才缓存，且写入规则自己的
+  # 独立目录 ./cache-raw（与全局 cache.path 互不影响，各自独立清理）
+  # - name: raw-only
+  #   match: '.*https://[^.]+\.githubusercontent\.com'
+  #   cache:
+  #     enabled: true          # 规则内显式开启（优先于全局开关）
+  #     path: ./cache-raw      # 规则独立缓存目录（不写则沿用全局 cache.path）
+  #     ttl: 6h
+  #     clean-interval: 30m    # 该目录的后台清理间隔（不写则沿用全局 cache.clean-interval）
 
 # 允许/拒绝列表（正则，对完整目标 URL 匹配，优先级高于缓存与回源）
 # deny-list 命中即拒绝（403）；allow-list 非空时为白名单模式（未命中即拒绝 403）
