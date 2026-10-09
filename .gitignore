@@ -4,6 +4,7 @@ cache-data/
 # 若手工把 cache.path 改为 ./cache：忽略目录内运行时文件，但保留源码文件
 /cache/*
 !/cache/cache.go
+!/cache/cache_test.go
 !/cache/manager.go
 !/cache/manager_test.go
 
