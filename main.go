@@ -27,7 +27,8 @@ import (
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "启动失败:", err)
+		// 启动失败走 slog Error（此时若 run 已重建默认日志器，则按生效级别输出）
+		slog.Default().Error("启动失败", "err", err)
 		os.Exit(1)
 	}
 }
@@ -56,6 +57,13 @@ func run() error {
 		return err
 	}
 	// //////////////////  加载配置  end  ////////////////////////////////////////////////
+
+	// //////////////////  按配置重建日志器  start  ////////////////////////////////////////////////
+	// loadConfig 成功后立刻按生效的 log.level 重建 slog 默认日志器：
+	// 后续 proxy / cache / config 全链路日志均按该级别生效
+	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel()}))
+	slog.SetDefault(logger)
+	// //////////////////  按配置重建日志器  end  ////////////////////////////////////////////////
 
 	// //////////////////  初始化缓存与代理服务  start  ////////////////////////////////////////////////
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -107,6 +115,7 @@ func run() error {
 		"version", proxy.Version,
 		"listen", ln.Addr().String(),
 		"config", path,
+		"log_level", cfg.LogLevel().String(),
 		"cache_enabled", cfg.Cache.Enabled,
 		"cache_dirs", len(activeDirs),
 		"cache_ttl", cacheTTLLog,

@@ -37,8 +37,8 @@ func ruleCacheCfg(name string, rc RuleCache) DomainRule {
 // 显式覆盖生效；未配置（或 path 为空白串）沿用全局；enabled 显式值优先、否则沿用全局。
 func TestResolveOptionsRuleCache(t *testing.T) {
 	const (
-		globalPath     = "./global-cache"   // 全局缓存目录
-		globalInterval = 10 * time.Minute   // 全局清理间隔
+		globalPath     = "./global-cache"    // 全局缓存目录
+		globalInterval = 10 * time.Minute    // 全局清理间隔
 		ruleName       = "githubusercontent" // 规则名（用于断言规则确实命中）
 	)
 
@@ -114,7 +114,7 @@ func TestResolveOptionsRuleCache(t *testing.T) {
 				t.Fatalf("Validate() 意外报错: %v", err)
 			}
 
-			o := cfg.ResolveOptions(testTargetURL)
+			o := cfg.ResolveOptions("", testTargetURL)
 			if o.Rule != ruleName {
 				t.Fatalf("Rule = %q, want %q（规则未命中则后续断言失真）", o.Rule, ruleName)
 			}
@@ -347,7 +347,7 @@ func TestResolveOptionsCacheTTL(t *testing.T) {
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("Validate() 意外报错: %v", err)
 			}
-			o := cfg.ResolveOptions(testTargetURL)
+			o := cfg.ResolveOptions("", testTargetURL)
 			if o.CacheTTL != tt.wantTTL {
 				t.Errorf("CacheTTL = %v, want %v", o.CacheTTL, tt.wantTTL)
 			}
@@ -383,7 +383,7 @@ func TestResolveOptionsCacheTTL(t *testing.T) {
 		if got := cfg.GlobalCacheTTL(); got != 0 {
 			t.Errorf("GlobalCacheTTL() = %v, want 0（YAML 显式 ttl: 0 = 永不过期）", got)
 		}
-		if got := cfg.ResolveOptions(testTargetURL).CacheTTL; got != 0 {
+		if got := cfg.ResolveOptions("", testTargetURL).CacheTTL; got != 0 {
 			t.Errorf("ResolveOptions().CacheTTL = %v, want 0", got)
 		}
 	})
@@ -399,7 +399,7 @@ func TestResolveOptionsCacheTTL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load(%s) 意外报错: %v", path, err)
 		}
-		if got := cfg.ResolveOptions(testTargetURL).CacheTTL; got != DefaultCacheTTL {
+		if got := cfg.ResolveOptions("", testTargetURL).CacheTTL; got != DefaultCacheTTL {
 			t.Errorf("ResolveOptions().CacheTTL = %v, want %v（未配置默认 30m）", got, DefaultCacheTTL)
 		}
 	})
@@ -419,7 +419,7 @@ func TestResolveOptionsCacheTTL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load(%s) 意外报错: %v", path, err)
 		}
-		o := cfg.ResolveOptions(testTargetURL)
+		o := cfg.ResolveOptions("", testTargetURL)
 		if o.Rule != "r0" {
 			t.Fatalf("Rule = %q, want %q（规则未命中则后续断言失真）", o.Rule, "r0")
 		}

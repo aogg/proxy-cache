@@ -13,7 +13,7 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **规则级独立缓存目录**：每条 domain-rule 的 `cache` 可独立配置 `enabled`/`ttl`/`path`/`clean-interval`，支持「全局 `cache.enabled: false` 关闭缓存、命中规则的流量按规则开启并写入各自独立目录」（启动时预热创建全部缓存目录，按目录复用缓存实例与后台清理协程）
 - **url-redirect 多上游轮询回源**：`$1` 模板展开为多个候选代理 URL，round-robin **起始下标逐请求轮换**（第 1 个请求从第 1 条开始、第 2 个从第 2 条开始……），逐个尝试直到通过成功判据；全部失败可回退直连原始 URL
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）
-- **域名规则（domain-rules）**：正则匹配目标 URL，命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`timeout` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
+- **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`timeout` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
 - **上游代理支持**：全局与规则级 `http-proxy`（http/https/socks5），所有回源请求（含 url-redirect 候选请求）均可走代理
 - **allow-list / deny-list**：正则白/黑名单访问控制（deny 优先，allow 非空即白名单模式）
 - **可观测性**：`X-Cache`（HIT/MISS/BYPASS）与 `X-Proxy-Upstream`（本次内容来源）响应头、结构化日志、`/healthz` 健康检查
@@ -105,6 +105,7 @@ docker run -d --name proxy-cache \
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
 | `url-redirect` | string[] | 空 | 回源候选模板列表，`$1`/`${1}` 占位符替换为原始目标 URL；空列表 = 全部直连回源 |
 | `cache.*` | object | 见下 | 全局缓存配置 |
+| `log.level` | string | `info` | 日志级别：`debug` / `info` / `warn` / `error`（大小写不敏感，非法值启动时直接报错），详见下文「日志」 |
 | `domain-rules` | list | 空 | 域名/URL 规则列表，自上而下第一条命中生效 |
 | `allow-list` | string[] | 空 | 允许列表（正则）。非空时为白名单模式 |
 | `deny-list` | string[] | 空 | 拒绝列表（正则）。命中即返回 403 |
@@ -127,8 +128,8 @@ docker run -d --name proxy-cache \
 | 配置项 | 类型 | 说明 |
 | --- | --- | --- |
 | `name` | string | 规则名（可选，用于日志/`X-Cache` 观测） |
-| `match` | string | **必填**，正则表达式，对请求的**完整目标 URL** 做非锚定匹配，如 `.*https://[^.]+\.githubusercontent\.com` 或 `raw\.githubusercontent\.com` |
-| `exclude` | string[] | 排除正则列表（可选，支持多项）。`match` 命中后再逐个检查（同样对完整目标 URL 非锚定匹配），**任一命中即排除该规则**（视为不匹配，继续向下尝试后续规则）；全部不命中才应用本规则 |
+| `match` | string | **必填**，正则表达式，对「**`http://<入站Host>/<目标URL>`**」整串做非锚定匹配（入站 Host 归一化为小写）。既可按入站域名写（如 `'http://github\.path\..+'`，Host 形如 `github.path.xxx` 时命中），旧的纯目标 URL 写法也兼容（如 `raw\.githubusercontent\.com`、`.*https://[^.]+\.githubusercontent\.com`） |
+| `exclude` | string[] | 排除正则列表（可选，支持多项）。`match` 命中后再逐个检查（同样对整串非锚定匹配），**任一命中即排除该规则**（视为不匹配，继续向下尝试后续规则）；全部不命中才应用本规则 |
 | `cache.enabled` | bool | 覆盖该规则的缓存开关 |
 | `cache.ttl` | duration | 覆盖该规则的缓存时长；未配置沿用全局 `cache.ttl`；`0` = 永不过期；负数非法 |
 | `cache.path` | string | 该规则的**独立缓存目录**（trim 后为空 = 未配置，沿用全局 `cache.path`；同一 URL 永远落同一规则/目录） |
@@ -140,6 +141,8 @@ docker run -d --name proxy-cache \
 | `timeout` | duration | 该规则回源超时 |
 
 规则覆盖项均为「可选」：不写则沿用全局配置；**第一条命中的规则生效**（不做多规则叠加）。
+
+> 匹配范围说明：域名规则的 `match` / `exclude` 对「`http://<入站Host>/<目标URL>`」整串匹配（入站 Host 参与匹配）；而**缓存 key（目标 URL 的 sha256）与 allow-list / deny-list 仍只对目标 URL 匹配**，与入站 Host 无关。
 
 **全局关闭缓存、命中规则才开启独立缓存**：把全局 `cache.enabled` 设为 `false` 后，在需要的规则内显式配置 `cache.enabled: true`（并可用 `cache.path` 指定独立目录）——未命中任何规则的流量一律 `X-Cache: BYPASS` 不缓存，命中规则的流量才缓存且写入规则自己的目录，与全局目录互不影响、各自独立清理。服务启动时会按配置预热创建全部可能被写入的缓存目录并启动各自的后台清理（同一路径首次出现的清理间隔生效）。
 
@@ -249,6 +252,27 @@ curl "http://127.0.0.1:8080/healthz"
 - 全局 `http-proxy` 对**所有回源请求**生效，包括 url-redirect 候选请求与 fallback 直连请求；支持 `http://`、`https://`、`socks5://` 代理地址
 - 域名规则 `http-proxy` 覆盖全局：例如 GitHub 走本地代理、其他目标直连
 - 仅「服务端 → 上游」的回源流量走该代理；客户端 → 本服务的流量不受影响
+
+## 日志
+
+日志为 slog 结构化文本输出到 stderr，级别由配置文件 `log.level` 控制（大小写不敏感；留空默认 `info`；非法值启动时直接报错）。四级从多到少：`debug` > `info` > `warn` > `error`，高级别包含低级别的全部日志。
+
+```yaml
+log:
+  level: info   # debug / info / warn / error
+```
+
+| 级别 | 能看到什么 |
+| --- | --- |
+| `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched` / `excluded` 明细）、url-redirect 轮询起始下标与每次候选尝试、缓存查询 HIT/MISS 与写缓存细节 |
+| `info` | 规则匹配结果（`规则匹配结果`）、url-redirect 候选命中（`url-redirect 候选命中`）、全败回退直连、每条访问完成日志（`代理请求完成`）、异常恢复提示 |
+| `warn` | 候选请求失败 / 未过成功判据 / 回退直连、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
+| `error` | 仅错误：回源彻底失败（502）等 |
+
+### 排障指引
+
+- **域名规则没按预期命中**：把 `log.level` 设为 `debug`，观察每条规则的「域名规则匹配」日志（`matched` 表示 match 是否命中、`excluded` 表示是否被 exclude 排除）与最终的「规则匹配结果」日志（`rule` 为命中的规则名，未命中为 `global-default`），即可区分是 match 没命中还是被 exclude 排除。
+- **url-redirect 候选行为异常**：`debug` 级别下可看到「url-redirect 候选展开」（候选数量、轮询起始下标、尝试顺序）与每次「尝试 url-redirect 候选」日志，配合 `warn` 级别的失败原因定位问题候选。
 
 ## 缓存实现说明
 

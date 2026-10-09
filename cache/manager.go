@@ -21,7 +21,7 @@ type Manager struct {
 }
 
 // NewManager 创建缓存管理器；ctx 用于派生各目录后台清理协程的生命周期
-//（ctx 取消后全部 janitor 退出，与 Cache.StartJanitor 语义一致），传 nil 时兜底 Background。
+// （ctx 取消后全部 janitor 退出，与 Cache.StartJanitor 语义一致），传 nil 时兜底 Background。
 func NewManager(ctx context.Context) *Manager {
 	if ctx == nil {
 		ctx = context.Background()
@@ -30,9 +30,9 @@ func NewManager(ctx context.Context) *Manager {
 }
 
 // Acquire 返回 dir 对应的 Cache 实例：已存在直接复用；否则创建目录
-//（mkdir 失败快速返回错误）并在 cleanInterval>0 时启动后台过期清理。
+// （mkdir 失败快速返回错误）并在 cleanInterval>0 时启动后台过期清理。
 // 同一目录的清理间隔以首次创建时传入的为准，之后传入的间隔不再生效
-//（避免重复创建清理协程；各目录间隔来自配置，运行期只读不变）。
+// （避免重复创建清理协程；各目录间隔来自配置，运行期只读不变）。
 func (m *Manager) Acquire(dir string, cleanInterval time.Duration) (*Cache, error) {
 	// 快路径：读锁直接查已存在实例
 	m.mu.RLock()

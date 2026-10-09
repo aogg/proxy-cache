@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"regexp"
@@ -102,17 +103,21 @@ type RuleCache struct {
 	CleanInterval *Duration `yaml:"clean-interval"`
 }
 
-// DomainRule 单条域名/URL 规则。match 为正则表达式，对请求的完整目标 URL 做
-// 非锚定匹配（因此 `.*https://[^.]+\.githubusercontent\.com` 与 `raw\.githubusercontent\.com`
-// 两种写法均可）；exclude 为可选的排除正则列表（同样对完整目标 URL 非锚定匹配），
+// DomainRule 单条域名/URL 规则。match 为正则表达式，对
+// 「http://<入站Host>/<目标URL>」整串做非锚定匹配（Host 归一化为小写并去除首尾空白）：
+//   - 按入站域名匹配：如 `http://github\.path\..+`（入站 Host 形如 github.path.xxx 时命中）；
+//   - 按目标 URL 匹配（旧写法兼容）：因非锚定，`raw\.githubusercontent\.com` 与
+//     `.*https://[^.]+\.githubusercontent\.com` 等原写法照常命中。
+//
+// exclude 为可选的排除正则列表（同样对该整串非锚定匹配），
 // match 命中后任一 exclude 命中即视为不匹配、继续向下尝试后续规则；
 // 规则自上而下，第一条命中的规则生效。
 type DomainRule struct {
 	// Name 规则名（可选，仅用于日志与观测）。
 	Name string `yaml:"name"`
-	// Match 匹配目标 URL 的正则表达式（必填）。
+	// Match 匹配「http://<入站Host>/<目标URL>」整串的正则表达式（必填，非锚定匹配）。
 	Match string `yaml:"match"`
-	// Exclude 排除正则列表（可选，可配置多个）：match 命中后逐个检查，
+	// Exclude 排除正则列表（可选，可配置多个）：match 命中后逐个检查（同样对整串非锚定匹配），
 	// 任一命中即排除该规则（视为不匹配，继续向下尝试后续规则）；
 	// 全部不命中才应用该规则。
 	Exclude []string `yaml:"exclude"`
@@ -143,18 +148,28 @@ func (r *DomainRule) label() string {
 	return r.Match
 }
 
-// matches 判断该规则是否命中目标 URL：match 命中且该规则所有 exclude
-// 均不命中。任一 exclude 命中即视为不匹配（该规则被排除）。
-func (r *DomainRule) matches(targetURL string) bool {
-	if r.re == nil || !r.re.MatchString(targetURL) {
-		return false
+// matchResult 返回该规则对匹配串的匹配明细（match 与 exclude 分别命中与否）：
+//   - matched：match 正则是否命中；
+//   - excluded：match 命中后是否有任一 exclude 命中（未配置 exclude 恒为 false）。
+//
+// matched=true 且 excluded=false 才视为该规则命中。
+func (r *DomainRule) matchResult(matchStr string) (matched, excluded bool) {
+	if r.re == nil || !r.re.MatchString(matchStr) {
+		return false, false
 	}
 	for _, ex := range r.excludeRe {
-		if ex.MatchString(targetURL) {
-			return false // 命中任一 exclude，该规则被排除
+		if ex.MatchString(matchStr) {
+			return true, true // 命中任一 exclude，该规则被排除
 		}
 	}
-	return true
+	return true, false
+}
+
+// LogConfig 日志配置。
+type LogConfig struct {
+	// Level 日志级别：debug / info / warn / error（大小写不敏感；留空默认 info；
+	// 非法值在 Validate 阶段报错，启动快速失败）。
+	Level string `yaml:"level"`
 }
 
 // CacheConfig 全局缓存配置。
@@ -187,6 +202,8 @@ type Config struct {
 	URLRedirect []string `yaml:"url-redirect"`
 	// Cache 全局缓存配置。
 	Cache CacheConfig `yaml:"cache"`
+	// Log 日志配置（level）。
+	Log LogConfig `yaml:"log"`
 	// DomainRules 域名/URL 规则列表（自上而下第一条命中生效）。
 	DomainRules []DomainRule `yaml:"domain-rules"`
 	// AllowList 允许列表（正则）；非空时为白名单模式，未命中的目标一律拒绝。
@@ -194,6 +211,9 @@ type Config struct {
 	// DenyList 拒绝列表（正则）；命中即拒绝。
 	DenyList []string `yaml:"deny-list"`
 
+	// logLevel 是 log.level 归一化后的生效级别（Validate 阶段填充，不参与 YAML 解析），
+	// 经 LogLevel() 访问器读取。
+	logLevel slog.Level
 	// allow / deny 是两个列表编译后的正则（Validate 阶段填充）。
 	allow []*regexp.Regexp
 	deny  []*regexp.Regexp
@@ -283,11 +303,29 @@ func (c *Config) Validate() error {
 	if c.SuccessCheck == "" {
 		c.SuccessCheck = SuccessCheckContent
 	}
+	// log.level 归一化：trim + 小写；空串默认 info（生效级别映射在下方取值校验阶段填充）
+	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
+	if c.Log.Level == "" {
+		c.Log.Level = "info"
+	}
 	// //////////////////  默认值补全  end  ////////////////////////////////////////////////
 
 	// //////////////////  全局取值校验  start  ////////////////////////////////////////////////
 	if c.SuccessCheck != SuccessCheckStatus && c.SuccessCheck != SuccessCheckContent {
 		return fmt.Errorf("success-check 仅支持 status 或 content，当前为 %q", c.SuccessCheck)
+	}
+	// log.level 仅允许四级，非法值启动快速失败；合法值转成 slog.Level 存私有字段供 LogLevel() 使用
+	switch c.Log.Level {
+	case "debug":
+		c.logLevel = slog.LevelDebug
+	case "info":
+		c.logLevel = slog.LevelInfo
+	case "warn":
+		c.logLevel = slog.LevelWarn
+	case "error":
+		c.logLevel = slog.LevelError
+	default:
+		return fmt.Errorf("log.level 仅支持 debug/info/warn/error，当前为 %q", c.Log.Level)
 	}
 	// 经上方默认值补全后 TTL 必然非 nil：负数是配置错误（0 = 永不过期，合法）
 	if c.Cache.TTL.D() < 0 {
@@ -314,7 +352,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("domain-rules[%d] (%s) 的 match 正则无效: %w", i, r.label(), err)
 		}
 		r.re = re
-		// exclude 正则逐个编译缓存（与 match 同样对完整目标 URL 非锚定匹配）
+		// exclude 正则逐个编译缓存（与 match 同样对「http://<Host>/<目标URL>」整串非锚定匹配）
 		r.excludeRe = make([]*regexp.Regexp, 0, len(r.Exclude))
 		for j, pat := range r.Exclude {
 			pat = strings.TrimSpace(pat)
@@ -382,7 +420,7 @@ func (c *Config) fallbackDirect() bool {
 }
 
 // GlobalCacheTTL 返回全局 cache.ttl 的生效时长：Validate 之后必然非 nil
-//（未配置已兜底 DefaultCacheTTL）；显式 0 = 永不过期，原样返回 0。
+// （未配置已兜底 DefaultCacheTTL）；显式 0 = 永不过期，原样返回 0。
 // 方法内做 nil 防御，供未经过 Validate 的构造场景兜底，
 // 供 ResolveOptions 与 main 启动日志复用。
 func (c *Config) GlobalCacheTTL() time.Duration {
@@ -392,9 +430,24 @@ func (c *Config) GlobalCacheTTL() time.Duration {
 	return c.Cache.TTL.D()
 }
 
-// ResolveOptions 把全局配置与第一条命中目标 URL 的域名规则覆盖项合并，
+// LogLevel 返回 log.level 对应的 slog.Level。必须在 Validate 之后调用
+// （归一化结果存于私有字段 logLevel）；未经过 Validate 的构造场景兜底返回 Info。
+func (c *Config) LogLevel() slog.Level {
+	if c.logLevel == slog.LevelInfo {
+		return slog.LevelInfo
+	}
+	return c.logLevel
+}
+
+// ResolveOptions 把全局配置与第一条命中「入站 Host + 目标 URL」的域名规则覆盖项合并，
 // 返回该请求最终生效的配置。必须在 Validate 之后调用。
-func (c *Config) ResolveOptions(targetURL string) Options {
+//
+// 域名规则匹配串构造为「http://<入站Host>/<目标URL>」整串（Host 归一化为小写并去除
+// 首尾空白），规则 match 与 exclude 均对该整串做非锚定匹配：既支持按入站域名路由
+// （如 match: 'http://github\.path\..+'），也兼容旧的目标 URL 正则写法。
+// 注意：缓存 key（目标 URL 的 sha256）与 allow-list / deny-list 仍只对目标 URL 匹配，
+// 不受入站 Host 影响。
+func (c *Config) ResolveOptions(host, targetURL string) Options {
 	// //////////////////  全局默认值  start  ////////////////////////////////////////////////
 	o := Options{
 		CacheEnabled:       c.Cache.Enabled,
@@ -409,12 +462,19 @@ func (c *Config) ResolveOptions(targetURL string) Options {
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
+	// //////////////////  构造规则匹配串（入站 Host + 目标 URL）  start  ////////////////////
+	// 形如 http://github.path.proxy-cache.xxx.sslip.io/https://raw.githubusercontent.com/...
+	matchStr := "http://" + strings.ToLower(strings.TrimSpace(host)) + "/" + targetURL
+	// //////////////////  构造规则匹配串（入站 Host + 目标 URL）  end  ////////////////////
+
 	// //////////////////  应用第一条命中的域名规则覆盖项  start  ////////////////////////////////////////////////
 	for i := range c.DomainRules {
 		r := &c.DomainRules[i]
 		// match 命中且该规则所有 exclude 均不命中才应用；
 		// 被 exclude 排除的规则视为不匹配，继续向下尝试后续规则。
-		if !r.matches(targetURL) {
+		matched, excluded := r.matchResult(matchStr)
+		slog.Debug("域名规则匹配", "rule", r.label(), "matched", matched, "excluded", excluded)
+		if !matched || excluded {
 			continue
 		}
 		if r.Cache.Enabled != nil {
@@ -451,11 +511,23 @@ func (c *Config) ResolveOptions(targetURL string) Options {
 		break // 自上而下第一条命中即生效
 	}
 	// //////////////////  应用第一条命中的域名规则覆盖项  end  ////////////////////////////////////////////////
+
+	// //////////////////  匹配结果日志  start  ////////////////////////////////////////////////
+	// 全部规则未命中时按 debug 留痕，最终生效结果（命中规则名或 global-default）按 info 输出
+	if o.Rule == "" {
+		slog.Debug("未命中任何域名规则，使用全局默认配置", "target", targetURL)
+	}
+	rule := o.Rule
+	if rule == "" {
+		rule = "global-default"
+	}
+	slog.Info("规则匹配结果", "rule", rule, "target", targetURL)
+	// //////////////////  匹配结果日志  end  ////////////////////////////////////////////////
 	return o
 }
 
 // ActiveCacheDirs 返回当前配置下可能被写入的缓存目录 -> 生效清理间隔，供启动预热使用
-//（启动时按此逐目录创建 Cache 实例并启动各自后台清理）。必须在 Validate 之后调用：
+// （启动时按此逐目录创建 Cache 实例并启动各自后台清理）。必须在 Validate 之后调用：
 //   - 全局 cache.enabled 为 true 时包含全局 cache.path + 全局 clean-interval；
 //   - 逐条规则判定其命中后缓存是否开启（规则 cache.enabled 显式值优先，否则沿用全局值），
 //     开启则取其生效 path（未配置沿用全局 path）与生效 clean-interval（未配置沿用全局）；
@@ -494,23 +566,26 @@ func (c *Config) ActiveCacheDirs() map[string]time.Duration {
 	return dirs
 }
 
-// CheckACL 校验目标 URL 是否被 allow-list / deny-list 放行：
-// deny-list 命中即拒绝；allow-list 非空时为白名单模式，未命中任何 allow 规则同样拒绝。
-func (c *Config) CheckACL(targetURL string) error {
+// CheckACL 校验目标 URL 是否被 allow-list / deny-list 放行（判定逻辑不变：
+// deny-list 命中即拒绝；allow-list 非空时为白名单模式，未命中任何 allow 规则同样拒绝）。
+// 额外返回命中的列表项（matched）：deny 命中时为命中的 deny 正则原文，
+// allow 命中时为命中的 allow 正则原文；未命中白名单或未配置列表时为空串，
+// 供调用方记录拒绝日志。
+func (c *Config) CheckACL(targetURL string) (matched string, err error) {
 	for _, re := range c.deny {
 		if re.MatchString(targetURL) {
-			return fmt.Errorf("目标 URL 命中 deny-list 规则 %q，已拒绝代理", re.String())
+			return re.String(), fmt.Errorf("目标 URL 命中 deny-list 规则 %q，已拒绝代理", re.String())
 		}
 	}
 	if len(c.allow) > 0 {
 		for _, re := range c.allow {
 			if re.MatchString(targetURL) {
-				return nil
+				return re.String(), nil
 			}
 		}
-		return fmt.Errorf("目标 URL 未命中 allow-list 任何规则，已拒绝代理（allow-list 非空时为白名单模式）")
+		return "", fmt.Errorf("目标 URL 未命中 allow-list 任何规则，已拒绝代理（allow-list 非空时为白名单模式）")
 	}
-	return nil
+	return "", nil
 }
 
 // validateProxyAddr 校验上游代理地址格式（支持 http/https/socks5）。

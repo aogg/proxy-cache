@@ -146,7 +146,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleProxy 处理一条代理请求：提取目标 URL -> ACL -> 合并生效配置 -> 按方法分发。
+// handleProxy 处理一条代理请求：提取目标 URL -> 日志请求开始 -> ACL -> 合并生效配置 -> 按方法分发。
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
@@ -156,17 +156,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.log.Debug("代理请求开始", "method", r.Method, "remote", r.RemoteAddr, "target", target)
 	// //////////////////  提取并校验目标 URL  end  ////////////////////////////////////////////////
 
 	// //////////////////  allow/deny 访问控制  start  ////////////////////////////////////////////////
-	if err := s.cfg.CheckACL(target); err != nil {
-		s.writeError(w, http.StatusForbidden, err.Error())
+	// matched 为命中的列表项：deny 命中时非空且 err!=nil；allow 白名单模式未命中时为空串且 err!=nil
+	if matched, aclErr := s.cfg.CheckACL(target); aclErr != nil {
+		if matched != "" {
+			s.log.Warn("请求被拒绝列表拦截", "target", target, "matched", matched)
+		} else {
+			s.log.Warn("请求未命中白名单", "target", target, "matched", matched)
+		}
+		s.writeError(w, http.StatusForbidden, aclErr.Error())
 		return
 	}
 	// //////////////////  allow/deny 访问控制  end  ////////////////////////////////////////////////
 
 	// //////////////////  合并全局配置与域名规则  start  ////////////////////////////////////////////////
-	eff := s.cfg.ResolveOptions(target)
+	// 域名规则对「http://<入站Host>/<目标URL>」整串匹配，入站 Host 参与匹配
+	eff := s.cfg.ResolveOptions(r.Host, target)
 	// //////////////////  合并全局配置与域名规则  end  ////////////////////////////////////////////////
 
 	// GET 走完整链路（缓存 + url-redirect 轮询）；其他方法不缓存、不轮询，直接透传
@@ -218,10 +226,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	// //////////////////  查缓存：命中直接回放  start  ////////////////////////////////////////////////
 	if disk != nil {
 		if e, ok := disk.Get(key); ok {
+			s.log.Debug("缓存查询结果", "result", "HIT", "key", key, "dir", eff.CachePath)
 			s.serveEntry(w, r, e, "HIT", eff, start)
 			return
 		}
 	}
+	s.log.Debug("缓存查询结果", "result", "MISS", "key", key, "dir", eff.CachePath)
 	// //////////////////  查缓存：命中直接回放  end  ////////////////////////////////////////////////
 
 	// //////////////////  未命中：单飞回源并写缓存  start  ////////////////////////////////////////////////
@@ -237,6 +247,8 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 			if disk != nil {
 				if serr := disk.Set(key, ent); serr != nil {
 					s.log.Warn("写入缓存失败", "key", key, "target", target, "err", serr)
+				} else {
+					s.log.Debug("写入缓存成功", "key", key, "ttl", ent.TTL.String())
 				}
 			}
 		}
@@ -267,6 +279,7 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 	candidates := ExpandCandidates(eff.URLRedirect, target)
 	if len(candidates) == 0 {
 		// 未配置 url-redirect：直接回源原始 URL（结果原样透传，不套用成功判据）
+		s.log.Debug("无 url-redirect 候选，直连回源", "target", target)
 		return s.fetchDirect(r, target, eff)
 	}
 
@@ -274,10 +287,21 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 	start := int(s.rr.Add(1)-1) % len(candidates)
 	// //////////////////  轮询起始下标：第 1 次请求从 0 开始，之后逐次 +1  end  ////////
 
+	// //////////////////  候选展开日志  start  ////////////////////////////////////////////////
+	// 按实际尝试顺序（round-robin 起始下标起轮换）输出展开前模板列表，避免逐条拼入超长目标 URL
+	order := make([]string, 0, len(eff.URLRedirect))
+	for i := range eff.URLRedirect {
+		order = append(order, eff.URLRedirect[(start+i)%len(eff.URLRedirect)])
+	}
+	s.log.Debug("url-redirect 候选展开", "count", len(candidates), "start_index", start, "order", order)
+	// //////////////////  候选展开日志  end  ////////////////////////////////////////////////
+
 	// //////////////////  逐个尝试候选  start  ////////////////////////////////////////////////
 	var lastErr error
 	for i := 0; i < len(candidates); i++ {
 		cand := candidates[(start+i)%len(candidates)]
+		s.log.Debug("尝试 url-redirect 候选", "index", i, "candidate", cand)
+		candStart := time.Now() // 该候选耗时（含请求与响应读取）
 		e, err := s.doRequest(r, http.MethodGet, cand, nil, eff)
 		if err != nil {
 			lastErr = err
@@ -286,6 +310,8 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 		}
 		if checkSuccess(e, eff.SuccessCheck) {
 			e.Source = cand
+			s.log.Info("url-redirect 候选命中", "index", i, "candidate", cand,
+				"cost", time.Since(candStart).Round(time.Millisecond).String())
 			return e, nil
 		}
 		lastErr = fmt.Errorf("候选 %s 未通过 success-check=%s（状态码 %d，body %d 字节）",
@@ -436,12 +462,16 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 	)
 }
 
-// writeError 输出 JSON 格式错误响应并记录日志。
+// writeError 输出 JSON 格式错误响应并记录日志（502 回源彻底失败升级为 Error，其余保持 Warn）。
 func (s *Server) writeError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(map[string]string{"error": msg}); err != nil {
 		s.log.Warn("写错误响应失败", "status", code, "err", err)
+	}
+	if code == http.StatusBadGateway {
+		s.log.Error("请求处理失败", "status", code, "error", msg)
+		return
 	}
 	s.log.Warn("请求处理失败", "status", code, "error", msg)
 }

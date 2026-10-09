@@ -100,7 +100,7 @@ func TestResolveOptionsExclude(t *testing.T) {
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("Validate() 意外报错: %v", err)
 			}
-			o := cfg.ResolveOptions(tt.target)
+			o := cfg.ResolveOptions("", tt.target)
 			if o.Rule != tt.wantRule {
 				t.Errorf("Rule = %q, want %q", o.Rule, tt.wantRule)
 			}
@@ -150,11 +150,11 @@ func TestValidateExclude(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate() 意外报错: %v", err)
 		}
-		o := cfg.ResolveOptions("https://raw.githubusercontent.com/foo/bar/main/x.yaml")
+		o := cfg.ResolveOptions("", "https://raw.githubusercontent.com/foo/bar/main/x.yaml")
 		if o.Rule != "githubusercontent" {
 			t.Errorf("Rule = %q, want %q", o.Rule, "githubusercontent")
 		}
-		o = cfg.ResolveOptions("https://raw.githubusercontent.com/excluded/repo/main/x.yaml")
+		o = cfg.ResolveOptions("", "https://raw.githubusercontent.com/excluded/repo/main/x.yaml")
 		if o.Rule != "" {
 			t.Errorf("Rule = %q, want %q（被 exclude 排除后走全局默认）", o.Rule, "")
 		}
