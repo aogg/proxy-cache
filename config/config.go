@@ -22,6 +22,9 @@ const (
 	SuccessCheckContent = "content"
 )
 
+// DefaultCacheTTL 全局 cache.ttl 未配置时的默认缓存时长。
+const DefaultCacheTTL = 30 * time.Minute
+
 // Duration 是 YAML 配置里的时长类型，解析规则：
 //   - Go duration 格式：30s / 30m / 1h30m
 //   - 纯数字：按秒解析（1800 => 1800s）
@@ -59,6 +62,12 @@ func ParseDuration(s string) (time.Duration, error) {
 // D 返回 time.Duration 表示。
 func (d Duration) D() time.Duration { return time.Duration(d) }
 
+// durationPtr 返回 Duration 指针（用于预置默认值）。
+func durationPtr(d time.Duration) *Duration {
+	v := Duration(d)
+	return &v
+}
+
 // String 实现 fmt.Stringer，便于日志输出。
 func (d Duration) String() string { return d.D().String() }
 
@@ -82,7 +91,8 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 type RuleCache struct {
 	// Enabled 覆盖缓存开关。
 	Enabled *bool `yaml:"enabled"`
-	// TTL 覆盖该规则的缓存时长。
+	// TTL 覆盖该规则的缓存时长：nil（未配置）沿用全局 cache.ttl；
+	// 显式 0 表示永不过期；负数为配置错误（Validate 拒绝）。
 	TTL *Duration `yaml:"ttl"`
 	// Path 覆盖该规则的缓存目录（独立目录，实现按规则分目录缓存）；
 	// trim 后为空表示未配置、沿用全局 cache.path。
@@ -153,8 +163,9 @@ type CacheConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// Path 缓存目录（默认 ./cache-data，命名避免与源码 cache/ 包目录混用）。
 	Path string `yaml:"path"`
-	// TTL 默认缓存时长（可被域名规则覆盖）。
-	TTL Duration `yaml:"ttl"`
+	// TTL 默认缓存时长（可被域名规则覆盖）：nil（未配置）按 30m 处理
+	//（Default 预置、Validate 兜底）；显式 0 表示永不过期；负数为配置错误（Validate 拒绝）。
+	TTL *Duration `yaml:"ttl"`
 	// CleanInterval 后台过期清理扫描间隔，<=0 关闭。
 	CleanInterval Duration `yaml:"clean-interval"`
 }
@@ -194,7 +205,7 @@ type Options struct {
 	Rule string
 	// CacheEnabled 该请求是否启用缓存。
 	CacheEnabled bool
-	// CacheTTL 该请求的缓存时长。
+	// CacheTTL 该请求的缓存时长（0 = 永不过期；负数已被 Validate 拦截）。
 	CacheTTL time.Duration
 	// CachePath 该请求读写缓存使用的目录（规则可配独立目录；未配置沿用全局 cache.path）。
 	CachePath string
@@ -224,7 +235,7 @@ func Default() *Config {
 		Cache: CacheConfig{
 			Enabled:       true,
 			Path:          "./cache-data",
-			TTL:           Duration(30 * time.Minute),
+			TTL:           durationPtr(DefaultCacheTTL),
 			CleanInterval: Duration(10 * time.Minute),
 		},
 	}
@@ -260,8 +271,10 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Cache.Path) == "" {
 		c.Cache.Path = "./cache-data"
 	}
-	if c.Cache.TTL <= 0 {
-		c.Cache.TTL = Duration(30 * time.Minute)
+	// cache.ttl 为指针：nil（未配置/显式置空）兜底默认 30m；显式 0（永不过期）与负数
+	// 保持原值，负数在下方「全局取值校验」阶段报错
+	if c.Cache.TTL == nil {
+		c.Cache.TTL = durationPtr(DefaultCacheTTL)
 	}
 	if c.Cache.CleanInterval < 0 {
 		c.Cache.CleanInterval = 0
@@ -275,6 +288,10 @@ func (c *Config) Validate() error {
 	// //////////////////  全局取值校验  start  ////////////////////////////////////////////////
 	if c.SuccessCheck != SuccessCheckStatus && c.SuccessCheck != SuccessCheckContent {
 		return fmt.Errorf("success-check 仅支持 status 或 content，当前为 %q", c.SuccessCheck)
+	}
+	// 经上方默认值补全后 TTL 必然非 nil：负数是配置错误（0 = 永不过期，合法）
+	if c.Cache.TTL.D() < 0 {
+		return fmt.Errorf("cache.ttl 不能为负数（0 表示永不过期，未配置默认 %s），当前为 %s", DefaultCacheTTL, c.Cache.TTL)
 	}
 	if strings.TrimSpace(c.HTTPProxy) != "" {
 		if err := validateProxyAddr(c.HTTPProxy); err != nil {
@@ -310,9 +327,9 @@ func (c *Config) Validate() error {
 			}
 			r.excludeRe = append(r.excludeRe, ex)
 		}
-		// 规则级覆盖项合法性
-		if r.Cache.TTL != nil && r.Cache.TTL.D() <= 0 {
-			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.ttl 必须大于 0", i, r.label())
+		// 规则级覆盖项合法性：ttl 负数为配置错误；显式 0 = 永不过期（合法）
+		if r.Cache.TTL != nil && r.Cache.TTL.D() < 0 {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.ttl 不能为负数（0 表示永不过期，不配置则沿用全局 cache.ttl）", i, r.label())
 		}
 		// cache.path 允许为空（trim 后空 = 未配置，沿用全局 cache.path），无需校验
 		if r.Cache.CleanInterval != nil && r.Cache.CleanInterval.D() < 0 {
@@ -364,13 +381,24 @@ func (c *Config) fallbackDirect() bool {
 	return *c.FallbackDirect
 }
 
+// GlobalCacheTTL 返回全局 cache.ttl 的生效时长：Validate 之后必然非 nil
+//（未配置已兜底 DefaultCacheTTL）；显式 0 = 永不过期，原样返回 0。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底，
+// 供 ResolveOptions 与 main 启动日志复用。
+func (c *Config) GlobalCacheTTL() time.Duration {
+	if c.Cache.TTL == nil {
+		return DefaultCacheTTL
+	}
+	return c.Cache.TTL.D()
+}
+
 // ResolveOptions 把全局配置与第一条命中目标 URL 的域名规则覆盖项合并，
 // 返回该请求最终生效的配置。必须在 Validate 之后调用。
 func (c *Config) ResolveOptions(targetURL string) Options {
 	// //////////////////  全局默认值  start  ////////////////////////////////////////////////
 	o := Options{
 		CacheEnabled:       c.Cache.Enabled,
-		CacheTTL:           c.Cache.TTL.D(),
+		CacheTTL:           c.GlobalCacheTTL(),
 		CachePath:          c.Cache.Path,
 		CacheCleanInterval: c.Cache.CleanInterval.D(),
 		HTTPProxy:          strings.TrimSpace(c.HTTPProxy),

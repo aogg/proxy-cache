@@ -96,13 +96,20 @@ func run() error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpSrv.Serve(ln) }()
 
+	// 启动日志的 cache_ttl 字段：显式 0（永不过期）输出 never，否则输出 duration 字符串
+	//（GlobalCacheTTL 内含 nil 防御；Load 必经 Validate，正常情况非 nil）
+	cacheTTLLog := "never"
+	if d := cfg.GlobalCacheTTL(); d > 0 {
+		cacheTTLLog = d.String()
+	}
+
 	logger.Info("proxy-cache 已启动",
 		"version", proxy.Version,
 		"listen", ln.Addr().String(),
 		"config", path,
 		"cache_enabled", cfg.Cache.Enabled,
 		"cache_dirs", len(activeDirs),
-		"cache_ttl", cfg.Cache.TTL.String(),
+		"cache_ttl", cacheTTLLog,
 		"url_redirect", len(cfg.URLRedirect),
 		"domain_rules", len(cfg.DomainRules),
 		"http_proxy", cfg.HTTPProxy,

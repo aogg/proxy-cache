@@ -38,7 +38,7 @@ url-redirect:
 cache:
   enabled: true              # 是否启用缓存（全局关闭后仍可在 domain-rules 内按规则开启，见下方场景示例）
   path: ./cache-data         # 缓存目录（默认 ./cache-data；命名避免与源码 cache/ 包目录混用）
-  ttl: 30m                   # 默认缓存时长（域名规则可覆盖）
+  ttl: 30m                   # 默认缓存时长（域名规则可覆盖）；0=永不过期（未配置默认 30m；负数非法）
   clean-interval: 10m    # 后台过期清理扫描间隔（<=0 关闭；读取命中过期条目时也会惰性删除）
 
 # 域名/URL 规则（自上而下，第一条命中的规则生效）
@@ -60,7 +60,7 @@ domain-rules:
       # - '/branches/'          # 支持任意正则
     cache:
       enabled: true
-      ttl: 6h                # raw 文件内容较稳定，缓存更久
+      ttl: 6h                # raw 文件内容较稳定，缓存更久（0=永不过期；不写沿用全局 cache.ttl）
       # path: ./cache-raw            # 规则独立缓存目录（不写沿用全局 cache.path；写独立目录即按规则分目录缓存）
       # clean-interval: 30m          # 该目录的后台清理间隔（不写沿用全局 cache.clean-interval；<=0 关闭）
     # ---- 以下均为可选覆盖项，不写则沿用全局配置 ----
@@ -90,7 +90,7 @@ domain-rules:
   #   cache:
   #     enabled: true          # 规则内显式开启（优先于全局开关）
   #     path: ./cache-raw      # 规则独立缓存目录（不写则沿用全局 cache.path）
-  #     ttl: 6h
+  #     ttl: 6h                # 0=永不过期；不写沿用全局 cache.ttl
   #     clean-interval: 30m    # 该目录的后台清理间隔（不写则沿用全局 cache.clean-interval）
 
 # 允许/拒绝列表（正则，对完整目标 URL 匹配，优先级高于缓存与回源）

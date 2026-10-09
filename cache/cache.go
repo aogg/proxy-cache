@@ -5,7 +5,8 @@
 //   - 文件格式：8 字节文件头（4 字节魔数 + 4 字节 JSON 元信息长度）+ JSON 元信息 + 响应体原文；
 //   - 并发安全：写入总是先落同目录临时文件再 rename（原子替换），读取方要么看到旧条目、
 //     要么看到完整新条目，不会读到半截数据；所有方法可并发调用；
-//   - TTL 在写入时固化到条目内，读取判定过期与后台清理均按条目自身 TTL 进行；
+//   - TTL 在写入时固化到条目内，读取判定过期与后台清理均按条目自身 TTL 进行
+//     （TTL<=0 表示永不过期）；
 //   - 过期采用「读取时惰性删除 + 可选后台定期扫描（StartJanitor）」双策略。
 package cache
 
@@ -47,7 +48,7 @@ type meta struct {
 	Header http.Header `json:"header"`
 	// StoredAt 写入时刻（Unix 秒）。
 	StoredAt int64 `json:"stored_at"`
-	// TTLSeconds 写入时固化的缓存时长（秒）。
+	// TTLSeconds 写入时固化的缓存时长（秒）；0 = 永不过期标记。
 	TTLSeconds int64 `json:"ttl_seconds"`
 }
 
@@ -61,16 +62,20 @@ type Entry struct {
 	Body []byte
 	// StoredAt 写入时刻。
 	StoredAt time.Time
-	// TTL 该条目的缓存时长（<=0 视为不缓存/已过期）。
+	// TTL 该条目的缓存时长（<=0 表示永不过期，与配置层 cache.ttl: 0 语义一致）。
 	TTL time.Duration
 	// Source 获取该内容时使用的上游（direct 或 url-redirect 候选 URL），仅用于观测。
 	Source string
 }
 
 // Expired 判断条目在 t 时刻是否已过期。
+// e==nil 视为已过期；TTL<=0 表示永不过期（恒返回 false）。
 func (e *Entry) Expired(t time.Time) bool {
-	if e == nil || e.TTL <= 0 {
+	if e == nil {
 		return true
+	}
+	if e.TTL <= 0 {
+		return false // 永不过期
 	}
 	return t.Sub(e.StoredAt) >= e.TTL
 }
@@ -133,11 +138,11 @@ func (c *Cache) Get(key string) (*Entry, bool) {
 	return e, true
 }
 
-// Set 原子写入缓存条目（TTL<=0 视为不需要缓存，直接返回）。
+// Set 原子写入缓存条目（仅 e==nil 直接返回；TTL<=0 表示永不过期，同样落盘）。
 // 写入流程：完整内容写入临时文件 -> rename 覆盖目标文件（同目录下原子替换）。
 func (c *Cache) Set(key string, e *Entry) error {
 	// //////////////////  准备数据  start  ////////////////////////////////////////////////
-	if e == nil || e.TTL <= 0 {
+	if e == nil {
 		return nil
 	}
 	data, err := encodeEntry(e)
@@ -170,18 +175,23 @@ func (c *Cache) Set(key string, e *Entry) error {
 }
 
 // encodeEntry 把条目编码为磁盘文件字节流：文件头(8B) + 元信息 JSON + 响应体。
+// TTL<=0（永不过期）时 TTLSeconds 写 0（0 = 永不过期标记）；TTL>0 时向上取整为
+// 至少 1 秒，避免亚秒级 TTL 落盘后被判为立即过期。
 func encodeEntry(e *Entry) ([]byte, error) {
-	// TTL 不足 1 秒时向上取整为 1 秒，避免亚秒级 TTL 落盘后被判为立即过期
-	ttl := e.TTL.Round(time.Second)
-	if ttl <= 0 {
-		ttl = time.Second
+	var ttlSeconds int64
+	if e.TTL > 0 {
+		ttl := e.TTL.Round(time.Second)
+		if ttl <= 0 {
+			ttl = time.Second
+		}
+		ttlSeconds = int64(ttl / time.Second)
 	}
 	m := meta{
 		Version:    1,
 		Status:     e.Status,
 		Header:     e.Header,
 		StoredAt:   e.StoredAt.Unix(),
-		TTLSeconds: int64(ttl / time.Second),
+		TTLSeconds: ttlSeconds,
 	}
 	mj, err := json.Marshal(&m)
 	if err != nil {
@@ -227,7 +237,10 @@ func readEntry(r io.Reader) (*Entry, error) {
 		Header:   m.Header,
 		Body:     body,
 		StoredAt: time.Unix(m.StoredAt, 0),
-		TTL:      time.Duration(m.TTLSeconds) * time.Second,
+		// TTLSeconds=0 是「永不过期」标记（Entry.TTL=0 配合 Expired 即永不过期）；
+		// 旧格式文件 TTLSeconds>=1 照常过期，无需迁移。旧版本程序读到新「永久」条目
+		// 会按旧语义（TTL<=0 视为已过期）将其删除，无害，向前不兼容方向可接受。
+		TTL: time.Duration(m.TTLSeconds) * time.Second,
 	}, nil
 }
 
@@ -254,6 +267,7 @@ func (c *Cache) StartJanitor(ctx context.Context, interval time.Duration) {
 }
 
 // Clean 扫描缓存目录，删除过期/损坏条目与残留临时文件，返回删除数量。
+// TTL<=0 的永久条目按未过期处理不会被删除（仍会清理损坏文件与临时文件）。
 func (c *Cache) Clean() int {
 	des, err := os.ReadDir(c.dir)
 	if err != nil {

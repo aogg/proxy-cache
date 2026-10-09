@@ -185,8 +185,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // handleGet 处理 GET 请求：读缓存（HIT）或 单飞回源 + 写缓存（MISS）；不可缓存时直接回源（BYPASS）。
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string, eff config.Options, start time.Time) {
 	key := cache.Key(target)
-	// Range / no-cache 请求绕过缓存读取（避免语义冲突与强制刷新），其余启用缓存条件：cache.enabled 且 ttl>0
-	cacheable := eff.CacheEnabled && eff.CacheTTL > 0 &&
+	// Range / no-cache 请求绕过缓存读取（避免语义冲突与强制刷新），其余启用缓存条件：cache.enabled 且 ttl>=0
+	//（TTL=0 表示永不过期，同样可缓存；负数理论上已被 config.Validate 拦截，此处 >=0 兜底防御）
+	cacheable := eff.CacheEnabled && eff.CacheTTL >= 0 &&
 		r.Header.Get("Range") == "" && !clientNoCache(r)
 
 	// 解析本请求生效的缓存实例：规则可配独立缓存目录，按生效目录向管理器获取（复用已预热实例）；
@@ -232,7 +233,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		}
 		// 仅缓存满足成功判据的 200 响应
 		if ent.Status == http.StatusOK && checkSuccess(ent, eff.SuccessCheck) {
-			ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目
+			ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目（0 = 永不过期）
 			if disk != nil {
 				if serr := disk.Set(key, ent); serr != nil {
 					s.log.Warn("写入缓存失败", "key", key, "target", target, "err", serr)

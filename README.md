@@ -117,7 +117,7 @@ docker run -d --name proxy-cache \
 | --- | --- | --- | --- |
 | `cache.enabled` | bool | `true` | 是否启用缓存（全局关闭后仍可在域名规则内按规则开启，见下文「全局关闭缓存」场景） |
 | `cache.path` | string | `./cache-data` | 缓存目录（命名避免与源码 `cache/` 包目录混用） |
-| `cache.ttl` | duration | `30m` | 默认缓存时长（可被域名规则覆盖） |
+| `cache.ttl` | duration | `30m` | 默认缓存时长（可被域名规则覆盖）；`0` = 永不过期（未配置默认 `30m`；负数非法） |
 | `cache.clean-interval` | duration | `10m` | 后台过期扫描间隔，`<=0` 关闭（读取命中过期条目时也会惰性删除） |
 
 全局 `cache.path` / `cache.clean-interval` 同样可被域名规则覆盖（`cache.path` / `cache.clean-interval`），规则未配置时沿用全局值。
@@ -130,7 +130,7 @@ docker run -d --name proxy-cache \
 | `match` | string | **必填**，正则表达式，对请求的**完整目标 URL** 做非锚定匹配，如 `.*https://[^.]+\.githubusercontent\.com` 或 `raw\.githubusercontent\.com` |
 | `exclude` | string[] | 排除正则列表（可选，支持多项）。`match` 命中后再逐个检查（同样对完整目标 URL 非锚定匹配），**任一命中即排除该规则**（视为不匹配，继续向下尝试后续规则）；全部不命中才应用本规则 |
 | `cache.enabled` | bool | 覆盖该规则的缓存开关 |
-| `cache.ttl` | duration | 覆盖该规则的缓存时长（必须 >0） |
+| `cache.ttl` | duration | 覆盖该规则的缓存时长；未配置沿用全局 `cache.ttl`；`0` = 永不过期；负数非法 |
 | `cache.path` | string | 该规则的**独立缓存目录**（trim 后为空 = 未配置，沿用全局 `cache.path`；同一 URL 永远落同一规则/目录） |
 | `cache.clean-interval` | duration | 该规则缓存目录的后台过期扫描间隔（必须 >=0，`0` 关闭；未配置沿用全局 `cache.clean-interval`） |
 | `http-proxy` | string | 该规则回源走指定代理（覆盖全局） |
@@ -162,7 +162,7 @@ url-redirect:                 # $1 = 原始目标 URL，按顺序轮询
 cache:
   enabled: true
   path: ./cache-data
-  ttl: 30m
+  ttl: 30m                    # 0=永不过期（未配置默认 30m；负数非法）
   clean-interval: 10m
 
 domain-rules:
@@ -172,7 +172,7 @@ domain-rules:
       - 'dongchengjie/airport'   # 该仓库不套用 6h 缓存，落到下一条规则或全局默认
     cache:
       enabled: true
-      ttl: 6h                # raw 内容缓存 6 小时
+      ttl: 6h                # raw 内容缓存 6 小时（0=永不过期）
       # path: ./cache-raw          # 规则独立缓存目录（不写沿用全局 cache.path）
       # clean-interval: 30m        # 该目录后台清理间隔（不写沿用全局 cache.clean-interval）
     # http-proxy: "http://127.0.0.1:7890"
@@ -256,8 +256,8 @@ curl "http://127.0.0.1:8080/healthz"
 - **文件格式**：8 字节文件头（4 字节魔数 + 4 字节元信息长度）+ JSON 元信息（状态码、响应头、写入时间、TTL）+ 响应体原文；单文件自包含，便于回放完整状态码与响应头
 - **并发安全**：写入先落同目录临时文件再 `rename` 原子替换；读取要么看到旧条目、要么看到完整新条目
 - **防击穿**：同一 URL 并发未命中时通过 singleflight 只回源一次，其余请求共享结果
-- **TTL 生效**：按「全局默认或域名规则覆盖」的 TTL 在**写入时固化**到条目；修改配置中的 TTL 只影响新写入条目（旧条目仍按写入时的 TTL 过期，或清空 cache 目录立即生效）
-- **过期清理**：读取命中过期条目时惰性删除 + 按生效目录每 `clean-interval`（全局默认或规则覆盖）后台全量扫描
+- **TTL 生效**：按「全局默认或域名规则覆盖」的 TTL 在**写入时固化**到条目；修改配置中的 TTL 只影响新写入条目（旧条目仍按写入时的 TTL 过期，或清空 cache 目录立即生效）。`cache.ttl: 0` 表示**永不过期**（条目内 `ttl_seconds=0` 标记，读取与后台清理均按此判定）。**注意**：永不过期条目后台清理不会删除，缓存目录会持续增长；仅 `Cache-Control: no-cache` 强制刷新可更新该条目内容，手动清空缓存目录可移除
+- **过期清理**：读取命中过期条目时惰性删除 + 按生效目录每 `clean-interval`（全局默认或规则覆盖）后台全量扫描；TTL<=0 的**永不过期条目会被跳过**（仍清理损坏文件与残留临时文件）
 - **规则级独立目录**：按目录复用缓存实例（同目录同一实例、同一后台清理协程，首次出现的 `clean-interval` 生效）；启动时按配置预热创建全部可能被写入的缓存目录，运行期按需获取实例失败时该请求降级为直接回源（BYPASS），不中断请求
 - **缓存条件**：仅 GET 且响应 200（content 模式还要求 body 非空）才写缓存；`Range` 请求、`Cache-Control: no-cache` 请求绕过缓存读取（no-cache 仍会刷新缓存）
 
