@@ -47,25 +47,28 @@ func TestResolveOptionsRuleCache(t *testing.T) {
 		wantInterval  time.Duration
 	}{
 		{
-			name:         "规则覆盖path与clean-interval生效",
-			rule:         RuleCache{Path: strPtr("./rule-cache"), CleanInterval: durPtr(5 * time.Minute)},
-			wantEnabled:  true, // 未配 enabled 沿用全局 true
-			wantPath:     "./rule-cache",
-			wantInterval: 5 * time.Minute,
+			name:          "规则覆盖path与clean-interval生效",
+			globalEnabled: true,
+			rule:          RuleCache{Path: strPtr("./rule-cache"), CleanInterval: durPtr(5 * time.Minute)},
+			wantEnabled:   true, // 未配 enabled 沿用全局 true
+			wantPath:      "./rule-cache",
+			wantInterval:  5 * time.Minute,
 		},
 		{
-			name:         "规则不配path与interval_沿用全局",
-			rule:         RuleCache{TTL: durPtr(time.Hour)},
-			wantEnabled:  true,
-			wantPath:     globalPath,
-			wantInterval: globalInterval,
+			name:          "规则不配path与interval_沿用全局",
+			globalEnabled: true,
+			rule:          RuleCache{TTL: durPtr(time.Hour)},
+			wantEnabled:   true,
+			wantPath:      globalPath,
+			wantInterval:  globalInterval,
 		},
 		{
-			name:         "规则path为空白串_视为未配置仍用全局_interval显式0生效",
-			rule:         RuleCache{Path: strPtr("   "), CleanInterval: durPtr(0)},
-			wantEnabled:  true,
-			wantPath:     globalPath,
-			wantInterval: 0, // 显式 0 = 关闭该目录后台清理
+			name:          "规则path为空白串_视为未配置仍用全局_interval显式0生效",
+			globalEnabled: true,
+			rule:          RuleCache{Path: strPtr("   "), CleanInterval: durPtr(0)},
+			wantEnabled:   true,
+			wantPath:      globalPath,
+			wantInterval:  0, // 显式 0 = 关闭该目录后台清理
 		},
 		{
 			name:          "全局关_规则开_核心场景",
