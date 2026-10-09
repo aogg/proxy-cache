@@ -4,7 +4,9 @@
 .dockerignore
 
 # 运行时与本地文件（不打入镜像上下文）
-cache/
+# 注意：运行时缓存目录是 cache-data/（对应 Dockerfile VOLUME /app/cache-data）；
+# cache/ 是源码包目录（cache/cache.go），不能排除，否则 go build 找不到 proxy-cache/cache 包
+cache-data/
 config.yaml
 *.log
 tmp/
