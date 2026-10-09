@@ -140,8 +140,9 @@ type DomainRule struct {
 	excludeRe []*regexp.Regexp
 }
 
-// label 返回规则的可读标识（优先 name，否则 match 原文）。
-func (r *DomainRule) label() string {
+// Label 返回规则的可读标识（优先 name，否则 match 原文）；
+// 供本包日志与 main 启动时的规则摘要日志复用。
+func (r *DomainRule) Label() string {
 	if r.Name != "" {
 		return r.Name
 	}
@@ -349,7 +350,7 @@ func (c *Config) Validate() error {
 		}
 		re, err := regexp.Compile(r.Match)
 		if err != nil {
-			return fmt.Errorf("domain-rules[%d] (%s) 的 match 正则无效: %w", i, r.label(), err)
+			return fmt.Errorf("domain-rules[%d] (%s) 的 match 正则无效: %w", i, r.Label(), err)
 		}
 		r.re = re
 		// exclude 正则逐个编译缓存（与 match 同样对「http://<Host>/<目标URL>」整串非锚定匹配）
@@ -357,29 +358,29 @@ func (c *Config) Validate() error {
 		for j, pat := range r.Exclude {
 			pat = strings.TrimSpace(pat)
 			if pat == "" {
-				return fmt.Errorf("domain-rules[%d] (%s) 的 exclude 第 %d 项为空", i, r.label(), j)
+				return fmt.Errorf("domain-rules[%d] (%s) 的 exclude 第 %d 项为空", i, r.Label(), j)
 			}
 			ex, err := regexp.Compile(pat)
 			if err != nil {
-				return fmt.Errorf("domain-rules[%d] (%s) 的 exclude 第 %d 项正则无效: %w", i, r.label(), j, err)
+				return fmt.Errorf("domain-rules[%d] (%s) 的 exclude 第 %d 项正则无效: %w", i, r.Label(), j, err)
 			}
 			r.excludeRe = append(r.excludeRe, ex)
 		}
 		// 规则级覆盖项合法性：ttl 负数为配置错误；显式 0 = 永不过期（合法）
 		if r.Cache.TTL != nil && r.Cache.TTL.D() < 0 {
-			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.ttl 不能为负数（0 表示永不过期，不配置则沿用全局 cache.ttl）", i, r.label())
+			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.ttl 不能为负数（0 表示永不过期，不配置则沿用全局 cache.ttl）", i, r.Label())
 		}
 		// cache.path 允许为空（trim 后空 = 未配置，沿用全局 cache.path），无需校验
 		if r.Cache.CleanInterval != nil && r.Cache.CleanInterval.D() < 0 {
-			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.clean-interval 必须大于等于 0", i, r.label())
+			return fmt.Errorf("domain-rules[%d] (%s) 的 cache.clean-interval 必须大于等于 0", i, r.Label())
 		}
 		if r.HTTPProxy != nil && strings.TrimSpace(*r.HTTPProxy) != "" {
 			if err := validateProxyAddr(*r.HTTPProxy); err != nil {
-				return fmt.Errorf("domain-rules[%d] (%s) 的 http-proxy 无效: %w", i, r.label(), err)
+				return fmt.Errorf("domain-rules[%d] (%s) 的 http-proxy 无效: %w", i, r.Label(), err)
 			}
 		}
 		if r.URLRedirect != nil {
-			if err := validateRedirectTemplates(*r.URLRedirect, fmt.Sprintf("domain-rules[%d] (%s) 的 url-redirect", i, r.label())); err != nil {
+			if err := validateRedirectTemplates(*r.URLRedirect, fmt.Sprintf("domain-rules[%d] (%s) 的 url-redirect", i, r.Label())); err != nil {
 				return err
 			}
 		}
@@ -389,12 +390,12 @@ func (c *Config) Validate() error {
 				v = c.SuccessCheck // 显式留空 = 沿用全局取值
 			}
 			if v != SuccessCheckStatus && v != SuccessCheckContent {
-				return fmt.Errorf("domain-rules[%d] (%s) 的 success-check 仅支持 status 或 content", i, r.label())
+				return fmt.Errorf("domain-rules[%d] (%s) 的 success-check 仅支持 status 或 content", i, r.Label())
 			}
 			r.SuccessCheck = &v
 		}
 		if r.Timeout != nil && r.Timeout.D() <= 0 {
-			return fmt.Errorf("domain-rules[%d] (%s) 的 timeout 必须大于 0", i, r.label())
+			return fmt.Errorf("domain-rules[%d] (%s) 的 timeout 必须大于 0", i, r.Label())
 		}
 	}
 	// //////////////////  域名规则校验  end  ////////////////////////////////////////////////
@@ -473,7 +474,7 @@ func (c *Config) ResolveOptions(host, targetURL string) Options {
 		// match 命中且该规则所有 exclude 均不命中才应用；
 		// 被 exclude 排除的规则视为不匹配，继续向下尝试后续规则。
 		matched, excluded := r.matchResult(matchStr)
-		slog.Debug("域名规则匹配", "rule", r.label(), "matched", matched, "excluded", excluded)
+		slog.Debug("域名规则匹配", "rule", r.Label(), "matched", matched, "excluded", excluded)
 		if !matched || excluded {
 			continue
 		}
@@ -507,21 +508,22 @@ func (c *Config) ResolveOptions(host, targetURL string) Options {
 		if r.Timeout != nil {
 			o.Timeout = r.Timeout.D()
 		}
-		o.Rule = r.label()
+		o.Rule = r.Label()
 		break // 自上而下第一条命中即生效
 	}
 	// //////////////////  应用第一条命中的域名规则覆盖项  end  ////////////////////////////////////////////////
 
 	// //////////////////  匹配结果日志  start  ////////////////////////////////////////////////
-	// 全部规则未命中时按 debug 留痕，最终生效结果（命中规则名或 global-default）按 info 输出
+	// 全部规则未命中时按 debug 留痕，最终生效结果（命中规则名或 global-default）按 info 输出；
+	// 同时输出参与匹配的入站 Host，便于核对「match 含 Host 段时是否因 Host 不符而未命中」
 	if o.Rule == "" {
-		slog.Debug("未命中任何域名规则，使用全局默认配置", "target", targetURL)
+		slog.Debug("未命中任何域名规则，使用全局默认配置", "host", strings.ToLower(strings.TrimSpace(host)), "target", targetURL)
 	}
 	rule := o.Rule
 	if rule == "" {
 		rule = "global-default"
 	}
-	slog.Info("规则匹配结果", "rule", rule, "target", targetURL)
+	slog.Info("规则匹配结果", "rule", rule, "host", strings.ToLower(strings.TrimSpace(host)), "target", targetURL)
 	// //////////////////  匹配结果日志  end  ////////////////////////////////////////////////
 	return o
 }

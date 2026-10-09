@@ -264,15 +264,19 @@ log:
 
 | 级别 | 能看到什么 |
 | --- | --- |
-| `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched` / `excluded` 明细）、url-redirect 轮询起始下标与每次候选尝试、缓存查询 HIT/MISS 与写缓存细节 |
-| `info` | 规则匹配结果（`规则匹配结果`）、url-redirect 候选命中（`url-redirect 候选命中`）、全败回退直连、每条访问完成日志（`代理请求完成`）、异常恢复提示 |
+| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index` + 按尝试顺序的 `模板[下标] 模板 -> 替换$1后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、每条访问完成日志（`代理请求完成`） |
+| `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched` / `excluded` 明细）、每次候选尝试开始、缓存查询 MISS 细节 |
 | `warn` | 候选请求失败 / 未过成功判据 / 回退直连、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
 | `error` | 仅错误：回源彻底失败（502）等 |
 
 ### 排障指引
 
+- **规则缓存目录没有生成缓存文件**，按顺序看三处日志：
+  1. 启动日志 `域名规则已加载`：核对每条规则的 `match`、`cache_enabled`、`cache_path`、`cache_ttl`、`url_redirect` 是否符合预期（规则未配置项显示沿用全局后的生效值）；
+  2. 请求日志 `规则匹配结果`：`rule` 是命中规则名，`global-default` 表示没命中任何规则——match 里写了入站 Host 段（如 `http://github\.path\..+`）时，请求的 Host 必须以该段开头（如 `github.path.xxx`），直接用 IP:端口访问不会命中，会落全局默认（没有规则的 url-redirect、缓存写进全局 `cache.path` 目录）；
+  3. `GET 请求绕过缓存（BYPASS）` / `写入缓存成功` / `缓存命中（HIT）`：分别说明这次为什么不缓存、实际写到了哪个文件（`file` 字段）、命中了哪个文件。
 - **域名规则没按预期命中**：把 `log.level` 设为 `debug`，观察每条规则的「域名规则匹配」日志（`matched` 表示 match 是否命中、`excluded` 表示是否被 exclude 排除）与最终的「规则匹配结果」日志（`rule` 为命中的规则名，未命中为 `global-default`），即可区分是 match 没命中还是被 exclude 排除。
-- **url-redirect 候选行为异常**：`debug` 级别下可看到「url-redirect 候选展开」（候选数量、轮询起始下标、尝试顺序）与每次「尝试 url-redirect 候选」日志，配合 `warn` 级别的失败原因定位问题候选。
+- **url-redirect 候选行为异常**：`info` 级别即可看到「url-redirect 轮询展开」（候选数量、轮询起始下标、按尝试顺序的模板与替换后 URL）与每条候选的结果日志（命中为 `url-redirect 候选命中并作为最终返回`，失败在 `warn` 级别），无需开 debug 就能还原整轮轮询；`debug` 额外提供每次尝试开始的明细。
 
 ## 缓存实现说明
 

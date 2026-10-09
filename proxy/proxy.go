@@ -193,10 +193,22 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 // handleGet 处理 GET 请求：读缓存（HIT）或 单飞回源 + 写缓存（MISS）；不可缓存时直接回源（BYPASS）。
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string, eff config.Options, start time.Time) {
 	key := cache.Key(target)
-	// Range / no-cache 请求绕过缓存读取（避免语义冲突与强制刷新），其余启用缓存条件：cache.enabled 且 ttl>=0
-	//（TTL=0 表示永不过期，同样可缓存；负数理论上已被 config.Validate 拦截，此处 >=0 兜底防御）
-	cacheable := eff.CacheEnabled && eff.CacheTTL >= 0 &&
-		r.Header.Get("Range") == "" && !clientNoCache(r)
+	// 先判定本请求不走缓存的具体原因（空串表示可缓存），再把原因暴露到日志，
+	// 避免出现「没写缓存文件但日志看不出为什么」的排查黑洞。
+	// 可缓存条件：cache.enabled 且 ttl>=0（TTL=0 表示永不过期，同样可缓存；负数理论上
+	// 已被 config.Validate 拦截，此处 >=0 兜底防御）且无 Range / no-cache 语义冲突
+	bypassReason := ""
+	switch {
+	case !eff.CacheEnabled:
+		bypassReason = "cache-disabled" // 全局或命中规则显式关闭缓存
+	case eff.CacheTTL < 0:
+		bypassReason = "negative-ttl" // 防御分支：Validate 已拦截负 TTL
+	case r.Header.Get("Range") != "":
+		bypassReason = "request-range" // Range 请求绕过缓存读取（避免语义冲突）
+	case clientNoCache(r):
+		bypassReason = "request-no-cache" // 客户端要求强制回源刷新
+	}
+	cacheable := bypassReason == ""
 
 	// 解析本请求生效的缓存实例：规则可配独立缓存目录，按生效目录向管理器获取（复用已预热实例）；
 	// 获取失败时本次请求降级为直接回源（BYPASS），不中断服务
@@ -206,12 +218,17 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		if err != nil {
 			s.log.Warn("获取缓存实例失败，本次请求降级为直接回源", "dir", eff.CachePath, "err", err)
 			cacheable = false
+			bypassReason = "cache-init-failed"
 		} else {
 			disk = c
 		}
 	}
 
 	if !cacheable {
+		// 不走缓存的决策留痕：Info 级输出原因与生效规则（含未命中任何规则的 global-default），
+		// 让「为什么不写缓存文件」在日志里直接可见
+		s.log.Info("GET 请求绕过缓存（BYPASS）", "rule", eff.Rule, "reason", bypassReason,
+			"target", truncate(target, 300))
 		// //////////////////  不走缓存：直接按生效配置回源  start  ////////////////////////////////////////////////
 		e, err := s.fetchViaCandidates(r, target, eff)
 		if err != nil {
@@ -226,7 +243,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	// //////////////////  查缓存：命中直接回放  start  ////////////////////////////////////////////////
 	if disk != nil {
 		if e, ok := disk.Get(key); ok {
-			s.log.Debug("缓存查询结果", "result", "HIT", "key", key, "dir", eff.CachePath)
+			// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径
+			s.log.Info("缓存命中（HIT）", "rule", eff.Rule, "key", key,
+				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))
 			s.serveEntry(w, r, e, "HIT", eff, start)
 			return
 		}
@@ -248,9 +267,17 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 				if serr := disk.Set(key, ent); serr != nil {
 					s.log.Warn("写入缓存失败", "key", key, "target", target, "err", serr)
 				} else {
-					s.log.Debug("写入缓存成功", "key", key, "ttl", ent.TTL.String())
+					// 写盘成功必须可见：规则名、缓存 key、实际落盘文件路径、body 大小与生效 TTL
+					s.log.Info("写入缓存成功",
+						"rule", eff.Rule, "target", truncate(target, 300), "key", key,
+						"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))
 				}
 			}
+		} else {
+			// 回源成功但不满足缓存判据：同样留痕，说明为什么这次没写缓存文件
+			s.log.Info("回源成功但不写缓存（未过成功判据或非 200）",
+				"rule", eff.Rule, "status", ent.Status, "check", eff.SuccessCheck,
+				"body_bytes", len(ent.Body), "target", truncate(target, 300))
 		}
 		return ent, nil
 	})
@@ -287,36 +314,49 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 	start := int(s.rr.Add(1)-1) % len(candidates)
 	// //////////////////  轮询起始下标：第 1 次请求从 0 开始，之后逐次 +1  end  ////////
 
-	// //////////////////  候选展开日志  start  ////////////////////////////////////////////////
-	// 按实际尝试顺序（round-robin 起始下标起轮换）输出展开前模板列表，避免逐条拼入超长目标 URL
-	order := make([]string, 0, len(eff.URLRedirect))
-	for i := range eff.URLRedirect {
-		order = append(order, eff.URLRedirect[(start+i)%len(eff.URLRedirect)])
+	// //////////////////  轮询展开明细日志  start  ////////////////////////////////////////////////
+	// 按「本轮实际尝试顺序」输出每个候选的原始模板与 $1 替换后的最终 URL，并给出本轮
+	// round-robin 起始下标（0 基，指向模板列表下标）；candidates 与 eff.URLRedirect 同序等长，
+	// details[i] 即第 (start+i)%n 个模板展开结果。Info 级保证默认日志级别下可见。
+	details := make([]string, 0, len(candidates))
+	for i := range candidates {
+		idx := (start + i) % len(candidates) // 该候选在模板列表中的原始下标
+		details = append(details, fmt.Sprintf("模板[%d] %s -> %s", idx, eff.URLRedirect[idx], candidates[idx]))
 	}
-	s.log.Debug("url-redirect 候选展开", "count", len(candidates), "start_index", start, "order", order)
-	// //////////////////  候选展开日志  end  ////////////////////////////////////////////////
+	s.log.Info("url-redirect 轮询展开", "start_index", start,
+		"count", len(candidates), "candidates", details)
+	// //////////////////  轮询展开明细日志  end  ////////////////////////////////////////////////
 
 	// //////////////////  逐个尝试候选  start  ////////////////////////////////////////////////
 	var lastErr error
 	for i := 0; i < len(candidates); i++ {
-		cand := candidates[(start+i)%len(candidates)]
-		s.log.Debug("尝试 url-redirect 候选", "index", i, "candidate", cand)
+		idx := (start + i) % len(candidates) // 该候选在模板列表中的原始下标
+		cand := candidates[idx]
+		tpl := eff.URLRedirect[idx]
+		s.log.Debug("尝试 url-redirect 候选", "attempt", i, "index", idx,
+			"template", tpl, "candidate", cand)
 		candStart := time.Now() // 该候选耗时（含请求与响应读取）
 		e, err := s.doRequest(r, http.MethodGet, cand, nil, eff)
 		if err != nil {
 			lastErr = err
-			s.log.Warn("url-redirect 候选请求失败", "candidate", cand, "err", err)
+			s.log.Warn("url-redirect 候选请求失败", "attempt", i, "index", idx,
+				"template", tpl, "candidate", cand,
+				"cost", time.Since(candStart).Round(time.Millisecond).String(), "err", err)
 			continue
 		}
 		if checkSuccess(e, eff.SuccessCheck) {
 			e.Source = cand
-			s.log.Info("url-redirect 候选命中", "index", i, "candidate", cand,
-				"cost", time.Since(candStart).Round(time.Millisecond).String())
+			// 命中即最终返回：输出命中的是第几个候选（模板下标 + 轮内尝试序）、
+			// 模板与替换后 URL、HTTP 状态码与耗时，作为「最终采用哪个候选」的留痕
+			s.log.Info("url-redirect 候选命中并作为最终返回", "attempt", i, "index", idx,
+				"template", tpl, "candidate", cand, "status", e.Status,
+				"bytes", len(e.Body), "cost", time.Since(candStart).Round(time.Millisecond).String())
 			return e, nil
 		}
 		lastErr = fmt.Errorf("候选 %s 未通过 success-check=%s（状态码 %d，body %d 字节）",
 			cand, eff.SuccessCheck, e.Status, len(e.Body))
-		s.log.Warn("url-redirect 候选未通过成功判据", "candidate", cand,
+		s.log.Warn("url-redirect 候选未通过成功判据", "attempt", i, "index", idx,
+			"template", tpl, "candidate", cand,
 			"check", eff.SuccessCheck, "status", e.Status, "body_bytes", len(e.Body))
 	}
 	// //////////////////  逐个尝试候选  end  ////////////////////////////////////////////////
@@ -573,6 +613,14 @@ func clientNoCache(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// ttlDisplay 把缓存 TTL 格式化为日志展示值：<=0（永不过期）输出 never，其余输出 duration 字符串。
+func ttlDisplay(d time.Duration) string {
+	if d <= 0 {
+		return "never"
+	}
+	return d.String()
 }
 
 // truncate 截断过长字符串，用于日志与错误信息。

@@ -9,9 +9,12 @@ listen: "0.0.0.0:8080"
 
 # 日志级别：debug / info / warn / error（大小写不敏感；留空默认 info；非法值启动时直接报错）
 # 四级从多到少：debug > info > warn > error，高级别包含低级别的全部日志
-#   info  - 规则匹配结果、url-redirect 候选命中、全败回退直连、每条访问完成日志、异常恢复提示
+#   info  - 每次决策结果全留痕：规则匹配结果（含入站 Host）、GET 绕过缓存（BYPASS）原因、
+#           url-redirect 轮询展开（本轮起始下标 + 各候选模板与 $1 替换后最终 URL）、
+#           候选命中并最终返回 / 候选失败、全败回退直连、缓存命中（含文件路径）、
+#           写入缓存成功（含规则名/缓存 key/落盘文件路径/body 大小/ttl）、每条访问完成日志
 #   debug - 在 info 基础上再增加：代理请求开始、逐条域名规则匹配过程（matched/excluded 明细）、
-#           轮询起始下标与每次候选尝试、缓存查询 HIT/MISS 与写缓存等细节
+#           每次候选尝试开始、缓存查询 MISS 明细等细节
 #   warn  - 在 info 基础上再增加：候选请求失败/未过判据/回退直连、写缓存失败、ACL 拦截等警告（含 error）
 #   error - 仅输出错误：回源彻底失败（502）等
 log:
@@ -46,6 +49,11 @@ url-redirect:
   - https://mirror.ghproxy.com/$1
 
 # 缓存配置
+# 注意：整块注释掉 cache: 并不等于关闭缓存！未配置时启用内置默认值
+#   （enabled: true / path: ./cache-data / ttl: 30m / clean-interval: 10m，
+#    启动日志 cache_enabled 可见实际生效值）。要关闭全局缓存必须显式写：
+#   cache:
+#     enabled: false
 cache:
   enabled: true              # 是否启用缓存（全局关闭后仍可在 domain-rules 内按规则开启，见下方场景示例）
   path: ./cache-data         # 缓存目录（默认 ./cache-data；命名避免与源码 cache/ 包目录混用）
@@ -56,7 +64,12 @@ cache:
 # match 与 exclude 均对「http://<入站Host>/<目标URL>」整串做非锚定匹配（Host 归一化为小写）：
 #   - 按目标 URL 匹配（旧写法兼容，非锚定）：如 raw\.githubusercontent\.com
 #   - 按入站域名匹配：如 'http://github\.path\..+'（入站 Host 形如 github.path.xxx 时命中）
-# 注意：缓存 key 与 allow-list / deny-list 仍只对目标 URL 匹配
+# 注意 1：缓存 key 与 allow-list / deny-list 仍只对目标 URL 匹配
+# 注意 2：match 里写了入站 Host 段（如 http://github\.path\..+）时，必须让请求的
+#         Host 以该段开头（如用 github.path.你的域名 解析到本服务再访问）；
+#         直接用 IP:端口 或不相关域名访问不会命中本规则，会落全局默认配置
+#         （日志「规则匹配结果 rule=global-default」可确认），此时既没有规则的
+#         url-redirect 轮询，也不会写规则独立缓存目录
 # exclude（可选）为排除正则列表，同样对整串非锚定匹配：
 #   match 命中后再逐个检查 exclude，任一命中即排除本规则（视为不匹配），
 #   继续向下尝试后续规则（都不命中则走全局默认配置）

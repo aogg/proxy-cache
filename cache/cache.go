@@ -100,6 +100,10 @@ func New(dir string) (*Cache, error) {
 // Dir 返回缓存目录路径。
 func (c *Cache) Dir() string { return c.dir }
 
+// FilePath 返回缓存键对应的磁盘文件完整路径（dir/key），
+// 供上层日志与观测输出「实际写盘/命中的是哪个文件」，不做任何磁盘操作。
+func (c *Cache) FilePath(key string) string { return c.path(key) }
+
 // Key 返回目标 URL 对应的缓存键（sha256 十六进制，64 字符）。
 func Key(target string) string {
 	sum := sha256.Sum256([]byte(target))

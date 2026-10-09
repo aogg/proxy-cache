@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -106,11 +107,6 @@ func run() error {
 
 	// 启动日志的 cache_ttl 字段：显式 0（永不过期）输出 never，否则输出 duration 字符串
 	//（GlobalCacheTTL 内含 nil 防御；Load 必经 Validate，正常情况非 nil）
-	cacheTTLLog := "never"
-	if d := cfg.GlobalCacheTTL(); d > 0 {
-		cacheTTLLog = d.String()
-	}
-
 	logger.Info("proxy-cache 已启动",
 		"version", proxy.Version,
 		"listen", ln.Addr().String(),
@@ -118,7 +114,7 @@ func run() error {
 		"log_level", cfg.LogLevel().String(),
 		"cache_enabled", cfg.Cache.Enabled,
 		"cache_dirs", len(activeDirs),
-		"cache_ttl", cacheTTLLog,
+		"cache_ttl", cacheTTLLog(cfg.GlobalCacheTTL()),
 		"url_redirect", len(cfg.URLRedirect),
 		"domain_rules", len(cfg.DomainRules),
 		"http_proxy", cfg.HTTPProxy,
@@ -130,6 +126,41 @@ func run() error {
 			source = "global"
 		}
 		logger.Info("缓存目录已就绪", "dir", dir, "clean_interval", activeDirs[dir].String(), "source", source)
+	}
+	// 逐条输出域名规则摘要：match 正则与规则级 cache / url-redirect 的生效值（未配置项沿用全局），
+	// 启动时即可核对「规则是否注册了独立缓存目录与轮询候选」——排查不写缓存先看这里
+	for i := range cfg.DomainRules {
+		r := &cfg.DomainRules[i]
+		// 规则 cache.enabled 显式值优先，否则沿用全局开关（与 ResolveOptions 合并语义一致）
+		cacheEnabled := cfg.Cache.Enabled
+		if r.Cache.Enabled != nil {
+			cacheEnabled = *r.Cache.Enabled
+		}
+		// 规则 cache.path 未配置（trim 后空）沿用全局目录
+		cachePath := cfg.Cache.Path
+		if r.Cache.Path != nil {
+			if p := strings.TrimSpace(*r.Cache.Path); p != "" {
+				cachePath = p
+			}
+		}
+		// 规则 cache.ttl 未配置沿用全局；0 = 永不过期
+		cacheTTL := cfg.GlobalCacheTTL()
+		if r.Cache.TTL != nil {
+			cacheTTL = r.Cache.TTL.D()
+		}
+		// 规则 url-redirect 未配置沿用全局候选列表
+		redirects := cfg.URLRedirect
+		if r.URLRedirect != nil {
+			redirects = *r.URLRedirect
+		}
+		logger.Info("域名规则已加载",
+			"rule", r.Label(),
+			"match", r.Match,
+			"cache_enabled", cacheEnabled,
+			"cache_path", cachePath,
+			"cache_ttl", cacheTTLLog(cacheTTL),
+			"url_redirect", len(redirects),
+		)
 	}
 	logger.Info("使用示例: curl -i http://" + displayAddr(ln.Addr()) + "/https://raw.githubusercontent.com/user/repo/main/README.md")
 	// //////////////////  启动 HTTP 服务  end  ////////////////////////////////////////////////
@@ -177,4 +208,13 @@ func displayAddr(a net.Addr) string {
 		return "127.0.0.1:" + fmt.Sprint(tcp.Port)
 	}
 	return a.String()
+}
+
+// cacheTTLLog 把缓存 TTL 格式化为启动/规则摘要日志展示值：
+// <=0（0 = 永不过期）输出 never，否则输出 duration 字符串（如 30m0s / 666h0m0s）。
+func cacheTTLLog(d time.Duration) string {
+	if d <= 0 {
+		return "never"
+	}
+	return d.String()
 }
