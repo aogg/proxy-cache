@@ -184,33 +184,40 @@ var conditionalRequestHeaders = []string{
 	"If-Match", "If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since",
 }
 
-// TestCheckSuccess 表驱动验证 checkSuccess 判据语义：
-// 200 即成功（content 模式还要求 body 非空）；HTTP 304（内容未变更）在两种模式下
-// 均视为成功——条件请求头已不透传，上游对无条件 GET 仍回 304 属异常/缓存副本有效语义，
-// 应判为成功候选而非失败；其余状态码一律不成功。
+// TestCheckSuccess 表驱动验证 checkSuccess 判据语义（签名含 method：HEAD 按 status 语义）：
+// 200 即成功（content 模式还要求 body 非空；HEAD 响应天然无 body，content 判据对 HEAD
+// 自动按 status 语义——200 即成功，docker registry 的 HEAD 探测不被「body 为空」误拒）；
+// HTTP 304（内容未变更）在两种模式下均视为成功——条件请求头已不透传，上游对无条件 GET
+// 仍回 304 属异常/缓存副本有效语义，应判为成功候选而非失败；其余状态码一律不成功。
+// 既有用例保持 GET 语义不变（补第三参 http.MethodGet），新增 HEAD 行覆盖方法维度。
 func TestCheckSuccess(t *testing.T) {
 	tests := []struct {
 		name   string
 		status int
 		body   string
 		check  string
+		method string
 		want   bool
 	}{
-		{"status-200即成功", http.StatusOK, "content", config.SuccessCheckStatus, true},
-		{"status-200空body也算成功", http.StatusOK, "", config.SuccessCheckStatus, true},
-		{"content-200非空body成功", http.StatusOK, "content", config.SuccessCheckContent, true},
-		{"content-200空body不成功", http.StatusOK, "", config.SuccessCheckContent, false},
-		{"status-304视为成功", http.StatusNotModified, "", config.SuccessCheckStatus, true},
-		{"content-304也视为成功", http.StatusNotModified, "", config.SuccessCheckContent, true},
-		{"status-404不成功", http.StatusNotFound, "not found", config.SuccessCheckStatus, false},
-		{"content-500不成功", http.StatusInternalServerError, "boom", config.SuccessCheckContent, false},
+		{"status-200即成功", http.StatusOK, "content", config.SuccessCheckStatus, http.MethodGet, true},
+		{"status-200空body也算成功", http.StatusOK, "", config.SuccessCheckStatus, http.MethodGet, true},
+		{"content-200非空body成功", http.StatusOK, "content", config.SuccessCheckContent, http.MethodGet, true},
+		{"content-200空body不成功", http.StatusOK, "", config.SuccessCheckContent, http.MethodGet, false},
+		{"status-304视为成功", http.StatusNotModified, "", config.SuccessCheckStatus, http.MethodGet, true},
+		{"content-304也视为成功", http.StatusNotModified, "", config.SuccessCheckContent, http.MethodGet, true},
+		{"status-404不成功", http.StatusNotFound, "not found", config.SuccessCheckStatus, http.MethodGet, false},
+		{"content-500不成功", http.StatusInternalServerError, "boom", config.SuccessCheckContent, http.MethodGet, false},
+		{"content-HEAD-200无body按status语义成功", http.StatusOK, "", config.SuccessCheckContent, http.MethodHead, true},
+		{"status-HEAD-200无body成功", http.StatusOK, "", config.SuccessCheckStatus, http.MethodHead, true},
+		{"HEAD-304视为成功", http.StatusNotModified, "", config.SuccessCheckContent, http.MethodHead, true},
+		{"HEAD-404不成功", http.StatusNotFound, "", config.SuccessCheckStatus, http.MethodHead, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			e := &cache.Entry{Status: tt.status, Body: []byte(tt.body)}
-			if got := checkSuccess(e, tt.check); got != tt.want {
-				t.Errorf("checkSuccess(status=%d, body=%d字节, check=%q) = %v, want %v",
-					tt.status, len(tt.body), tt.check, got, tt.want)
+			if got := checkSuccess(e, tt.check, tt.method); got != tt.want {
+				t.Errorf("checkSuccess(status=%d, body=%d字节, check=%q, method=%q) = %v, want %v",
+					tt.status, len(tt.body), tt.check, tt.method, got, tt.want)
 			}
 		})
 	}
