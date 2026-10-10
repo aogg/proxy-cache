@@ -5,7 +5,9 @@ package proxy
 //   - 首个候选通过 success-check=content 即返回（Entry.Source 为该候选 URL）；
 //   - 首个候选失败（判据不过）时轮换到下一个候选命中；
 //   - 起始下标随请求次数 round-robin 轮换（第 1 次从 0 开始，之后逐次 +1）；
-//   - 候选全部失败时按 fallback-direct 回退直连原始 URL，或关闭回退时报错。
+//   - 候选全部失败时按 fallback-direct 回退直连原始 URL，或关闭回退时报错；
+//   - success-check 判据（checkSuccess）对 200/304/其他状态码的成败语义；
+//   - 条件请求头（If-None-Match 等）不再透传给上游，其余白名单头（Range）保持透传。
 
 import (
 	"io"
@@ -13,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"proxy-cache/cache"
@@ -173,4 +176,110 @@ func TestFetchViaCandidatesFallbackDirect(t *testing.T) {
 			t.Errorf("错误信息 %q 应包含 %q", err.Error(), "fallback-direct")
 		}
 	})
+}
+
+// conditionalRequestHeaders 条件请求头清单（与 RFC 9110 条件请求头一致），
+// 期望全部不透传给上游：否则上游回 304 空 body 会破坏成功判据与缓存写入。
+var conditionalRequestHeaders = []string{
+	"If-Match", "If-Modified-Since", "If-None-Match", "If-Range", "If-Unmodified-Since",
+}
+
+// TestCheckSuccess 表驱动验证 checkSuccess 判据语义：
+// 200 即成功（content 模式还要求 body 非空）；HTTP 304（内容未变更）在两种模式下
+// 均视为成功——条件请求头已不透传，上游对无条件 GET 仍回 304 属异常/缓存副本有效语义，
+// 应判为成功候选而非失败；其余状态码一律不成功。
+func TestCheckSuccess(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		check  string
+		want   bool
+	}{
+		{"status-200即成功", http.StatusOK, "content", config.SuccessCheckStatus, true},
+		{"status-200空body也算成功", http.StatusOK, "", config.SuccessCheckStatus, true},
+		{"content-200非空body成功", http.StatusOK, "content", config.SuccessCheckContent, true},
+		{"content-200空body不成功", http.StatusOK, "", config.SuccessCheckContent, false},
+		{"status-304视为成功", http.StatusNotModified, "", config.SuccessCheckStatus, true},
+		{"content-304也视为成功", http.StatusNotModified, "", config.SuccessCheckContent, true},
+		{"status-404不成功", http.StatusNotFound, "not found", config.SuccessCheckStatus, false},
+		{"content-500不成功", http.StatusInternalServerError, "boom", config.SuccessCheckContent, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &cache.Entry{Status: tt.status, Body: []byte(tt.body)}
+			if got := checkSuccess(e, tt.check); got != tt.want {
+				t.Errorf("checkSuccess(status=%d, body=%d字节, check=%q) = %v, want %v",
+					tt.status, len(tt.body), tt.check, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestForwardRequestHeadersNoConditional 直接断言回源请求头白名单不含任何条件请求头，
+// 且 Range 保持透传（与 forwardRequestHeaders 注释声明一致）。
+func TestForwardRequestHeadersNoConditional(t *testing.T) {
+	forwarded := map[string]bool{}
+	for _, h := range forwardRequestHeaders {
+		forwarded[strings.ToLower(h)] = true
+	}
+	for _, h := range conditionalRequestHeaders {
+		if forwarded[strings.ToLower(h)] {
+			t.Errorf("白名单不应包含条件请求头 %s", h)
+		}
+	}
+	if !forwarded["range"] {
+		t.Error("白名单应保留 Range 透传")
+	}
+}
+
+// TestConditionalHeadersNotForwarded 用 httptest 假上游断言条件请求头不再透传：
+// 客户端带全量条件请求头 + Range 回源时，上游不应收到任何条件头（收到的应只有白名单头），
+// Range 保持透传；上游返回 200 + 完整 body，判据可过、缓存可写。
+func TestConditionalHeadersNotForwarded(t *testing.T) {
+	var mu sync.Mutex
+	gotConditional := map[string]string{} // 上游实际收到的条件请求头（应为空）
+	gotRange := ""                        // 上游实际收到的 Range（应原样透传）
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		for _, h := range conditionalRequestHeaders {
+			if v := r.Header.Get(h); v != "" {
+				gotConditional[h] = v
+			}
+		}
+		gotRange = r.Header.Get("Range")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "content")
+	}))
+	defer upstream.Close()
+
+	s := newCandidatesServer(t, []string{upstream.URL + "/$1"}, true)
+
+	// 客户端带全量条件请求头 + Range 发起代理请求
+	r := httptest.NewRequest(http.MethodGet, "/"+candidatesTargetURL, nil)
+	r.Header.Set("If-Match", `"xyz"`)
+	r.Header.Set("If-Modified-Since", "Mon, 02 Jan 2006 15:04:05 GMT")
+	r.Header.Set("If-None-Match", `"abc"`)
+	r.Header.Set("If-Range", `"abc"`)
+	r.Header.Set("If-Unmodified-Since", "Mon, 02 Jan 2006 15:04:05 GMT")
+	r.Header.Set("Range", "bytes=0-9")
+
+	eff := s.cfg.ResolveOptions("", candidatesTargetURL)
+	e, err := s.fetchViaCandidates(r, candidatesTargetURL, eff)
+	if err != nil {
+		t.Fatalf("fetchViaCandidates() 意外报错: %v", err)
+	}
+	if e.Status != http.StatusOK {
+		t.Errorf("Status = %d, want %d（条件头不透传后上游应回 200 完整内容）", e.Status, http.StatusOK)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotConditional) > 0 {
+		t.Errorf("条件请求头不应透传给上游，实际收到: %v", gotConditional)
+	}
+	if want := "bytes=0-9"; gotRange != want {
+		t.Errorf("上游收到的 Range = %q, want %q（Range 应保持透传）", gotRange, want)
+	}
 }

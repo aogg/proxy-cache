@@ -12,7 +12,9 @@ listen: "0.0.0.0:8080"
 #   info  - 每次决策结果全留痕：规则匹配结果（含入站 Host）、GET 绕过缓存（BYPASS）原因、
 #           url-redirect 轮询展开（本轮起始下标 + 各候选模板与 $1 替换后最终 URL）、
 #           候选命中并最终返回 / 候选失败、全败回退直连、缓存命中（含文件路径）、
-#           写入缓存成功（含规则名/缓存 key/落盘文件路径/body 大小/ttl）、每条访问完成日志
+#           写入缓存成功（含规则名/缓存 key/落盘文件路径/body 大小/ttl）、
+#           成功返回内容（200 且 body 非空：来源/状态码/字节数/缓存状态）、
+#           内容未变更（304，客户端缓存副本有效）、每条访问完成日志
 #   debug - 在 info 基础上再增加：代理请求开始、逐条域名规则匹配过程（matched/excluded 明细）、
 #           每次候选尝试开始、缓存查询 MISS 明细等细节
 #   warn  - 在 info 基础上再增加：候选请求失败/未过判据/回退直连、写缓存失败、ACL 拦截等警告（含 error）
@@ -32,6 +34,9 @@ http-proxy: ""
 # url-redirect 候选的成功判据：
 #   status  - HTTP 200 即算成功
 #   content - HTTP 200 且 body 非空才算成功（默认，防止镜像返回空内容/软 404）
+# HTTP 304（内容未变更）在两种模式下均视为成功候选：条件请求头（If-None-Match 等 5 个）
+# 不透传给上游，回源始终为无条件 GET；若上游对无条件 GET 仍回 304，304 原样透传给客户端
+# （不写缓存，客户端用本地缓存副本），日志按成功留痕而非失败
 success-check: content
 
 # 所有 url-redirect 候选都失败后，是否回退直接请求原始 URL
@@ -42,7 +47,8 @@ fallback-direct: true
 #   https://hk.gh-proxy.org/$1 + https://raw.githubusercontent.com/a/b
 #   => https://hk.gh-proxy.org/https://raw.githubusercontent.com/a/b
 # 按 round-robin 轮换起始下标逐个尝试（第 1 个请求从第 1 条开始，第 2 个请求从第 2 条开始……），
-# 只要有一个候选通过 success-check 即返回并写缓存；候选全部失败时按 fallback-direct 处理
+# 只要有一个候选通过 success-check 即返回（200 才写缓存；304 视为成功并原样透传、不写缓存）；
+# 候选全部失败时按 fallback-direct 处理
 url-redirect:
   - https://hk.gh-proxy.org/$1
   - https://gh-proxy.com/$1

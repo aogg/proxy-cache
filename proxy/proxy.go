@@ -32,10 +32,13 @@ var hopByHopHeaders = []string{
 }
 
 // forwardRequestHeaders 回源请求（含 url-redirect 候选请求）透传的客户端请求头白名单。
+// 注意：条件请求头（If-Match / If-Modified-Since / If-None-Match / If-Range / If-Unmodified-Since）
+// 不透传——否则客户端带 If-None-Match 访问时，上游会对候选与直连回源都回 304（空 body），
+// 导致成功判据不过、缓存不写、日志全程报失败；回源始终为无条件 GET，
+// 客户端的 304 语义由代理自身缓存 ETag 逻辑（serveEntry，HIT 场景）负责。其余白名单头（含 Range）保持透传。
 var forwardRequestHeaders = []string{
 	"Accept", "Accept-Encoding", "Accept-Language", "Authorization",
-	"Content-Type", "If-Match", "If-Modified-Since", "If-None-Match",
-	"If-Range", "If-Unmodified-Since", "Range", "User-Agent",
+	"Content-Type", "Range", "User-Agent",
 }
 
 // Server 是代理服务 HTTP 处理器，实现 http.Handler。
@@ -273,6 +276,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 						"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))
 				}
 			}
+		} else if ent.Status == http.StatusNotModified {
+			// 回源 304（内容未变更）：条目无实体不可缓存，304 原样透传给客户端，
+			// 客户端用本地缓存副本渲染，属成功语义而非失败（条件头已不透传，
+			// 上游对无条件 GET 仍回 304 属异常/缓存副本有效兜底场景）
+			s.log.Info("回源 304 未变更，不写缓存（客户端缓存副本有效）",
+				"rule", eff.Rule, "status", ent.Status, "target", truncate(target, 300))
 		} else {
 			// 回源成功但不满足缓存判据：同样留痕，说明为什么这次没写缓存文件
 			s.log.Info("回源成功但不写缓存（未过成功判据或非 200）",
@@ -465,11 +474,15 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 	// //////////////////  透传上游响应头  end  ////////////////////////////////////////////////
 
 	// //////////////////  写响应  start  ////////////////////////////////////////////////
+	// 先算最终给客户端的状态码：HIT 且客户端 If-None-Match 命中条目 ETag 时降为 304
 	status := e.Status
-	switch {
-	case cacheStatus == "HIT" && etagNotModified(r, e.Header):
-		// 缓存命中且客户端 ETag 匹配：直接回 304，不再回传 body
+	if cacheStatus == "HIT" && etagNotModified(r, e.Header) {
 		status = http.StatusNotModified
+	}
+	switch {
+	case status == http.StatusNotModified:
+		// 304（HIT ETag 命中，或上游对无条件 GET 仍回 304 的兜底透传）：
+		// 无实体，不应携带 Content-Length 等实体头，只写状态码
 		w.WriteHeader(status)
 	case r.Method == http.MethodHead:
 		// HEAD：保留上游声明的 Content-Length，不写 body
@@ -489,6 +502,21 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 		}
 	}
 	// //////////////////  写响应  end  ////////////////////////////////////////////////
+
+	// //////////////////  成功返回日志  start  ////////////////////////////////////////////////
+	// 响应写给客户端后补一条轻量的成功语义日志，避免「客户端实际拿到了内容、
+	// 日志却整条像失败」的误判；字段刻意精简，不与下方「代理请求完成」重复堆叠
+	switch {
+	case status == http.StatusNotModified:
+		// 最终 304（HIT ETag 命中或上游 304 透传）也是成功：客户端用本地缓存副本正常渲染
+		s.log.Info("内容未变更（304），客户端缓存副本有效",
+			"rule", eff.Rule, "upstream", e.Source, "cache", cacheStatus)
+	case status == http.StatusOK && len(e.Body) > 0 && r.Method != http.MethodHead:
+		s.log.Info("成功返回内容",
+			"rule", eff.Rule, "upstream", e.Source, "status", status,
+			"bytes", len(e.Body), "cache", cacheStatus)
+	}
+	// //////////////////  成功返回日志  end  ////////////////////////////////////////////////
 
 	s.log.Info("代理请求完成",
 		"method", r.Method,
@@ -557,14 +585,22 @@ func ExpandCandidates(templates []string, target string) []string {
 
 // checkSuccess 按生效的 success-check 判据判断候选响应是否成功：
 // status：HTTP 200 即成功；content：HTTP 200 且 body 非空（默认）。
+// HTTP 304 在两种模式下均视为成功（内容未变更）：条件请求头已不透传，正常回源不会出现 304；
+// 若上游对无条件 GET 仍回 304，属异常/缓存副本有效语义，应按成功候选处理（304 原样透传给客户端，
+// 客户端沿用本地缓存副本），而不是把整条链路判成失败。
 func checkSuccess(e *cache.Entry, check string) bool {
-	if e.Status != http.StatusOK {
+	switch e.Status {
+	case http.StatusNotModified:
+		// 304 无实体：无条件视为成功，不再检查 body
+		return true
+	case http.StatusOK:
+		if check == config.SuccessCheckStatus {
+			return true
+		}
+		return len(e.Body) > 0
+	default:
 		return false
 	}
-	if check == config.SuccessCheckStatus {
-		return true
-	}
-	return len(e.Body) > 0
 }
 
 // skipResponseHeader 判断某响应头是否不应透传给客户端（逐跳头 + 本服务自管头）。
