@@ -10,7 +10,7 @@ listen: "0.0.0.0:8080"
 # 日志级别：debug / info / warn / error（大小写不敏感；留空默认 info；非法值启动时直接报错）
 # 四级从多到少：debug > info > warn > error，高级别包含低级别的全部日志
 #   info  - 每次决策结果全留痕：规则匹配结果（含入站 Host）、GET 绕过缓存（BYPASS）原因、
-#           url-redirect 轮询展开（本轮起始下标 + 各候选模板与 $1 替换后最终 URL）、
+#           url-redirect 轮询展开（本轮起始下标 + 各候选模板与占位符替换后最终 URL）、
 #           候选命中并最终返回 / 候选失败、全败回退直连、缓存命中（含文件路径）、
 #           写入缓存成功（含规则名/缓存 key/落盘文件路径/body 大小/ttl）、
 #           成功返回内容（200 且 body 非空：来源/状态码/字节数/缓存状态）、
@@ -32,23 +32,40 @@ http-proxy: ""
 # http-proxy: "http://127.0.0.1:7890"
 
 # url-redirect 候选的成功判据：
-#   status  - HTTP 200 即算成功
+#   status  - HTTP 200 即算成功（HEAD 响应天然无 body，content 判据对 HEAD 也自动按 status 语义）
 #   content - HTTP 200 且 body 非空才算成功（默认，防止镜像返回空内容/软 404）
 # HTTP 304（内容未变更）在两种模式下均视为成功候选：条件请求头（If-None-Match 等 5 个）
-# 不透传给上游，回源始终为无条件 GET；若上游对无条件 GET 仍回 304，304 原样透传给客户端
+# 不透传给上游，回源始终为无条件 GET/HEAD；若上游对无条件请求仍回 304，304 原样透传给客户端
 # （不写缓存，客户端用本地缓存副本），日志按成功留痕而非失败
 success-check: content
 
 # 所有 url-redirect 候选都失败后，是否回退直接请求原始 URL
+# 注意：路径目标请求（见下方 Docker Registry 场景示例）没有完整原始 URL 可直连，
+# fallback-direct 不适用——候选全败直接报错（错误信息注明路径目标无直连回退）
 fallback-direct: true
 
 # url-redirect：回源镜像/上游代理模板列表
-# $1（或 ${1}）会被替换为原始目标 URL，例如：
-#   https://hk.gh-proxy.org/$1 + https://raw.githubusercontent.com/a/b
-#   => https://hk.gh-proxy.org/https://raw.githubusercontent.com/a/b
+# 模板占位符（每个变量均支持 $name 与 ${name} 两种写法，每个模板至少包含一个，启动时校验）：
+#   $1 / ${1} —— 目标串（兼容保留）：
+#       完整 URL 请求 = 目标 URL 原文，如
+#         https://hk.gh-proxy.org/$1 + https://raw.githubusercontent.com/a/b
+#         => https://hk.gh-proxy.org/https://raw.githubusercontent.com/a/b
+#       路径目标请求（如 docker registry 的 /v2/xxx/manifests/latest）= 路径目标本身（不带 scheme）
+#   $http.server.header.full_url / ${http.server.header.full_url} —— 本次入站请求的完整 URL：
+#       scheme://host/path?query（scheme 优先取请求头 X-Forwarded-Proto 首个值，否则按 TLS 判定；
+#       host 为入站 Host 原样含端口）
+#   $http.server.header.full_url_no_server / ${http.server.header.full_url_no_server}
+#       —— 入站请求 URL 去掉 scheme://host 的部分（/path?query，以 / 开头含查询串），如
+#         入站 http://registry-proxy-cache.xxx:5480/v2/a/b/manifests/latest 时
+#         https://docker.1panel.live/$http.server.header.full_url_no_server
+#         => https://docker.1panel.live/v2/a/b/manifests/latest
+# 展开按变量名长度降序替换（full_url_no_server 先于 full_url，避免前缀遮蔽），未知的 $ 序列
+# 原样保留为字面量；斜杠接缝去重：full_url_no_server 的值以 / 开头，模板里占位符前紧邻 /
+# 时（如 https://docker.1panel.live/$http...）两个 / 合并为一个，保证拼出的是
+# https://docker.1panel.live/v2/... 而非 ...//v2/...；
 # 按 round-robin 轮换起始下标逐个尝试（第 1 个请求从第 1 条开始，第 2 个请求从第 2 条开始……），
 # 只要有一个候选通过 success-check 即返回（200 才写缓存；304 视为成功并原样透传、不写缓存）；
-# 候选全部失败时按 fallback-direct 处理
+# 候选全部失败时按 fallback-direct 处理（路径目标请求无直连回退）
 url-redirect:
   - https://hk.gh-proxy.org/$1
   - https://gh-proxy.com/$1
@@ -67,15 +84,20 @@ cache:
   clean-interval: 10m    # 后台过期清理扫描间隔（<=0 关闭；读取命中过期条目时也会惰性删除）
 
 # 域名/URL 规则（自上而下，第一条命中的规则生效）
-# match 与 exclude 均对「http://<入站Host>/<目标URL>」整串做非锚定匹配（Host 归一化为小写）：
+# match 与 exclude 均对「http://<入站Host>/<目标>」整串做非锚定匹配（Host 归一化为小写）：
 #   - 按目标 URL 匹配（旧写法兼容，非锚定）：如 raw\.githubusercontent\.com
 #   - 按入站域名匹配：如 'http://github\.path\..+'（入站 Host 形如 github.path.xxx 时命中）
-# 注意 1：缓存 key 与 allow-list / deny-list 仍只对目标 URL 匹配
+#   - 路径目标请求（路径不是完整 URL，如 docker registry 的 /v2/xxx/manifests/latest）
+#     同样按该整串匹配（target 段即路径目标），必须命中规则且规则配了 url-redirect 才能回源，
+#     见下方「Docker Registry 镜像加速」场景示例
+# 注意 1：缓存 key 与 allow-list / deny-list：完整 URL 请求仍只对目标 URL 匹配；
+#         路径目标请求对「http://<入站Host>/<路径目标>」整串做 ACL 匹配，
+#         缓存 key 输入也为该整串（入站 Host 参与，不同入站域名互不污染）
 # 注意 2：match 里写了入站 Host 段（如 http://github\.path\..+）时，必须让请求的
 #         Host 以该段开头（如用 github.path.你的域名 解析到本服务再访问）；
 #         直接用 IP:端口 或不相关域名访问不会命中本规则，会落全局默认配置
 #         （日志「规则匹配结果 rule=global-default」可确认），此时既没有规则的
-#         url-redirect 轮询，也不会写规则独立缓存目录
+#         url-redirect 轮询，也不会写规则独立缓存目录；路径目标请求更会直接 400
 # exclude（可选）为排除正则列表，同样对整串非锚定匹配：
 #   match 命中后再逐个检查 exclude，任一命中即排除本规则（视为不匹配），
 #   继续向下尝试后续规则（都不命中则走全局默认配置）
@@ -124,7 +146,32 @@ domain-rules:
   #     ttl: 6h                # 0=永不过期；不写沿用全局 cache.ttl
   #     clean-interval: 30m    # 该目录的后台清理间隔（不写则沿用全局 cache.clean-interval）
 
-# 允许/拒绝列表（正则，对完整目标 URL 匹配，优先级高于缓存与回源）
+  # ---- 场景示例：Docker Registry 镜像加速（docker pull 走本服务拉取镜像） ----
+  # docker daemon 把本服务当 registry 访问，请求路径不是完整 URL（路径目标），如：
+  #   GET/HEAD http://registry-proxy-cache.linkease.net:5480/v2/adockero/proxy-cache/manifests/latest
+  # 路径目标请求的限制：仅支持 GET/HEAD（其他方法 400）；必须命中本条规则且 url-redirect 非空
+  # 才能回源（未命中规则直接 400，全局默认配置不承接路径目标）；候选全败无直连回退（直接报错）；
+  # 缓存 key 输入为「http://<入站Host>/<路径目标>」（入站 Host 参与，不同入站域名互不污染）。
+  # 用法（入站域名换成自己部署的、解析到本服务，端口对应 listen）：
+  #   docker pull registry-proxy-cache.linkease.net:5480/adockero/proxy-cache
+  # - name: docker-registry
+  #   match: '.+registry-proxy-cache\.linkease\...+'   # 换成自己的入站域名（对整串非锚定匹配）
+  #   cache:
+  #     enabled: true
+  #     ttl: 666h                # 镜像 manifest/layer 内容不可变，缓存 666 小时（0=永不过期）
+  #     path: ./cache-docker     # 规则独立缓存目录，与其他场景隔离（记得挂载/保证可写）
+  #     clean-interval: 30m      # 该目录的后台清理间隔（不写则沿用全局 cache.clean-interval）
+  #   success-check: status      # registry /v2/ ping 等响应可能空 body，content 判据会误拒，用 status
+  #   fallback-direct: false     # 路径目标无完整原始 URL 可直连回退，候选全败直接报错
+  #   timeout: 300s              # 大镜像 blob 拉取耗时较长，放宽回源总超时
+  #   url-redirect:              # 多镜像站候选轮询，均用 full_url_no_server 拼回源路径
+  #     - https://docker.1panel.live/$http.server.header.full_url_no_server
+  #     - https://hub.rat.dev/$http.server.header.full_url_no_server
+  #     - https://docker.m.daocloud.io/$http.server.header.full_url_no_server
+  #     - https://docker.1ms.run/$http.server.header.full_url_no_server
+
+# 允许/拒绝列表（正则，优先级高于缓存与回源）：完整 URL 请求对目标 URL 匹配；
+# 路径目标请求对「http://<入站Host>/<路径目标>」整串匹配（保持拦截能力）
 # deny-list 命中即拒绝（403）；allow-list 非空时为白名单模式（未命中即拒绝 403）
 allow-list: []
 #  - 'https://raw\.githubusercontent\.com/'

@@ -26,6 +26,27 @@ const (
 // DefaultCacheTTL 全局 cache.ttl 未配置时的默认缓存时长。
 const DefaultCacheTTL = 30 * time.Minute
 
+// url-redirect 模板占位符（变量名，不含 $ / ${} 包裹形式；每个变量均支持 $name 与 ${name} 写法）。
+// 占位符名统一定义在本包：模板校验（validateRedirectTemplates）与 proxy 包的模板展开
+// （ExpandCandidates）共用同一套常量，避免两处维护漂移。
+const (
+	// PlaceholderTarget 目标串（$1 / ${1}，兼容保留）：完整 URL 请求 = 目标 URL 原文；
+	// 路径目标请求（如 docker registry 的 /v2/xxx/manifests/latest）= 路径目标本身（不带 scheme）。
+	PlaceholderTarget = "1"
+	// PlaceholderFullURL 本次入站请求的完整 URL（scheme://host/path?query）：
+	// scheme 优先取请求头 X-Forwarded-Proto 首个值（小写），否则按 TLS 判定 https/http；host 含端口原样。
+	PlaceholderFullURL = "http.server.header.full_url"
+	// PlaceholderFullURLNoServer 入站请求 URL 去掉 scheme://host 的部分
+	// （/path?query，以 / 开头、含查询串）。
+	PlaceholderFullURLNoServer = "http.server.header.full_url_no_server"
+)
+
+// RedirectPlaceholders 返回全部已知 url-redirect 占位符名（含 $1），
+// 供模板校验与错误提示使用；新增变量时需同步维护本列表与 proxy 包的展开逻辑。
+func RedirectPlaceholders() []string {
+	return []string{PlaceholderTarget, PlaceholderFullURL, PlaceholderFullURLNoServer}
+}
+
 // Duration 是 YAML 配置里的时长类型，解析规则：
 //   - Go duration 格式：30s / 30m / 1h30m
 //   - 纯数字：按秒解析（1800 => 1800s）
@@ -440,14 +461,25 @@ func (c *Config) LogLevel() slog.Level {
 	return c.logLevel
 }
 
-// ResolveOptions 把全局配置与第一条命中「入站 Host + 目标 URL」的域名规则覆盖项合并，
+// BuildMatchStr 构造域名规则匹配串「http://<入站Host>/<目标>」整串：
+// Host 归一化为小写并去除首尾空白；target 可为完整目标 URL，也可为路径目标
+// （不带 scheme，如 v2/xxx/manifests/latest）。域名规则的 match/exclude 匹配、
+// 路径目标请求的 allow-list / deny-list 匹配与路径目标的缓存 key 输入均使用该整串。
+func BuildMatchStr(host, target string) string {
+	return "http://" + strings.ToLower(strings.TrimSpace(host)) + "/" + target
+}
+
+// ResolveOptions 把全局配置与第一条命中「入站 Host + 目标」的域名规则覆盖项合并，
 // 返回该请求最终生效的配置。必须在 Validate 之后调用。
 //
-// 域名规则匹配串构造为「http://<入站Host>/<目标URL>」整串（Host 归一化为小写并去除
+// 域名规则匹配串构造为「http://<入站Host>/<目标>」整串（Host 归一化为小写并去除
 // 首尾空白），规则 match 与 exclude 均对该整串做非锚定匹配：既支持按入站域名路由
-// （如 match: 'http://github\.path\..+'），也兼容旧的目标 URL 正则写法。
-// 注意：缓存 key（目标 URL 的 sha256）与 allow-list / deny-list 仍只对目标 URL 匹配，
-// 不受入站 Host 影响。
+// （如 match: 'http://github\.path\..+'），也兼容旧的目标 URL 正则写法；
+// 路径目标请求（targetURL 不带 scheme，如 docker registry 的 /v2/xxx/manifests/latest）
+// 同样按该整串匹配（形如 http://registry-proxy-cache.xxx:5480/v2/xxx/manifests/latest）。
+// 注意：完整 URL 请求的缓存 key（目标 URL 的 sha256）与 allow-list / deny-list 匹配
+// 仍只对目标 URL 进行，不受入站 Host 影响；路径目标请求则对「http://<入站Host>/<路径目标>」
+// 整串做 ACL 匹配与缓存 key 输入（见 proxy 包），把入站 Host 纳入以保持拦截能力并避免跨域名缓存污染。
 func (c *Config) ResolveOptions(host, targetURL string) Options {
 	// //////////////////  全局默认值  start  ////////////////////////////////////////////////
 	o := Options{
@@ -463,10 +495,11 @@ func (c *Config) ResolveOptions(host, targetURL string) Options {
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
-	// //////////////////  构造规则匹配串（入站 Host + 目标 URL）  start  ////////////////////
+	// //////////////////  构造规则匹配串（入站 Host + 目标）  start  ////////////////////////////////////////////////
 	// 形如 http://github.path.proxy-cache.xxx.sslip.io/https://raw.githubusercontent.com/...
-	matchStr := "http://" + strings.ToLower(strings.TrimSpace(host)) + "/" + targetURL
-	// //////////////////  构造规则匹配串（入站 Host + 目标 URL）  end  ////////////////////
+	//（路径目标请求同理：http://<入站Host>/v2/xxx/manifests/latest）
+	matchStr := BuildMatchStr(host, targetURL)
+	// //////////////////  构造规则匹配串（入站 Host + 目标）  end  ////////////////////////////////////////////////
 
 	// //////////////////  应用第一条命中的域名规则覆盖项  start  ////////////////////////////////////////////////
 	for i := range c.DomainRules {
@@ -606,7 +639,8 @@ func validateProxyAddr(addr string) error {
 }
 
 // validateRedirectTemplates 校验 url-redirect 模板列表（就地去除首尾空白）：
-// 每个模板必须以 http(s):// 开头且包含 $1 或 ${1} 占位符。
+// 每个模板必须以 http(s):// 开头，且至少包含一个已知占位符——$1 / ${1}，
+// 或任一已知 $http.server.header.* 变量的 $ / ${} 形式（错误信息列出全部合法写法）。
 func validateRedirectTemplates(list []string, where string) error {
 	for i := range list {
 		t := strings.TrimSpace(list[i])
@@ -616,12 +650,33 @@ func validateRedirectTemplates(list []string, where string) error {
 		if !strings.HasPrefix(t, "http://") && !strings.HasPrefix(t, "https://") {
 			return fmt.Errorf("%s 第 %d 个模板 %q 必须以 http:// 或 https:// 开头", where, i, t)
 		}
-		if !strings.Contains(t, "$1") && !strings.Contains(t, "${1}") {
-			return fmt.Errorf("%s 第 %d 个模板 %q 缺少 $1 占位符", where, i, t)
+		if !hasKnownPlaceholder(t) {
+			return fmt.Errorf("%s 第 %d 个模板 %q 缺少占位符（合法占位符: %s）",
+				where, i, t, placeholderHelp())
 		}
 		list[i] = t
 	}
 	return nil
+}
+
+// hasKnownPlaceholder 判断模板是否包含任一已知占位符（$name 或 ${name} 形式）。
+func hasKnownPlaceholder(t string) bool {
+	for _, name := range RedirectPlaceholders() {
+		if strings.Contains(t, "$"+name) || strings.Contains(t, "${"+name+"}") {
+			return true
+		}
+	}
+	return false
+}
+
+// placeholderHelp 生成全部合法占位符写法（每个变量 $name 与 ${name} 两种形式），用于校验错误信息。
+func placeholderHelp() string {
+	names := RedirectPlaceholders()
+	parts := make([]string, 0, 2*len(names))
+	for _, name := range names {
+		parts = append(parts, "$"+name, "${"+name+"}")
+	}
+	return strings.Join(parts, " / ")
 }
 
 // compilePatternList 把字符串正则列表编译为 []*regexp.Regexp。
