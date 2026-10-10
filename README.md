@@ -308,6 +308,12 @@ domain-rules:
       - https://docker.1ms.run/$http.server.header.full_url_no_server
 ```
 
+### 镜像站匿名 401 挑战与自动 token 获取
+
+daocloud / 1ms.run / hub.rat.dev 等镜像站对匿名 GET/HEAD 的 blob/manifest 请求常直接返回 **401**，响应带 `WWW-Authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:<name>:pull"` 挑战。docker 客户端直连时会自动「按 challenge 去 realm 匿名取 token → 带 `Authorization: Bearer <token>` 重试」，所以直连能成功；反代场景若只透传裸请求，所有 url-redirect 候选都会被 401 拒绝、最终 502。
+
+本代理已在回源链路自动完成这套**匿名 token dance**（与 docker 客户端直连行为等价）：GET/HEAD 回源收到 401 且挑战为 Bearer（含 realm）时，自动向 realm 匿名换取 token（仅附带挑战里的 service/scope 查询参数，绝不携带客户端的 Authorization）并带 `Authorization: Bearer <token>` 重试一次（仍 401 则按该响应原样返回，不循环）；token 按 `realm|service|scope` 进程内缓存（TTL 取响应 `expires_in`，缺省 60s），避免每个 blob 层都打一次 auth 端点。取 token 或重试失败时按原始 401 响应返回，继续走既有的候选轮询与成功判据（不影响缓存写盘语义）。大镜像 blob 拉取耗时较长，建议放宽该规则 `timeout`（如示例中的 `timeout: 300s`）——token 获取与重试共用该回源总超时。
+
 ### 用法
 
 ```bash
@@ -386,6 +392,7 @@ log:
 | 缓存命中且 `If-None-Match` 匹配 ETag（或上游对无条件请求回 304） | 返回 304（不带 `Content-Length` 实体头），客户端使用本地缓存副本，日志记为成功（`内容未变更（304）`） |
 | 客户端条件请求头（`If-Match` 等 5 个） | 不透传给上游：回源始终为无条件 GET/HEAD（其余请求头按白名单透传，含 `Range`） |
 | 命中 deny-list 或未命中非空 allow-list | 403 |
+| 上游回 401 + `WWW-Authenticate: Bearer` 挑战（GET/HEAD 回源） | 自动匿名取 token 并带 `Authorization: Bearer` 重试一次（token 进程内缓存，详见「Docker Registry 镜像加速」）；取 token / 重试失败按原始 401 走既有判据 |
 | 回源彻底失败（候选全败且无/失败直连） | 502（JSON 错误体） |
 | 配置文件不存在 | 使用内置默认配置启动并输出告警 |
 

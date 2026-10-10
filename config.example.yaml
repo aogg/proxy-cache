@@ -152,6 +152,9 @@ domain-rules:
   # 路径目标请求的限制：仅支持 GET/HEAD（其他方法 400）；必须命中本条规则且 url-redirect 非空
   # 才能回源（未命中规则直接 400，全局默认配置不承接路径目标）；候选全败无直连回退（直接报错）；
   # 缓存 key 输入为「http://<入站Host>/<路径目标>」（入站 Host 参与，不同入站域名互不污染）。
+  # 镜像站对匿名 blob/manifest 常回 401 + WWW-Authenticate: Bearer 挑战：本代理会自动按挑战
+  # 去 realm 匿名取 token 并带 Authorization: Bearer 重试一次（与 docker 客户端直连行为等价），
+  # token 进程内缓存（TTL 取 expires_in，缺省 60s），不会每个 blob 层都打一次 auth 端点。
   # 用法（入站域名换成自己部署的、解析到本服务，端口对应 listen）：
   #   docker pull registry-proxy-cache.linkease.net:5480/adockero/proxy-cache
   # - name: docker-registry

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -56,6 +57,12 @@ type Server struct {
 	clients map[string]*http.Client
 	// flight 同一缓存键的单飞组，防止缓存击穿。
 	flight flightGroup
+	// dockerTokenMu 保护 dockerTokens 的并发读写。
+	dockerTokenMu sync.Mutex
+	// dockerTokens Docker Registry 匿名 token 进程内缓存：key = realm|service|scope，
+	// value = token 与过期时间点。镜像 blob 分层很多，进程内缓存避免每层都打一次
+	// auth 端点（auth.docker.io 对国内很慢且有频控）。
+	dockerTokens map[string]dockerTokenEntry
 }
 
 // New 创建 Server：预编译全局与各域名规则用到的上游代理客户端。
@@ -64,7 +71,7 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{cfg: cfg, caches: caches, log: logger}
+	s := &Server{cfg: cfg, caches: caches, log: logger, dockerTokens: make(map[string]dockerTokenEntry)}
 
 	// 收集全部可能用到的上游代理地址（空串代表直连），各建一个可复用 Client
 	proxySet := map[string]struct{}{"": {}}
@@ -529,6 +536,9 @@ func (s *Server) fetchDirect(r *http.Request, target string, eff config.Options)
 
 // doRequest 向 urlStr 发起请求。所有上游请求（直连与 url-redirect 候选）统一走这里，
 // 并应用生效配置的 http-proxy（上游代理）与 timeout（总超时）。
+// GET/HEAD 回源遇上游 401 + WWW-Authenticate: Bearer 挑战时，自动完成 Docker Registry
+// 匿名 token dance（401 → 取 token → 带 Bearer 重试一次，见 dockerAuthDance）；
+// 其余方法（fetchDirect 透传 r.Body 的那类）不做 dance。
 func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reader, eff config.Options) (*cache.Entry, error) {
 	// //////////////////  校验参数  start  ////////////////////////////////////////////////
 	timeout := eff.Timeout
@@ -578,12 +588,310 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	}
 	// //////////////////  发起请求并读取响应  end  ////////////////////////////////////////////////
 
-	return &cache.Entry{
+	entry := &cache.Entry{
 		Status:   resp.StatusCode,
 		Header:   hdr,
 		Body:     buf,
 		StoredAt: time.Now(),
-	}, nil
+	}
+
+	// //////////////////  Docker Registry 401 匿名 token dance  start  ///////////////////////////
+	// 镜像站（docker.m.daocloud.io / docker.1ms.run / hub.rat.dev 等）对匿名 GET/HEAD 的
+	// blob/manifest 常回 401 + WWW-Authenticate: Bearer 挑战：docker 客户端直连时会自动
+	// 「按 challenge 去 realm 匿名取 token → 带 Authorization: Bearer 重试」，这里等价补齐，
+	// 否则候选裸请求全被 401 拒绝、整轮轮询全败最终 502。触发条件（GET/HEAD 回源 + 上游
+	// 401 + Bearer 挑战）与失败兜底（沿用原始 401 响应）见 dockerAuthDance；
+	// 每个 doRequest 只 dance 一次，不循环（重试响应即使仍 401 也原样返回）。
+	if resp.StatusCode == http.StatusUnauthorized && (method == http.MethodGet || method == http.MethodHead) {
+		if e2, ok := s.dockerAuthDance(ctx, s.client(eff.HTTPProxy), req, resp, urlStr); ok {
+			entry = e2 // 重试响应作为最终响应，继续既有的返回 Entry 语义
+		}
+	}
+	// //////////////////  Docker Registry 401 匿名 token dance  end  /////////////////////////////
+
+	return entry, nil
+}
+
+// //////////////////  Docker Registry 匿名 token dance（401 → 取 token → 带 Bearer 重试）  //////
+
+// dockerTokenDefaultTTL 挑战响应未提供有效 expires_in 时的匿名 token 缺省有效期。
+const dockerTokenDefaultTTL = 60 * time.Second
+
+// dockerTokenBodyLimit 匿名 token 响应 body 的读取上限（token JSON 只有几百字节，
+// 限制仅为防异常端点返回超大响应拖爆内存）。
+const dockerTokenBodyLimit = 1 << 20
+
+// dockerTokenEntry 是一条进程内缓存的匿名 registry token。
+type dockerTokenEntry struct {
+	// token 匿名 Bearer token 原文（仅内存持有，不落盘、不打完整日志）。
+	token string
+	// expiresAt 过期时间点：写入时按 expires_in（缺省 60s）固化。
+	expiresAt time.Time
+}
+
+// bearerChallenge 是 WWW-Authenticate: Bearer 挑战中本服务用到的参数。
+type bearerChallenge struct {
+	// realm token 签发端点（必填，缺失则不 dance）。
+	realm string
+	// service 目标 service（如 registry.docker.io），挑战缺省时为空串。
+	service string
+	// scope 权限范围（如 repository:<name>:pull），挑战缺省时为空串。
+	scope string
+}
+
+// dockerAuthDance 尝试 Docker Registry 匿名 token dance（401 → 取 token → 带 Bearer 重试一次）。
+// 调用方（doRequest）已保证 method 为 GET/HEAD 且首个响应状态码为 401；此处再要求
+// WWW-Authenticate 含可解析的 Bearer 挑战（scheme 大小写不敏感且带 realm），否则放弃。
+//   - 取 token 走进程内缓存（见 dockerToken），客户端与 ctx 均沿用原请求（受同一 timeout 约束）；
+//   - 取到 token 后复制原上游请求（同 method/URL，沿用原上游请求头）删除 Authorization
+//     后改为 Bearer 重试一次：重试响应按既有语义（深拷贝响应头 + 读 body）构建为 Entry
+//     返回（ok=true）；重试即使仍 401 也按该响应原样返回，不再 dance；
+//   - 挑战不可解析 / 取 token / 构造重试 / 重试失败时返回 ok=false，调用方沿用原始
+//     401 entry（行为与未实现 dance 的版本一致，绝不因 dance 引入新的失败路径）；
+//   - 确认 dance 触发后先把首个 401 响应 body 用 io.Copy(io.Discard, ...) 排干再 Close
+//    （GET 此前已读到 EOF、HEAD 天然无 body，这里是显式兜底），避免连接泄漏；
+//     调用方 defer 的重复 Close 对 http 响应体是幂等的，安全。
+func (s *Server) dockerAuthDance(ctx context.Context, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string) (*cache.Entry, bool) {
+	// //////////////////  解析 Bearer 挑战  start  //////////////////////////////////////////////
+	var ch *bearerChallenge
+	for _, v := range resp.Header.Values("WWW-Authenticate") {
+		if c := parseBearerChallenge(v); c != nil {
+			ch = c
+			break
+		}
+	}
+	if ch == nil {
+		s.log.Debug("上游 401 无可解析的 Bearer 挑战，跳过匿名 token dance",
+			"url", truncate(urlStr, 300),
+			"www_authenticate", truncate(strings.Join(resp.Header.Values("WWW-Authenticate"), ", "), 300))
+		return nil, false
+	}
+	// //////////////////  解析 Bearer 挑战  end  ////////////////////////////////////////////////
+
+	// 排干首个 401 响应 body 并关闭：dance 触发后原响应不再复用，不排干会占住连接造成泄漏
+	_, _ = io.Copy(io.Discard, resp.Body) // body 已废弃，排干错误无补救动作
+	_ = resp.Body.Close()
+
+	s.log.Info("触发 Docker Registry 匿名 token dance",
+		"url", truncate(urlStr, 300), "realm", ch.realm, "service", ch.service, "scope", ch.scope)
+
+	// //////////////////  取匿名 token（进程内缓存优先）  start  ///////////////////////////////
+	token, err := s.dockerToken(ctx, cl, ch)
+	if err != nil {
+		s.log.Warn("获取 Docker Registry 匿名 token 失败，按原始 401 响应返回",
+			"url", truncate(urlStr, 300), "realm", ch.realm, "err", err)
+		return nil, false
+	}
+	// //////////////////  取匿名 token（进程内缓存优先）  end  ///////////////////////////////////
+
+	// //////////////////  带 token 重试一次  start  /////////////////////////////////////////////
+	// 复制原请求（同 method/URL），头沿用原上游请求头：删除客户端 Authorization 后改为
+	// Bearer <token>（GET/HEAD 回源 body 恒为 nil，无需透传请求体）
+	req, err := http.NewRequestWithContext(ctx, orig.Method, urlStr, nil)
+	if err != nil {
+		s.log.Warn("构造匿名 token 重试请求失败，按原始 401 响应返回",
+			"url", truncate(urlStr, 300), "err", err)
+		return nil, false
+	}
+	req.Header = orig.Header.Clone()
+	req.Header.Del("Authorization")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp2, err := cl.Do(req)
+	if err != nil {
+		s.log.Warn("带匿名 token 重试上游请求失败，按原始 401 响应返回",
+			"url", truncate(urlStr, 300), "token", maskToken(token), "err", err)
+		return nil, false
+	}
+	defer resp2.Body.Close()
+
+	// 重试响应按既有语义读取：HEAD 天然无 body 跳过，其余读全文；读取失败按重试失败兜底
+	var buf []byte
+	if orig.Method != http.MethodHead {
+		buf, err = io.ReadAll(resp2.Body)
+		if err != nil {
+			s.log.Warn("读取匿名 token 重试响应失败，按原始 401 响应返回",
+				"url", truncate(urlStr, 300), "err", err)
+			return nil, false
+		}
+	}
+	hdr := make(http.Header, len(resp2.Header))
+	for k, vv := range resp2.Header {
+		hdr[k] = append([]string(nil), vv...)
+	}
+	// 重试结果留痕（Info）：状态码 + 脱敏 token（绝不输出完整 token 值）
+	s.log.Info("带匿名 token 重试完成", "url", truncate(urlStr, 300),
+		"status", resp2.StatusCode, "token", maskToken(token))
+	return &cache.Entry{
+		Status:   resp2.StatusCode,
+		Header:   hdr,
+		Body:     buf,
+		StoredAt: time.Now(),
+	}, true
+	// //////////////////  带 token 重试一次  end  /////////////////////////////////////////////
+}
+
+// dockerToken 返回挑战对应的匿名 token：优先命中进程内缓存（key = realm|service|scope，
+// 未过期直接复用，避免每个 blob 层都打一次 auth 端点），未命中或已过期才请求 realm
+// 换取新 token 并写回缓存（TTL = expires_in，>0 才用，否则缺省 60s）。
+func (s *Server) dockerToken(ctx context.Context, cl *http.Client, ch *bearerChallenge) (string, error) {
+	key := ch.realm + "|" + ch.service + "|" + ch.scope
+	now := time.Now()
+
+	// 缓存命中（未过期）：Debug 留痕即可
+	s.dockerTokenMu.Lock()
+	if ent, ok := s.dockerTokens[key]; ok && now.Before(ent.expiresAt) {
+		s.dockerTokenMu.Unlock()
+		s.log.Debug("Docker Registry 匿名 token 缓存命中",
+			"realm", ch.realm, "service", ch.service, "scope", ch.scope,
+			"token", maskToken(ent.token),
+			"expires_in", ent.expiresAt.Sub(now).Round(time.Second).String())
+		return ent.token, nil
+	}
+	s.dockerTokenMu.Unlock()
+
+	token, ttl, err := fetchDockerToken(ctx, cl, ch)
+	if err != nil {
+		return "", err
+	}
+	s.dockerTokenMu.Lock()
+	if s.dockerTokens == nil { // 防御：绕过 New 构造的 Server 也能安全写入
+		s.dockerTokens = make(map[string]dockerTokenEntry)
+	}
+	s.dockerTokens[key] = dockerTokenEntry{token: token, expiresAt: now.Add(ttl)}
+	s.dockerTokenMu.Unlock()
+	return token, nil
+}
+
+// fetchDockerToken 请求 realm 匿名换取 token（不带进程内缓存，由 dockerToken 负责缓存）：
+//   - token URL = realm + service/scope 查询参数：仅附带挑战里存在的参数；与 realm 自带
+//     query 合并，已有键不覆盖；
+//   - 请求头仅 Accept: application/json 与固定 User-Agent（proxy-cache/<Version>），
+//     绝不携带客户端的 Authorization；
+//   - 响应 JSON 优先取 "token" 字段、为空再取 "access_token"，两者皆空视为失败；
+//     "expires_in"（秒，整数，>0 才生效）作为缓存 TTL，缺省 60s。
+func fetchDockerToken(ctx context.Context, cl *http.Client, ch *bearerChallenge) (string, time.Duration, error) {
+	u, err := url.Parse(ch.realm)
+	if err != nil {
+		return "", 0, fmt.Errorf("解析 token realm %q 失败: %w", ch.realm, err)
+	}
+	q := u.Query()
+	if ch.service != "" && q.Get("service") == "" {
+		q.Set("service", ch.service)
+	}
+	if ch.scope != "" && q.Get("scope") == "" {
+		q.Set("scope", ch.scope)
+	}
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", 0, fmt.Errorf("构造 token 请求失败（%s）: %w", u.String(), err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "proxy-cache/"+Version)
+
+	resp, err := cl.Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("请求 token 端点失败（%s）: %w", u.String(), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("token 端点返回异常状态码 %d（%s）", resp.StatusCode, u.String())
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, dockerTokenBodyLimit))
+	if err != nil {
+		return "", 0, fmt.Errorf("读取 token 响应失败（%s）: %w", u.String(), err)
+	}
+	var tok struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int64  `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &tok); err != nil {
+		return "", 0, fmt.Errorf("解析 token 响应 JSON 失败（%s）: %w", u.String(), err)
+	}
+	token := tok.Token
+	if token == "" {
+		token = tok.AccessToken
+	}
+	if token == "" {
+		return "", 0, fmt.Errorf("token 响应缺少 token/access_token 字段（%s）", u.String())
+	}
+	ttl := dockerTokenDefaultTTL
+	if tok.ExpiresIn > 0 {
+		ttl = time.Duration(tok.ExpiresIn) * time.Second
+	}
+	return token, ttl, nil
+}
+
+// parseBearerChallenge 解析一条 WWW-Authenticate 挑战头为 Bearer 挑战参数：
+//   - scheme 与参数以首个空白分隔，scheme 大小写不敏感且必须为 Bearer；
+//   - 参数形如 key=value 或 key="value"（双引号包裹时剥离），参数名大小写不敏感；
+//     取 realm / service / scope 三个参数（realm 必填，缺失或非 Bearer scheme 返回 nil，不 dance）；
+//   - 逗号分隔参数，双引号内的逗号不参与分隔（scope 等值内可能含逗号）。
+func parseBearerChallenge(header string) *bearerChallenge {
+	scheme, params, _ := strings.Cut(strings.TrimSpace(header), " ")
+	if !strings.EqualFold(strings.TrimSpace(scheme), "Bearer") {
+		return nil
+	}
+	ch := &bearerChallenge{}
+	for _, part := range splitChallengeParams(params) {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"`)
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "realm":
+			ch.realm = v
+		case "service":
+			ch.service = v
+		case "scope":
+			ch.scope = v
+		}
+	}
+	if ch.realm == "" {
+		return nil
+	}
+	return ch
+}
+
+// splitChallengeParams 按逗号拆分挑战参数串：双引号内的逗号不参与拆分，
+// 保留引号原文（引号剥离由 parseBearerChallenge 统一处理）。
+func splitChallengeParams(s string) []string {
+	var (
+		parts []string
+		b     strings.Builder
+		inQuo bool
+	)
+	for _, c := range s {
+		switch {
+		case c == '"':
+			inQuo = !inQuo
+			b.WriteRune(c)
+		case c == ',' && !inQuo:
+			parts = append(parts, b.String())
+			b.Reset()
+		default:
+			b.WriteRune(c)
+		}
+	}
+	if b.Len() > 0 {
+		parts = append(parts, b.String())
+	}
+	return parts
+}
+
+// maskToken 脱敏展示匿名 token：仅输出前 8 字符与总长度，避免日志泄露完整凭证。
+func maskToken(tok string) string {
+	if tok == "" {
+		return ""
+	}
+	if len(tok) <= 8 {
+		return fmt.Sprintf("***（len=%d）", len(tok))
+	}
+	return fmt.Sprintf("%s***（len=%d）", tok[:8], len(tok))
 }
 
 // serveEntry 把上游响应/缓存条目回放给客户端：
