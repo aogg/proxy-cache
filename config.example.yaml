@@ -135,6 +135,33 @@ fallback-direct: true
 #                             提前终止并 502，docker 客户端会自行重试该层
 #url-redirect-hedge-delay: 2s
 
+# ----------------------------------------------------------------------------
+# 慢速升级多源并发续传（slow-download escalation，全局与 domain-rules 规则级都可配，
+# 规则覆盖全局；仅 type=docker 规则的 GET 路径目标流式回源生效）
+# ----------------------------------------------------------------------------
+# docker pull 大 blob 时若选中的镜像站下载过慢，自动向其余全部候选并发发起
+# Range 续传（每个源拉满剩余区间自己的流），与胜者既有连接按偏移有序合并写给
+# docker；落后领先源超过 slow-download-max-behind 的源被剪枝关闭（带宽放大靠
+# 剪枝收敛；内存上界 = 源数×4MB）；非 docker 类型规则 / HEAD / 直连路径完全不生效。
+# slow-download-speed            判慢阈值（B/s，窗口平均送出速率低于它判「过慢」）。
+#                                默认 1MB；<=0 = 关闭整个特性。字节数写法支持纯整数
+#                                或 "512KB"/"1MB"/"1.5MB"/"64MB"/"2GB"（1024 进制，
+#                                单位大小写不敏感，支持 B/KB/MB/GB/TB 与小数）
+# slow-download-window           判速滑动窗口时长（默认 10s，启用时最小 1s）：窗口满
+#                                按窗口平均速率判慢；不满足条件零开销（除窗口计时）
+# slow-download-min-remaining    触发所需最小剩余字节数（默认 64MB）：剩余量不足
+#                                不升级（尾巴太小没必要并发拉满）；0 = 不设门槛；
+#                                上游总长不可知（无 Content-Length/Content-Range）
+#                                则永不触发
+# slow-download-max-behind       多源合并的剪枝阈值（默认 8MB，启用时必须 >0）：
+#                                某源落后领先源超过该字节数即被关闭移除
+# 触发日志「下载过慢，升级多源并发续传」（含 rule/candidate/bytes/content_length/
+# window/window_speed/sources）；每流至多触发一次；升级后进度日志追加 sources 字段。
+#slow-download-speed: 1MB
+#slow-download-window: 10s
+#slow-download-min-remaining: 64MB
+#slow-download-max-behind: 8MB
+
 # url-redirect：回源镜像/上游代理候选列表（对象数组，破坏性变更：不再支持旧版纯字符串写法，
 # 解析期报错并给出迁移示例；候选对象支持字段见下方示例与 README「url-redirect 候选对象」小节）
 # 候选对象字段：
@@ -244,6 +271,11 @@ domain-rules:
     # ---- url-redirect 候选探测提速覆盖（规则没配沿用全局；含义见顶部全局说明） ----
     # url-redirect-probe-timeout: 5s         # 该规则单次候选尝试的探测预算（0=不限制）
     # url-redirect-hedge-delay: 2s           # 该规则候选阶梯竞速的放行间隔（0=纯串行）
+    # ---- 慢速升级多源并发续传覆盖（仅 type=docker 规则生效；规则没配沿用全局，含义见顶部全局说明） ----
+    # slow-download-speed: 1MB               # 该规则判慢阈值（B/s；<=0 关闭特性）
+    # slow-download-window: 10s              # 该规则判速滑动窗口（启用时最小 1s）
+    # slow-download-min-remaining: 64MB      # 该规则触发所需最小剩余字节数（0 = 不设门槛）
+    # slow-download-max-behind: 8MB          # 该规则多源合并的剪枝阈值（启用时必须 >0）
     # url-redirect:                          # 该规则专用候选列表（设为 [] 表示该规则直连回源）
     #   - template: https://gh-proxy.com/$1
 
@@ -301,6 +333,13 @@ domain-rules:
   #   url-redirect-hedge-delay: 2s       # 候选阶梯竞速：每 2s 放行下一个候选并发探测，先过判据者胜出
   #   url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次（硬失败跳过）
   #   url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
+  #   # ---- 慢速升级多源并发续传（仅 type=docker 生效；含义见顶部全局说明） ----
+  #   # 竞速胜出的镜像站拉 blob 太慢时（10s 窗口平均 < 1MB/s），其余镜像站并发 Range 续传
+  #   # 合并提速；慢源超过 8MB 落后被剪枝。slow-download-speed: 0 可显式关闭整个特性
+  #   slow-download-speed: 1MB           # 判慢阈值（B/s；<=0 关闭特性）
+  #   slow-download-window: 10s          # 判速滑动窗口（启用时最小 1s）
+  #   slow-download-min-remaining: 64MB  # 剩余量不足不升级（0 = 不设门槛）
+  #   slow-download-max-behind: 8MB      # 合并中落后领先源超限即剪枝
   #   url-redirect:              # 多镜像站候选轮询（对象数组），均用 full_url_no_server 拼回源路径；
   #                              # 候选级 insecure-skip-verify 仅对该候选生效（三级优先级最高，
   #                              # 适合个别镜像站证书链不全的情况，如 actima）

@@ -4,6 +4,12 @@
 // EOF 后按既有条件（仅 200 且过判据）用 cache.Set 原子写缓存，并把完整 Entry
 // 返回给单飞等待方。
 //
+// 慢速升级多源并发续传（slow-download escalation，见 slowdownload.go）：type=docker
+// 规则的流式回源在 commit 后的读循环里按 slow-download-window 滑动窗口判速，窗口平均
+// 送出速率低于 slow-download-speed 且剩余量足够、候选数>1 时，对其余全部候选并发发起
+// Range 续传并与胜者既有连接做有序合并（每流至多一次；升级只增开续传源，绝不动客户端
+// 已见字节，连续性保证不变）。
+//
 // 连续性保证：一旦 commit（写出响应头）就绝不再切换候选或改变状态码——所有候选
 // 切换/重试/竞速都发生在 selectCandidate 内部（commit 之前），commit 前的任何失败
 // 都不会给客户端输出哪怕一个字节（失败时由调用方 writeError 502）。
@@ -112,10 +118,35 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		contentLength = v
 	}
 
+	// 慢速升级多源并发续传（slow-download escalation）门控与状态：
+	// 仅 type=docker 规则的 GET 路径目标流式回源启用，speed<=0 / window<=0 / max-behind<=0
+	// 视为关闭（未配置时 Options 已带默认值，规则显式 0 = 显式关闭）；窗口计时在循环内
+	// 进行（不满足条件零开销，除窗口计时本身），每流至多升级一次。
+	slowEnabled := eff.RuleType == config.RuleTypeDocker &&
+		eff.SlowDownloadSpeed > 0 && eff.SlowDownloadWindow > 0 && eff.SlowDownloadMaxBehind > 0
+	slowWindowAt := committedAt // 判速滑动窗口起点（自 commit 起算）
+	slowWindowBytes := 0        // 窗口起点时已传字节数
+	slowEscalated := false      // 本流是否已升级（每流至多一次）
+	var slowMerger *slowMerger  // 升级后的有序合并器（nil = 未升级）
+
 	// //////////////////  边读上游边写客户端与累积缓冲  start  ///////////////////////////////////
 	clientOK := true // 客户端写失败（docker 已断开）后置 false：继续读完上游只填缓存
 	accum := bytes.NewBuffer(make([]byte, 0, len(res.first)+streamChunkSize))
 	total := 0
+	// writeOut 写一块给客户端与累积缓冲（accum 语义不变）：客户端写失败（docker 已断开）
+	// 置 clientOK=false 并保持既有行为——继续读完上游只填缓存（单源循环与多源合并共用）
+	writeOut := func(p []byte) {
+		total += len(p)
+		accum.Write(p)
+		if clientOK {
+			if _, werr := w.Write(p); werr != nil {
+				clientOK = false
+				// 与 serveEntry 既有日志文案一致（broken pipe 可辨认）
+				s.log.Warn("写响应体失败（客户端已断开，继续读上游仅填缓存）",
+					"target", truncate(r.URL.Path, 200), "err", werr)
+			}
+		}
+	}
 	writeFirst := func() {
 		if len(res.first) == 0 {
 			return
@@ -131,6 +162,38 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	}
 	writeFirst()
 
+	// emitProgress 进度日志（单源读循环与多源合并循环同一节拍共用）：extra 追加到字段尾
+	//（升级后由合并循环追加 sources=当前存活源数）
+	emitProgress := func(now time.Time, extra ...any) {
+		clientState := "ok"
+		if !clientOK {
+			clientState = "disconnected"
+		}
+		args := []any{
+			"rule", eff.Rule, "candidate", truncate(source, 300), "status", res.status,
+			"bytes", total,
+		}
+		if contentLength > 0 {
+			// 百分比取 0-100 整数（上游声明值异常偏小时截到 100，不输出越界值）
+			pct := int(float64(total) / float64(contentLength) * 100)
+			if pct < 0 {
+				pct = 0
+			} else if pct > 100 {
+				pct = 100
+			}
+			args = append(args, "content_length", contentLength, "percent", pct)
+		}
+		args = append(args,
+			"speed", humanBytesPerSec(int64(total-lastProgressBytes), now.Sub(lastProgressAt)),
+			"elapsed", fmt.Sprintf("%.1fs", now.Sub(committedAt).Seconds()),
+			"client", clientState,
+		)
+		args = append(args, extra...)
+		s.log.Info("流式透传进度", args...)
+		lastProgressAt = now
+		lastProgressBytes = total
+	}
+
 	if res.body != nil {
 		// 上游读经 progressReader 记入看门狗：read-timeout（无新增数据）语义与旧版一致，
 		// 慢速但持续传输的大 blob 不会被误砍；客户端写阻塞（接收慢）时读循环随之放缓，
@@ -140,50 +203,50 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		for {
 			n, rerr := pr.Read(buf)
 			if n > 0 {
-				total += n
-				accum.Write(buf[:n])
-				if clientOK {
-					if _, werr := w.Write(buf[:n]); werr != nil {
-						clientOK = false
-						// 与 serveEntry 既有日志文案一致（broken pipe 可辨认）；
-						// 保持既有行为：继续读完上游只填缓存
-						s.log.Warn("写响应体失败（客户端已断开，继续读上游仅填缓存）",
-							"target", truncate(r.URL.Path, 200), "err", werr)
-					}
-				}
+				writeOut(buf[:n])
 			}
 			// 流式透传进度日志：按 progress-interval 周期留痕回源进度（类似 docker pull 的
 			// xxMB/342.7MB 进度感），间隔内整条流已完成则一条都不出（最终日志已有成败留痕）。
 			// 用循环内时间检查而非定时器 goroutine 实现：上游停滞无新数据时读循环阻塞、
 			// 自然不输出进度（属预期，间隔内的沉默即「无进度」本身）
 			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
-				now := time.Now()
-				clientState := "ok"
-				if !clientOK {
-					clientState = "disconnected"
-				}
-				args := []any{
-					"rule", eff.Rule, "candidate", truncate(source, 300), "status", res.status,
-					"bytes", total,
-				}
-				if contentLength > 0 {
-					// 百分比取 0-100 整数（上游声明值异常偏小时截到 100，不输出越界值）
-					pct := int(float64(total) / float64(contentLength) * 100)
-					if pct < 0 {
-						pct = 0
-					} else if pct > 100 {
-						pct = 100
+				emitProgress(time.Now())
+			}
+			// 慢速升级触发判定（与进度日志同一节拍；rerr==nil 才判，EOF 同拍到达时走正常收尾）：
+			// 窗口满且窗口平均送出速率 < slow-download-speed 判「过慢」，再校验剩余字节
+			//（已知总长 - 当前位置）>= slow-download-min-remaining 与候选数 > 1，全部满足
+			// 才升级——clientOK=false（客户端已断开、仅填缓存）同样允许，缓存填充同样受益。
+			if slowEnabled && !slowEscalated && rerr == nil && time.Since(slowWindowAt) >= eff.SlowDownloadWindow {
+				windowSent := int64(total - slowWindowBytes)
+				windowElapsed := time.Since(slowWindowAt)
+				slowWindowAt = time.Now() // 窗口滚动（触发与否都重新计窗）
+				slowWindowBytes = total
+				if slowEscalationDue(windowSent, windowElapsed, eff.SlowDownloadSpeed) {
+					winnerStart, knownTotal, end, pok := slowEscalationTarget(res.status, res.header)
+					remaining := slowEscalationRemaining(knownTotal, winnerStart, int64(total))
+					if pok && remaining >= eff.SlowDownloadMinRemaining && len(candidates) > 1 {
+						offset := winnerStart + int64(total)
+						rangeHeader := resumeRangeHeader(offset, end)
+						others := escalationCandidates(candidates, res.url)
+						s.log.Info("下载过慢，升级多源并发续传",
+							"rule", eff.Rule, "candidate", truncate(source, 300),
+							"bytes", total, "content_length", knownTotal,
+							"window", eff.SlowDownloadWindow.String(),
+							"window_speed", humanBytesPerSec(windowSent, windowElapsed),
+							"sources", len(others)+1)
+						// 升级动作：胜者既有连接不中断并入合并，其余全部候选并发 Range 续传
+						//（每候选一个 goroutine，复用 startUpstream 公共底层）
+						slowMerger = s.escalateSlowSources(r, res, winnerStart, others, eff, rangeHeader, int64(total), knownTotal)
+						slowEscalated = true
+						break // 转入下方有序合并循环（胜者 body 保持活体移交）
 					}
-					args = append(args, "content_length", contentLength, "percent", pct)
+					s.log.Debug("流式回源判慢但暂不满足升级条件",
+						"rule", eff.Rule, "candidate", truncate(source, 300),
+						"window_speed", humanBytesPerSec(windowSent, windowElapsed),
+						"speed", humanBytesPerSec(eff.SlowDownloadSpeed, time.Second),
+						"known_total", knownTotal, "remaining", remaining,
+						"min_remaining", eff.SlowDownloadMinRemaining, "candidates", len(candidates))
 				}
-				args = append(args,
-					"speed", humanBytesPerSec(int64(total-lastProgressBytes), now.Sub(lastProgressAt)),
-					"elapsed", fmt.Sprintf("%.1fs", now.Sub(committedAt).Seconds()),
-					"client", clientState,
-				)
-				s.log.Info("流式透传进度", args...)
-				lastProgressAt = now
-				lastProgressBytes = total
 			}
 			if rerr != nil {
 				if errors.Is(rerr, io.EOF) {
@@ -198,7 +261,28 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			}
 		}
 	}
-	res.Close()
+
+	// //////////////////  慢速升级后的有序合并循环  start  ///////////////////////////////////////
+	if slowMerger != nil {
+		// 有序合并：胜者（首位，天然从当前 total 继续）+ 全部续传源按绝对偏移严格有序
+		// 写给客户端与 accum；落后源按 max-behind 剪枝收敛带宽放大；游标推进到已知总长
+		// 走既有 EOF 收尾，全部源耗尽未到总长按「commit 后读上游失败」语义终止。
+		if _, merr := slowMerger.run(writeOut, func(now time.Time, live int) {
+			// 与单源读循环同一节拍：仅到 progress-interval 间隔才输出；
+			// 升级后追加 sources 字段输出当前存活源数
+			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
+				emitProgress(now, "sources", live)
+			}
+		}); merr != nil {
+			s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
+				"rule", eff.Rule, "candidate", truncate(source, 300),
+				"status", res.status, "bytes", total, "err", merr)
+			return nil, true, fmt.Errorf("流式回源读上游失败（%s）: %w", source, merr)
+		}
+	}
+	// //////////////////  慢速升级后的有序合并循环  end  /////////////////////////////////////////
+
+	res.Close() // 幂等：升级路径的源（含胜者）已由合并器统一关闭
 	// //////////////////  边读上游边写客户端与累积缓冲  end  /////////////////////////////////////
 
 	entry = &cache.Entry{

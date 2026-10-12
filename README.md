@@ -117,6 +117,10 @@ docker run -d --name proxy-cache \
 | `url-redirect-all-error-retry` | int | `0`（不重试） | 整轮全错后的重试轮数：一轮 = 所有候选（含各自 item 重试）都失败；全轮失败后整体重来最多 N 轮（总轮数 = 1+N），重试轮沿用同一候选顺序 |
 | `url-redirect-probe-timeout` | duration | `5s` | **单次候选尝试的探测预算**：从发出请求到「响应头可用（含 401 token dance 的第二次响应）且成功判据可判定（首块读出或 EOF）」的时限，覆盖建连后的等待与 token dance 全程；到期取消该次尝试并硬失败快切下一候选。仅约束探测阶段：探测通过后的 body 读取（流式透传/缓冲排干）不受它约束，仍由 `http-timeout`（整次尝试总超时）与 `read-timeout`（无新增数据）负责；建连本身由 `connect-timeout` 负责。显式 `0` = 不限制 |
 | `url-redirect-hedge-delay` | duration | `2s` | **候选阶梯并发竞速（hedge）的放行间隔**：候选按 round-robin 顺序起步，首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消）；某候选先失败时立即放行下一候选（不等间隔）；第一个通过成功判据的候选胜出，其余全部取消（context 取消，连接及时释放）。`0` = 纯串行禁用竞速（上一候选出结果后才放行下一个）。最坏「选定候选」耗时 ≈ (候选数-1)×该间隔 + 胜者探测耗时；全部候选都失败的极坏情况由内置扫描总预算（20s）兜底，提前终止并 502（docker 客户端会自行重试该层） |
+| `slow-download-speed` | bytes | `1MB` | **慢速升级多源并发续传的判慢阈值**（B/s，字节写法见下方说明）：type=docker 规则的流式回源按 `slow-download-window` 滑动窗口计平均送出速率，低于它判「过慢」，对（候选数>1 的）下载向其余全部候选并发发起 Range 续传并有序合并提速；`<=0`（或 `0`）= **关闭整个特性**。仅 type=docker 规则生效，详见下文「[慢速自动升级多源并发续传](#慢速自动升级多源并发续传)」 |
+| `slow-download-window` | duration | `10s` | 判速滑动窗口时长：窗口满按窗口平均速率判慢（启用时 Validate 钳制最小 `1s`，过短窗口会把网络抖动误判为持续过慢）；不满足触发条件零开销（除窗口计时本身） |
+| `slow-download-min-remaining` | bytes | `64MB` | 触发升级所需最小剩余字节数：剩余（已知总长 - 已传）不足不升级（尾巴太小没必要并发拉满）；`0` = 不设门槛；上游总长不可知（无 `Content-Length`/`Content-Range`）则永不触发 |
+| `slow-download-max-behind` | bytes | `8MB` | 多源合并的剪枝阈值：合并中某源落后领先源超过该字节数即被关闭移除（收敛多源并发的带宽放大）；启用时（`slow-download-speed > 0`）必须 `>0`，Validate 拒绝 |
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://` |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
@@ -130,6 +134,8 @@ docker run -d --name proxy-cache \
 | `deny-list` | string[] | 空 | 拒绝列表（正则）。命中即返回 403 |
 
 > 时长格式统一支持：Go duration（`30s`/`30m`/`1h30m`）、纯数字（按秒）、`2d`（天）、`1w`（周）。
+
+> 字节（bytes）格式统一支持：纯整数（按字节，`1048576`）或 1024 进制的单位字符串 `"512KB"` / `"1MB"` / `"1.5MB"` / `"64MB"` / `"2GB"`（单位 `B`/`KB`/`MB`/`GB`/`TB` 大小写不敏感、支持小数）。`slow-download-*` 四键的负数为配置错误（启动快速失败）。
 
 > **超时模型（与旧版差异）**：三个超时（`http-timeout` / `read-timeout` / `connect-timeout`）相互独立，全局与规则级都可配——同一字段规则没配就用全局，全局也没有 = 该项不限制（0）。`read-timeout` 的生效优先级：`rule.read-timeout` > `rule.timeout` > `global.read-timeout` > `global.timeout` > 不限制。与旧版行为差异：① 旧 `timeout` 是「回源总超时，未配置兜底 `60s`」，现仅为 `read-timeout` 别名且**无任何默认兜底**（有意的行为变更）；② 旧版 TCP 拨号/TLS 握手固定 `10s` 超时，现由 `connect-timeout` 控制、未配置不限制；③ 大 blob 在旧版可能因「总超时内没读完」被整体砍掉（数据在稳定传输也照砍），现 `read-timeout` 按数据进度判定，慢速但持续传输不会被砍；候选级/整轮重试为新增能力，未配置时不重试（行为与旧版一致）。
 
@@ -169,6 +175,10 @@ docker run -d --name proxy-cache \
 | `url-redirect-all-error-retry` | int | 覆盖该规则整轮全败后的重试轮数；未配置沿用全局 |
 | `url-redirect-probe-timeout` | duration | 覆盖该规则单次候选尝试的探测预算（默认 5s，`0` = 不限制）；未配置沿用全局 |
 | `url-redirect-hedge-delay` | duration | 覆盖该规则候选阶梯竞速的放行间隔（默认 2s，`0` = 纯串行禁用竞速）；未配置沿用全局 |
+| `slow-download-speed` | bytes | 覆盖该规则慢速升级多源并发续传的判慢阈值（B/s，`<=0` 关闭特性）；未配置沿用全局。**仅 type=docker 规则生效**，详见下文「[慢速自动升级多源并发续传](#慢速自动升级多源并发续传)」 |
+| `slow-download-window` | duration | 覆盖该规则判速滑动窗口时长（启用时最小 `1s`）；未配置沿用全局 |
+| `slow-download-min-remaining` | bytes | 覆盖该规则触发升级所需最小剩余字节数（`0` = 不设门槛）；未配置沿用全局 |
+| `slow-download-max-behind` | bytes | 覆盖该规则多源合并的剪枝阈值（启用时必须 `>0`）；未配置沿用全局 |
 
 规则覆盖项均为「可选」：不写则沿用全局配置；**第一条命中的规则生效**（不做多规则叠加）。
 
@@ -310,6 +320,36 @@ docker 客户端拉取镜像时，对每个请求只等约 30s 的响应头（`n
 - **单飞等待上限**：大 blob 流式回源可持续几十秒到几分钟，同一缓存 key 的并发 MISS 等待 singleflight 超过 10s（内置常量）就自行走候选回源（不再排队），避免被首个执行方吊死到超过 docker 响应头超时；
 - **HEAD 与完整 URL 目标（web）不变**：HEAD 探测沿用候选竞速管线但不写缓存、整包缓冲回放；web 请求仍整包缓冲后回放（行为不变）；
 - **Range 断点续传**：带 `Range` 的请求绕过缓存读取，上游回 206 视为成功并流式透传、不写缓存（旧版 206 会被成功判据拒掉导致续传全挂）。
+
+## 慢速自动升级多源并发续传
+
+竞速胜出的镜像站有时「能连上但下载极慢」（首字节快、速率只有几十 KB/s），docker pull 一个大 blob 会拖几分钟。为此，**type=docker 规则**的 GET 路径目标流式回源默认开启慢速升级：下载过慢时自动向其余全部候选**并发发起 Range 续传**，与胜者既有连接按偏移有序合并，把速率拉到多镜像站的并集。
+
+### 「过慢」的定义与触发条件
+
+commit 后的读循环里按 `slow-download-window`（默认 `10s`）滑动窗口计**平均送出速率**，**窗口满且窗口平均速率低于 `slow-download-speed`（默认 `1MB/s`）** 即判「过慢」。判慢后还需同时满足才真正升级：
+
+1. **剩余量足够**：剩余字节（上游声明总长 - 已传）≥ `slow-download-min-remaining`（默认 `64MB`）——尾巴太小没必要并发拉满；上游总长不可知（无 `Content-Length`/`Content-Range`）则永不触发；
+2. **候选数 > 1**：只有当前胜者一个候选时无从并发；
+3. **本流尚未升级过**：每流至多触发一次。
+
+全部条件不满足时保持现状零改动（除窗口计时外零开销）；客户端已断开（`clientOK=false`，仅填缓存）时同样允许触发——缓存填充同样受益。触发时输出 Info 日志「下载过慢，升级多源并发续传」（含 `rule` / `candidate` / `bytes` / `content_length` / `window` / `window_speed` / `sources`）。
+
+### Range 续传与有序合并
+
+- **续传区间**：胜者 200 + `Content-Length` 时向其余候选发 `Range: bytes={已传}-{总长-1}`；胜者 206（客户端断点续传）时从其 `Content-Range` 解析终点，续传偏移 = 起始偏移 + 已传（206 的终点解析不出来则该流不支持升级，静默跳过）；
+- **复用同一套上游机制**：续传请求与候选探测共用同一个底层尝试函数（`startUpstream`）——请求头白名单、docker 401 匿名 token dance、read-timeout 看门狗、`http-timeout` 尝试总超时、候选级 `insecure-skip-verify` 全部一致；
+- **响应校验**：续传响应必须 206 且 `Content-Range` 起始等于请求偏移（上游不支持 Range 回 200 → 丢弃该源，debug 留痕）；此前竞速中硬失败的候选也照常尝试，失败即剪枝（debug 留痕）；
+- **有序合并**：胜者既有连接**不中断**，作为源之一并入（天然从当前已传偏移继续）；每源一个 4MB FIFO 缓冲（**内存上界 = 源数×4MB**，缓冲满暂停读该源）+ 绝对游标；客户端严格按偏移有序写——首块先到者为 leader，其后每次取「持有下一期望偏移」的就绪数据写给客户端与累积缓冲（缓存写入语义不变，仍仅 200 且过判据落盘）；
+- **剪枝**：源出错、EOF 已尽且游标落后（流未完成却再无数据）、或落后领先源超过 `slow-download-max-behind`（默认 `8MB`）即关闭移除（日志含 reason）；
+- **收尾**：游标推进到已知总长 → 走既有 EOF 收尾（finalize 写缓存 / 206 不写缓存、成功返回与完成日志，字段兼容）；所有源全部耗尽且未到总长 → 沿用「commit 后读上游失败」语义：Error 日志、终止响应、不写缓存，等待方收到错误（502）。
+
+### 代价与边界（读配置前必看）
+
+- **带宽放大**：升级后**每个源都会拉满剩余区间自己的流**（慢源在被剪枝前会白拉一段），靠 `slow-download-max-behind` 剪枝收敛——阈值越小收敛越快、越大越容忍慢源后程发力；
+- **仅 docker type 生效**：非 docker 规则 / 未配 `url-redirect` 的直连路径 / HEAD 管线完全不生效；候选并发数上限 = 候选列表长度（一般 ≤5），不做额外并发池；
+- **连续性保证不变**：commit 后不再切换状态码/响应头，升级只增开续传源，绝不动客户端已见字节；
+- **关闭方式**：`slow-download-speed: 0`（或 `<=0`）显式关闭整个特性；也可按规则级覆盖只对个别 docker 规则开启/关闭。
 
 ## 单飞（singleflight）与等待上限
 

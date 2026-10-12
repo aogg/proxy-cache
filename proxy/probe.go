@@ -25,7 +25,7 @@ import (
 )
 
 // probeFirstChunkLimit 探测阶段首块读取上限：success-check=content 只需判定
-//「body 非空」，读到首块即停，剩余 body 留给 commit 后的流式透传/缓冲排干阶段。
+// 「body 非空」，读到首块即停，剩余 body 留给 commit 后的流式透传/缓冲排干阶段。
 const probeFirstChunkLimit = 64 << 10
 
 // probeResult 是一次上游尝试探测阶段的结果（资源所有权随返回值移交调用方：
@@ -117,7 +117,7 @@ func readProbeFirst(body io.Reader, wd *progressWatchdog) ([]byte, bool, error) 
 //   - 请求带 Range 且上游回 206：视为成功（docker 断点续传必需；旧判据会把 206
 //     全部拒掉导致 Range 拉取全挂。缓存写入条件不变——206 仍不写缓存）；
 //   - 其余沿用 checkSuccess 既有语义：304 视为成功；content 判据对已缓冲首块判非空
-//    （首块为空必然伴随 EOF/错误，等价于旧版「完整 body 为空」的失败判定）；
+//     （首块为空必然伴随 EOF/错误，等价于旧版「完整 body 为空」的失败判定）；
 //     HEAD 响应无 body，自动按 status 语义。
 func probePassed(res *probeResult, eff config.Options, method string, hasRange bool) bool {
 	if hasRange && res.status == http.StatusPartialContent {
@@ -142,27 +142,22 @@ func probeHardFailReason(res *probeResult) string {
 	return ""
 }
 
-// probeCandidateAttempt 向 urlStr 发起一次探测式上游尝试（候选管线共用，方法沿用入站
-// GET/HEAD）。返回 (结果, 错误, 是否硬失败, 硬失败原因)。硬失败（hard=true）：
-// probe-timeout 探测预算耗尽 / 上游 403 / token dance 后仍 401——候选层应跳过
-// url-redirect-item-error-retry 原地重试直接切换下一候选；其余失败（网络错误、
-// 超时、判据不过）为软失败，按既有 item 重试语义原地重试。
+// startUpstream 单次上游尝试的公共底层（候选探测管线与慢速升级多源并发续传共用）：
+// 覆盖「建请求头（白名单透传 + 可选 Range 覆盖）→ per-candidate insecure 客户端 →
+// 响应头 → 探测首块 → 401 匿名 token dance」整段，探测预算（probe-timeout）不在其中
+// （仅探测管线需要，probeCandidateAttempt 在外层经 onWatchdog 联动自行包装）。
 //
-// 四级超时的语义边界（互相独立、各管一段）：
-//   - probe-timeout（探测预算，仅本函数）：从发出请求到「响应头可用（含 token dance
-//     的第二次响应）且判据可判定（首块读出或 EOF）」的时限。到期经 AfterFunc 联动取消
-//     看门狗 ctx 使在途请求立即失败；探测结束（成败皆然）即拆链停表——探测通过后预算
-//     解除，绝不影响后续 body 读取；0 = 不限制；
-//   - http-timeout：整次尝试的总超时（建连 + 探测 + 完整读 body + token dance 全程），
-//     按每次尝试独立计时；ctx 取消链注册进 probeResult，流结束/放弃时才释放；
-//   - read-timeout：无新增数据看门狗（progressWatchdog），探测与读 body 全程生效，
-//     慢速但持续传输不会被误砍；
-//   - connect-timeout：建连（TCP 拨号 + TLS 握手），落在 (代理, connect-timeout) 组合
-//     的 Transport 上（与既有 client() 复用逻辑一致）；
-//   - insecure-skip-verify（候选级三级生效值，随 cand 传入）：true 时该次尝试走
-//     insecure 专属 http.Client（TLSClientConfig.InsecureSkipVerify=true），该候选路径
-//     上的所有连接——含 30x 重定向目标与 token dance 的第二次请求——都跳过证书校验。
-func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, cand candidate, eff config.Options) (res *probeResult, err error, hard bool, hardReason string) {
+// 资源与超时所有权：
+//   - parent 为尝试父 ctx（调用方负责与客户端断开解耦，WithoutCancel）；
+//   - http-timeout（整次尝试总超时，0 = 不限制）在本函数内从 parent 派生；
+//   - read-timeout 看门狗（progressWatchdog）在本函数内创建，onWatchdog 非 nil 时在
+//     「请求发出前」回调（探测管线借此把预算定时器联动到 wd.cancel——到期取消在途请求，
+//     且不连坐 http-timeout 分支，成功路径拆除联动后活体 body 不受影响）；
+//   - 成功时 cancelTimeout 与 wd.Stop 注册进返回结果的 onClose 链（流结束/放弃时统一
+//     释放）；失败时立即回收，防计时器泄漏。
+//
+// 返回 (结果, 错误)：res 非 nil 时资源所有权移交调用方。
+func (s *Server) startUpstream(parent context.Context, r *http.Request, cand candidate, eff config.Options, rangeHeader string, onWatchdog func(*progressWatchdog)) (res *probeResult, err error) {
 	urlStr := cand.url // 候选最终 URL（占位符展开后）
 	// //////////////////  http-timeout（整次尝试总预算）  start  //////////////////////////////
 	// 与客户端连接解耦由上层 ctx（WithoutCancel）保证；这里的总预算不能 defer cancel——
@@ -173,15 +168,18 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 		attemptParent, cancelTimeout = context.WithTimeout(parent, eff.HTTPTimeout)
 	}
 	wd := newProgressWatchdog(attemptParent, eff.ReadTimeout)
+	if onWatchdog != nil {
+		onWatchdog(wd)
+	}
 	defer func() {
 		if res != nil {
-			// 探测成功：资源所有权移交 probeResult（流结束/放弃时释放）
+			// 尝试成功：资源所有权移交 probeResult（流结束/放弃时释放）
 			if cancelTimeout != nil {
 				res.onClose(cancelTimeout)
 			}
 			res.onClose(wd.Stop)
 		} else {
-			// 探测失败：立即释放，防计时器泄漏
+			// 尝试失败：立即释放，防计时器泄漏
 			if cancelTimeout != nil {
 				cancelTimeout()
 			}
@@ -190,6 +188,94 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 	}()
 	// //////////////////  http-timeout（整次尝试总预算）  end  //////////////////////////////////
 
+	// //////////////////  构造并发起上游请求  start  ////////////////////////////////////////////
+	req, err := http.NewRequestWithContext(wd.ctx, r.Method, urlStr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("构造上游请求失败（%s）: %w", urlStr, err)
+	}
+	applyForwardRequestHeaders(req, r)
+	// rangeHeader 非空时覆盖客户端透传的 Range（慢速升级续传按当前进度精确请求剩余区间）
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+
+	// 按该候选生效的 insecure-skip-verify 选择客户端（true = 跳过上游证书校验，
+	// 同一 (代理, connect-timeout, insecure) 组合复用同一 Client，连接复用不受影响）
+	cl := s.client(eff.HTTPProxy, eff.ConnectTimeout, cand.insecureSkipVerify)
+	resp, err := cl.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求上游失败（%s）: %w", urlStr, wd.wrapErr(err))
+	}
+	wd.reset() // 响应头到达 = 一次进度（read-timeout 计时器重置）
+	// //////////////////  构造并发起上游请求  end  //////////////////////////////////////////////
+
+	// //////////////////  探测首块（判据可判定即返回）  start  ////////////////////////////////////
+	res = newProbeResultFromResponse(resp, wd, urlStr)
+	if res.body != nil {
+		first, eof, ferr := readProbeFirst(res.body, wd)
+		if ferr != nil {
+			res.Close()
+			res = nil // 已放弃该结果：置 nil 让出口的释放链立即回收看门狗/超时预算
+			return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, wd.wrapErr(ferr))
+		}
+		res.first, res.eof = first, eof
+		if eof { // 探测期已到 EOF：body 无剩余数据，立即关闭释放连接
+			_ = res.body.Close()
+			res.body = nil
+		}
+	}
+	// //////////////////  探测首块（判据可判定即返回）  end  //////////////////////////////////////
+
+	// //////////////////  401 匿名 token dance（探测式）  start  /////////////////////////////////
+	if res.status == http.StatusUnauthorized && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		resp2, consumed, ok := s.dockerAuthDanceRetry(wd, cl, req, resp, urlStr)
+		if ok {
+			res.Close() // 首 401 响应已被 dance 排干并关闭，释放其资源引用后改用重试响应
+			res = newProbeResultFromResponse(resp2, wd, urlStr)
+			res.danced = true
+			if res.body != nil {
+				first, eof, ferr := readProbeFirst(res.body, wd)
+				if ferr != nil {
+					res.Close()
+					res = nil // 已放弃该结果：置 nil 让出口的释放链立即回收看门狗/超时预算
+					return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, wd.wrapErr(ferr))
+				}
+				res.first, res.eof = first, eof
+				if eof {
+					_ = res.body.Close()
+					res.body = nil
+				}
+			}
+		} else if consumed {
+			// dance 已启动但未拿到重试响应（取 token 失败/重试请求失败）：
+			// 首 401 响应已被排干关闭，按原始 401 探测结果继续（判据必拒、软失败）
+			res.body = nil
+			res.eof = true
+		}
+		// consumed=false：401 无可解析 Bearer 挑战，未 dance，探测结果原样保留
+	}
+	// //////////////////  401 匿名 token dance（探测式）  end  ///////////////////////////////////
+	return res, nil
+}
+
+// probeCandidateAttempt 向 urlStr 发起一次探测式上游尝试（候选管线共用，方法沿用入站
+// GET/HEAD）。返回 (结果, 错误, 是否硬失败, 硬失败原因)。硬失败（hard=true）：
+// probe-timeout 探测预算耗尽 / 上游 403 / token dance 后仍 401——候选层应跳过
+// url-redirect-item-error-retry 原地重试直接切换下一候选；其余失败（网络错误、
+// 超时、判据不过）为软失败，按既有 item 重试语义原地重试。
+//
+// 尝试本体（请求头/token dance/看门狗/read-timeout/http-timeout/候选级 insecure）
+// 全部复用 startUpstream 公共底层；本函数只负责探测预算（probe-timeout）的包装：
+//   - probe-timeout：从发出请求到「响应头可用（含 token dance 的第二次响应）且成功
+//     判据可判定（首块读出或 EOF）」的时限，覆盖建连后的等待与 token dance 全程；
+//     到期经 AfterFunc 联动取消看门狗 ctx 使在途请求立即失败，硬失败快切下一候选；
+//     探测结束（成败皆然）即拆链停表——探测通过后预算解除，绝不影响后续 body 读取；
+//     0 = 不限制。预算 ctx 与 http-timeout 分支平级（联动只取消看门狗），
+//     成功路径拆除联动并回收预算 ctx 后，活体 body 的读取不受任何影响。
+//
+// connect-timeout 建连落在 (代理, connect-timeout) 组合的 Transport 上（与既有 client()
+// 复用逻辑一致）；insecure-skip-verify 候选级三级生效值随 cand 传入。
+func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, cand candidate, eff config.Options) (res *probeResult, err error, hard bool, hardReason string) {
 	// //////////////////  probe-timeout（探测预算，到期硬失败快切）  start  /////////////////////
 	var (
 		probeCtx    context.Context
@@ -199,9 +285,7 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 		probeFired  atomic.Bool // 定时器是否已触发（区分探测预算到期与 http-timeout 到期）
 	)
 	if eff.URLRedirectProbeTimeout > 0 {
-		probeCtx, cancelProbe = context.WithCancel(attemptParent)
-		// 联动：预算到期 → 取消看门狗 ctx（本次尝试的所有在途读写随之失败）
-		stopLink = context.AfterFunc(probeCtx, wd.cancel)
+		probeCtx, cancelProbe = context.WithCancel(parent)
 		probeTimer = time.AfterFunc(eff.URLRedirectProbeTimeout, func() {
 			probeFired.Store(true)
 			cancelProbe()
@@ -216,88 +300,24 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 		}()
 	}
 	probeExpired := func() bool { return probeFired.Load() }
+	// onWatchdog 在 startUpstream 创建看门狗后（请求发出前）被回调：
+	// 预算到期 → 取消看门狗 ctx（本次尝试的所有在途读写随之失败）
+	onWatchdog := func(wd *progressWatchdog) {
+		if eff.URLRedirectProbeTimeout > 0 {
+			stopLink = context.AfterFunc(probeCtx, wd.cancel)
+		}
+	}
 	// //////////////////  probe-timeout（探测预算，到期硬失败快切）  end  ///////////////////////
 
-	// //////////////////  构造并发起上游请求  start  ////////////////////////////////////////////
-	req, err := http.NewRequestWithContext(wd.ctx, r.Method, urlStr, nil)
+	res, err = s.startUpstream(parent, r, cand, eff, "", onWatchdog)
 	if err != nil {
-		return nil, fmt.Errorf("构造上游请求失败（%s）: %w", urlStr, err), false, ""
-	}
-	applyForwardRequestHeaders(req, r)
-
-	// 按该候选生效的 insecure-skip-verify 选择客户端（true = 跳过上游证书校验，
-	// 同一 (代理, connect-timeout, insecure) 组合复用同一 Client，连接复用不受影响）
-	cl := s.client(eff.HTTPProxy, eff.ConnectTimeout, cand.insecureSkipVerify)
-	resp, err := cl.Do(req)
-	if err != nil {
-		err = fmt.Errorf("请求上游失败（%s）: %w", urlStr, wd.wrapErr(err))
 		if probeExpired() {
 			// 探测预算到期：硬失败快切下一候选（跳过 item 原地重试）
-			return nil, fmt.Errorf("probe-timeout（探测预算 %s 内响应头未就绪）: %w",
+			return nil, fmt.Errorf("probe-timeout（探测预算 %s 内响应头/首块未就绪）: %w",
 				eff.URLRedirectProbeTimeout, err), true, "probe-timeout"
 		}
 		return nil, err, false, ""
 	}
-	wd.reset() // 响应头到达 = 一次进度（read-timeout 计时器重置）
-	// //////////////////  构造并发起上游请求  end  //////////////////////////////////////////////
-
-	// //////////////////  探测首块（判据可判定即返回）  start  ////////////////////////////////////
-	res = newProbeResultFromResponse(resp, wd, urlStr)
-	if res.body != nil {
-		first, eof, ferr := readProbeFirst(res.body, wd)
-		if ferr != nil {
-			res.Close()
-			res = nil // 已放弃该结果：置 nil 让出口的释放链立即回收看门狗/超时预算
-			// 读首块失败：探测预算到期属硬失败快切；其余网络/超时类失败按软失败处理
-			//（可 item 重试）
-			if probeExpired() {
-				return nil, fmt.Errorf("probe-timeout（探测预算 %s 内首块未就绪）: %w",
-					eff.URLRedirectProbeTimeout, wd.wrapErr(ferr)), true, "probe-timeout"
-			}
-			return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, wd.wrapErr(ferr)), false, ""
-		}
-		res.first, res.eof = first, eof
-		if eof { // 探测期已到 EOF：body 无剩余数据，立即关闭释放连接
-			_ = res.body.Close()
-			res.body = nil
-		}
-	}
-	// //////////////////  探测首块（判据可判定即返回）  end  //////////////////////////////////////
-
-	// //////////////////  401 匿名 token dance（探测式，预算覆盖第二次响应）  start  /////////////
-	if res.status == http.StatusUnauthorized && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		resp2, consumed, ok := s.dockerAuthDanceRetry(wd, cl, req, resp, urlStr)
-		if ok {
-			res.Close() // 首 401 响应已被 dance 排干并关闭，释放其资源引用后改用重试响应
-			res = newProbeResultFromResponse(resp2, wd, urlStr)
-			res.danced = true
-			if res.body != nil {
-				first, eof, ferr := readProbeFirst(res.body, wd)
-				if ferr != nil {
-					res.Close()
-					res = nil // 已放弃该结果：置 nil 让出口的释放链立即回收看门狗/超时预算
-					if probeExpired() {
-						return nil, fmt.Errorf("probe-timeout（探测预算 %s 内 dance 重试响应首块未就绪）: %w",
-							eff.URLRedirectProbeTimeout, wd.wrapErr(ferr)), true, "probe-timeout"
-					}
-					return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, wd.wrapErr(ferr)), false, ""
-				}
-				res.first, res.eof = first, eof
-				if eof {
-					_ = res.body.Close()
-					res.body = nil
-				}
-			}
-		} else if consumed {
-			// dance 已启动但未拿到重试响应（取 token 失败/重试请求失败）：
-			// 首个 401 响应已被排干关闭，按原始 401 探测结果继续（判据必拒、软失败）
-			res.body = nil
-			res.eof = true
-		}
-		// consumed=false：401 无可解析 Bearer 挑战，未 dance，探测结果原样保留
-	}
-	// //////////////////  401 匿名 token dance（探测式，预算覆盖第二次响应）  end  ///////////////
-
 	if probeExpired() {
 		// 探测预算在探测阶段结束前到期（竞态窗口内触发）：本次尝试按硬失败快切处理，
 		// 绝不把「ctx 已被预算取消」的活体 body 交给调用方 commit（否则 commit 后

@@ -37,6 +37,22 @@ const DefaultCacheTTL = 30 * time.Minute
 // DefaultProgressLogInterval 全局 log.progress-interval 未配置时的默认流式透传进度日志间隔。
 const DefaultProgressLogInterval = 10 * time.Second
 
+// 慢速升级多源并发续传（slow-download escalation，仅 type=docker 规则的 GET 路径目标
+// 流式回源生效）的缺省值。
+const (
+	// DefaultSlowDownloadSpeed 判慢阈值缺省值：1MB/s。生效窗口平均送出速率低于它判
+	// 「过慢」；显式 <=0（或 0）= 关闭整个特性。
+	DefaultSlowDownloadSpeed = 1 << 20
+	// DefaultSlowDownloadWindow 判速滑动窗口时长缺省值：10s（Validate 钳制最小 1s）。
+	DefaultSlowDownloadWindow = 10 * time.Second
+	// DefaultSlowDownloadMinRemaining 触发所需最小剩余字节数缺省值：64MB
+	//（已知总长不可知则永不触发；0 = 允许剩余 0 字节时也触发，负数 Validate 拒绝）。
+	DefaultSlowDownloadMinRemaining = 64 << 20
+	// DefaultSlowDownloadMaxBehind 多源合并的剪枝阈值缺省值：8MB（某源落后领先源超过
+	// 该字节数即被剪枝关闭，收敛多源并发带来的带宽放大）。
+	DefaultSlowDownloadMaxBehind = 8 << 20
+)
+
 // 候选探测提速（作用于 url-redirect 候选管线：流式 GET 与 HEAD 共用）的缺省值。
 const (
 	// DefaultURLRedirectProbeTimeout 单次候选尝试的探测预算缺省值：5s。
@@ -115,6 +131,94 @@ func durationPtr(d time.Duration) *Duration {
 
 // String 实现 fmt.Stringer，便于日志输出。
 func (d Duration) String() string { return d.D().String() }
+
+// Bytes 是 YAML 配置里的字节数类型（底层 int64 字节），解析规则：
+//   - 纯整数：按字节解析（1048576 => 1MB）；
+//   - 带单位字符串：1024 进制，单位大小写不敏感，支持 B / KB / MB / GB / TB 与小数
+//     （"512KB" / "1MB" / "1.5MB" / "64MB" / "2GB"）。
+//
+// 解析失败启动快速失败；负值由 Validate 拒绝（本类型只负责解析）。
+type Bytes int64
+
+// bytesUnitRe 匹配「数值 + 单位」形态的字节串（数值支持小数，单位为字母）。
+var bytesUnitRe = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)$`)
+
+// ParseBytes 把字节串解析为字节数（1024 进制），无法解析时返回错误。
+func ParseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	// 纯整数：按字节
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
+	}
+	m := bytesUnitRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("无法解析字节数 %q（支持纯整数 1048576 或 512KB / 1MB / 1.5MB / 64MB / 2GB 等写法，1024 进制）", s)
+	}
+	num, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("无法解析字节数 %q: %w", s, err)
+	}
+	var mult float64
+	switch strings.ToLower(m[2]) {
+	case "b":
+		mult = 1
+	case "kb":
+		mult = 1 << 10
+	case "mb":
+		mult = 1 << 20
+	case "gb":
+		mult = 1 << 30
+	case "tb":
+		mult = 1 << 40
+	default:
+		return 0, fmt.Errorf("无法解析字节数 %q：未知单位 %q（支持 B / KB / MB / GB / TB，大小写不敏感）", s, m[2])
+	}
+	return int64(num * mult), nil
+}
+
+// Int64 返回 int64 字节表示。
+func (b Bytes) Int64() int64 { return int64(b) }
+
+// String 实现 fmt.Stringer，便于日志输出（复用 proxy 包同款人类可读格式太重，这里按
+// MB 起换算输出两位小数，足够配置留痕使用）。
+func (b Bytes) String() string {
+	if b < 1<<20 {
+		return strconv.FormatInt(b.Int64(), 10) + "B"
+	}
+	units := [...]string{"B", "KB", "MB", "GB", "TB"}
+	v := float64(b)
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	s := strconv.FormatFloat(v, 'f', 2, 64)
+	s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	return s + units[i]
+}
+
+// UnmarshalYAML 实现 yaml.Unmarshaler，让 Bytes 可直接用于 YAML 字段。
+func (b *Bytes) UnmarshalYAML(node *yaml.Node) error {
+	if node == nil || node.Tag == "!!null" || strings.TrimSpace(node.Value) == "" {
+		*b = 0
+		return nil
+	}
+	v, err := ParseBytes(node.Value)
+	if err != nil {
+		return fmt.Errorf("第 %d 行: %w", node.Line, err)
+	}
+	*b = Bytes(v)
+	return nil
+}
+
+// bytesPtr 返回 Bytes 指针（用于预置默认值）。
+func bytesPtr(n int64) *Bytes {
+	v := Bytes(n)
+	return &v
+}
 
 // UnmarshalYAML 实现 yaml.Unmarshaler，让 Duration 可直接用于 YAML 字段。
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
@@ -299,6 +403,20 @@ type DomainRule struct {
 	// url-redirect-hedge-delay）。nil（未配置）沿用全局；0 = 纯串行禁用竞速；
 	// 负数为配置错误（Validate 拒绝）。
 	URLRedirectHedgeDelay *Duration `yaml:"url-redirect-hedge-delay"`
+	// SlowDownloadSpeed 该规则慢速升级多源并发续传的判慢阈值（B/s，语义同全局
+	// slow-download-speed）。nil（未配置）沿用全局；<=0 = 关闭整个特性；
+	// 负数为配置错误（Validate 拒绝）。仅 type=docker 规则生效。
+	SlowDownloadSpeed *Bytes `yaml:"slow-download-speed"`
+	// SlowDownloadWindow 该规则判速滑动窗口时长（语义同全局 slow-download-window）。
+	// nil（未配置）沿用全局；启用时（生效 speed>0）小于 1s 被 Validate 钳制为 1s。
+	SlowDownloadWindow *Duration `yaml:"slow-download-window"`
+	// SlowDownloadMinRemaining 该规则触发升级所需最小剩余字节数（语义同全局
+	// slow-download-min-remaining）。nil（未配置）沿用全局；0 合法（不设剩余量门槛）。
+	SlowDownloadMinRemaining *Bytes `yaml:"slow-download-min-remaining"`
+	// SlowDownloadMaxBehind 该规则多源合并的剪枝阈值（语义同全局
+	// slow-download-max-behind）。nil（未配置）沿用全局；启用时（生效 speed>0）
+	// 必须 >0，Validate 拒绝。
+	SlowDownloadMaxBehind *Bytes `yaml:"slow-download-max-behind"`
 
 	// re 是 Match 编译后的正则；excludeRe 是 Exclude 逐项编译后的正则列表
 	//（均在 Validate 阶段填充，不参与 YAML 解析）。
@@ -394,6 +512,22 @@ type Config struct {
 	// 第一个通过成功判据的候选胜出，其余全部取消（context 取消，连接及时释放）。
 	// 0 = 纯串行禁用竞速（上一候选出结果后才放行下一个）；负数为配置错误（Validate 拒绝）。
 	URLRedirectHedgeDelay *Duration `yaml:"url-redirect-hedge-delay"`
+	// SlowDownloadSpeed 全局慢速升级多源并发续传的判慢阈值（B/s）：流式回源的滑动窗口
+	// 平均送出速率低于它判「过慢」，对（候选数>1 的）docker 类流式下载向全部其余候选并发
+	// 发起 Range 续传并有序合并。默认 1MB/s；显式 <=0 = 关闭整个特性；负数为配置错误
+	//（Validate 拒绝）。仅 type=docker 规则生效。
+	SlowDownloadSpeed *Bytes `yaml:"slow-download-speed"`
+	// SlowDownloadWindow 全局判速滑动窗口时长：窗口满时按窗口平均送出速率判慢；
+	// 默认 10s，启用时（生效 speed>0）小于 1s 被 Validate 钳制为 1s。
+	SlowDownloadWindow *Duration `yaml:"slow-download-window"`
+	// SlowDownloadMinRemaining 全局触发升级所需最小剩余字节数：剩余字节（已知总长 -
+	// 已传）不足该值时不升级（尾巴太小没必要并发拉满）。默认 64MB；0 合法；
+	// 负数为配置错误（Validate 拒绝）。
+	SlowDownloadMinRemaining *Bytes `yaml:"slow-download-min-remaining"`
+	// SlowDownloadMaxBehind 全局多源合并的剪枝阈值：合并中某源落后领先源超过该字节数
+	// 即被关闭移除（收敛「每个源都拉满剩余区间自己的流」的带宽放大）。默认 8MB；
+	// 启用时（生效 speed>0）必须 >0，Validate 拒绝。
+	SlowDownloadMaxBehind *Bytes `yaml:"slow-download-max-behind"`
 	// HTTPProxy 全局上游代理（http/https/socks5 地址，如 http://127.0.0.1:7890），空串表示直连。
 	HTTPProxy string `yaml:"http-proxy"`
 	// SuccessCheck url-redirect 候选成功判据：status 或 content（默认 content）。
@@ -484,6 +618,18 @@ type Options struct {
 	// GET 路径目标流式回源期间每隔该间隔输出一条回源进度日志（已传字节数/百分比/速率等），
 	// 便于观测 docker pull 大 blob 这类长耗时流式传输的回源进度。
 	ProgressLogInterval time.Duration
+	// RuleType 生效规则的 type 归一化值（空串 = 未命中规则或规则未配置 type 过滤）：
+	// 供慢速升级多源并发续传做类型门控（仅 RuleTypeDocker 的流式回源启用）。
+	RuleType string
+	// SlowDownloadSpeed 慢速升级多源并发续传的判慢阈值（B/s）：<=0 = 关闭整个特性；
+	// 规则显式 ?? 全局（ResolveOptions 解析）。仅 type=docker 规则生效。
+	SlowDownloadSpeed int64
+	// SlowDownloadWindow 判速滑动窗口时长（启用时经 Validate 保证 >=1s）。
+	SlowDownloadWindow time.Duration
+	// SlowDownloadMinRemaining 触发升级所需最小剩余字节数（0 = 不设剩余量门槛）。
+	SlowDownloadMinRemaining int64
+	// SlowDownloadMaxBehind 多源合并的剪枝阈值（落后超过该字节数的源被剪枝关闭）。
+	SlowDownloadMaxBehind int64
 }
 
 // CandidateInsecureSkipVerify 返回候选对象的「忽略 TLS 证书校验」最终生效值——
@@ -598,6 +744,11 @@ func (c *Config) Validate() error {
 	if err := validateNonNegativeDuration(c.URLRedirectHedgeDelay, "url-redirect-hedge-delay"); err != nil {
 		return err
 	}
+	// 慢速升级多源并发续传四键：负数为配置错误；启用（生效 speed>0）时钳制 window>=1s、
+	// 要求 max-behind>0（min-remaining 允许 0；speed<=0 = 关闭特性，不做启用性校验）
+	if err := validateSlowDownload("", c.SlowDownloadSpeed, c.SlowDownloadWindow, c.SlowDownloadMinRemaining, c.SlowDownloadMaxBehind, c.GlobalSlowDownloadSpeed()); err != nil {
+		return err
+	}
 	// log.level 仅允许四级，非法值启动快速失败；合法值转成 slog.Level 存私有字段供 LogLevel() 使用
 	switch c.Log.Level {
 	case "debug":
@@ -710,6 +861,16 @@ func (c *Config) Validate() error {
 		if err := validateNonNegativeDuration(r.URLRedirectHedgeDelay, "url-redirect-hedge-delay"); err != nil {
 			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
 		}
+		// 规则级 slow-download-* 四键：生效 speed = 规则显式 ?? 全局（与 ResolveOptions
+		// 的解析顺序一致），启用时同样钳制 window / 要求 max-behind>0
+		ruleSpeed := c.GlobalSlowDownloadSpeed()
+		if r.SlowDownloadSpeed != nil {
+			ruleSpeed = r.SlowDownloadSpeed.Int64()
+		}
+		if err := validateSlowDownload(fmt.Sprintf("domain-rules[%d] (%s) 的", i, r.Label()),
+			r.SlowDownloadSpeed, r.SlowDownloadWindow, r.SlowDownloadMinRemaining, r.SlowDownloadMaxBehind, ruleSpeed); err != nil {
+			return err
+		}
 	}
 	// //////////////////  域名规则校验  end  ////////////////////////////////////////////////
 
@@ -745,6 +906,43 @@ func validateNonNegativeDuration(d *Duration, name string) error {
 func validateNonNegativeInt(n *int, name string) error {
 	if n != nil && *n < 0 {
 		return fmt.Errorf("%s 不能为负数（未配置或 0 = 不重试），当前为 %d", name, *n)
+	}
+	return nil
+}
+
+// validateSlowDownload 校验 slow-download-* 四键（全局与规则级共用，where 为空串时
+// 按全局键名报错，否则按「<where> <键名>」拼装）：
+//   - 任一键负数为配置错误（快速失败）；
+//   - 启用（effSpeed>0）时：window 非 nil 且 <1s 就地钳制为 1s（窗口过短会把网络抖动
+//     误判为持续过慢）；显式 max-behind <=0 为配置错误（多源合并没有剪枝阈值会放大带宽
+//     浪费）；min-remaining 允许 0（不设剩余量门槛）；
+//   - 关闭（effSpeed<=0）时只做负数检查（其余键不生效，无启用性要求）。
+func validateSlowDownload(where string, speed *Bytes, window *Duration, minRemaining, maxBehind *Bytes, effSpeed int64) error {
+	key := func(name string) string {
+		if where == "" {
+			return name
+		}
+		return where + " " + name
+	}
+	if speed != nil && *speed < 0 {
+		return fmt.Errorf("%s 不能为负数（<=0 = 关闭慢速升级多源并发续传），当前为 %s", key("slow-download-speed"), *speed)
+	}
+	if window != nil && window.D() < 0 {
+		return fmt.Errorf("%s 不能为负数，当前为 %s", key("slow-download-window"), *window)
+	}
+	if minRemaining != nil && *minRemaining < 0 {
+		return fmt.Errorf("%s 不能为负数（0 = 不设剩余量门槛），当前为 %s", key("slow-download-min-remaining"), *minRemaining)
+	}
+	if maxBehind != nil && *maxBehind < 0 {
+		return fmt.Errorf("%s 不能为负数（启用时必须 >0），当前为 %s", key("slow-download-max-behind"), *maxBehind)
+	}
+	if effSpeed > 0 {
+		if window != nil && window.D() < time.Second {
+			*window = Duration(time.Second) // 钳制最小 1s
+		}
+		if maxBehind != nil && *maxBehind <= 0 {
+			return fmt.Errorf("%s 必须大于 0（slow-download-speed 启用时它是多源合并的剪枝阈值）", key("slow-download-max-behind"))
+		}
 	}
 	return nil
 }
@@ -818,6 +1016,43 @@ func (c *Config) GlobalURLRedirectHedgeDelay() time.Duration {
 		return DefaultURLRedirectHedgeDelay
 	}
 	return c.URLRedirectHedgeDelay.D()
+}
+
+// GlobalSlowDownloadSpeed 返回全局判慢阈值生效值（B/s）：
+// nil（未配置）= 缺省 1MB/s；显式 <=0 = 关闭慢速升级多源并发续传。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底，供 ResolveOptions 复用。
+func (c *Config) GlobalSlowDownloadSpeed() int64 {
+	if c.SlowDownloadSpeed == nil {
+		return DefaultSlowDownloadSpeed
+	}
+	return c.SlowDownloadSpeed.Int64()
+}
+
+// GlobalSlowDownloadWindow 返回全局判速滑动窗口时长生效值：
+// nil（未配置）= 缺省 10s（DefaultSlowDownloadWindow）。
+func (c *Config) GlobalSlowDownloadWindow() time.Duration {
+	if c.SlowDownloadWindow == nil {
+		return DefaultSlowDownloadWindow
+	}
+	return c.SlowDownloadWindow.D()
+}
+
+// GlobalSlowDownloadMinRemaining 返回全局触发升级所需最小剩余字节数生效值：
+// nil（未配置）= 缺省 64MB（DefaultSlowDownloadMinRemaining）。
+func (c *Config) GlobalSlowDownloadMinRemaining() int64 {
+	if c.SlowDownloadMinRemaining == nil {
+		return DefaultSlowDownloadMinRemaining
+	}
+	return c.SlowDownloadMinRemaining.Int64()
+}
+
+// GlobalSlowDownloadMaxBehind 返回全局多源合并剪枝阈值生效值：
+// nil（未配置）= 缺省 8MB（DefaultSlowDownloadMaxBehind）。
+func (c *Config) GlobalSlowDownloadMaxBehind() int64 {
+	if c.SlowDownloadMaxBehind == nil {
+		return DefaultSlowDownloadMaxBehind
+	}
+	return c.SlowDownloadMaxBehind.Int64()
 }
 
 // ProgressLogInterval 返回全局流式透传进度日志的输出间隔生效值：
@@ -894,6 +1129,10 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		URLRedirectProbeTimeout:   c.GlobalURLRedirectProbeTimeout(),
 		URLRedirectHedgeDelay:     c.GlobalURLRedirectHedgeDelay(),
 		ProgressLogInterval:       c.ProgressLogInterval(),
+		SlowDownloadSpeed:         c.GlobalSlowDownloadSpeed(),
+		SlowDownloadWindow:        c.GlobalSlowDownloadWindow(),
+		SlowDownloadMinRemaining:  c.GlobalSlowDownloadMinRemaining(),
+		SlowDownloadMaxBehind:     c.GlobalSlowDownloadMaxBehind(),
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
@@ -987,6 +1226,21 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		if r.URLRedirectHedgeDelay != nil {
 			o.URLRedirectHedgeDelay = r.URLRedirectHedgeDelay.D()
 		}
+		// 慢速升级多源并发续传覆盖：规则没配（nil）沿用全局值；规则 type 记入 RuleType
+		//（归一化生效值），供 proxy 层做「仅 type=docker 生效」的类型门控
+		if r.SlowDownloadSpeed != nil {
+			o.SlowDownloadSpeed = r.SlowDownloadSpeed.Int64()
+		}
+		if r.SlowDownloadWindow != nil {
+			o.SlowDownloadWindow = r.SlowDownloadWindow.D()
+		}
+		if r.SlowDownloadMinRemaining != nil {
+			o.SlowDownloadMinRemaining = r.SlowDownloadMinRemaining.Int64()
+		}
+		if r.SlowDownloadMaxBehind != nil {
+			o.SlowDownloadMaxBehind = r.SlowDownloadMaxBehind.Int64()
+		}
+		o.RuleType = r.Type
 		o.Rule = r.Label()
 		break // 自上而下第一条命中即生效
 	}
