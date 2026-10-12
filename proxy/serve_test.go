@@ -46,7 +46,7 @@ func TestServeEntryUpstream304NoContentLength(t *testing.T) {
 	var buf bytes.Buffer
 	s := newServeServer(t, &buf)
 
-	eff := s.cfg.ResolveOptions("", candidatesTargetURL)
+	eff := s.cfg.ResolveOptions("", candidatesTargetURL, true)
 	r := httptest.NewRequest(http.MethodGet, "/"+candidatesTargetURL, nil)
 	rec := httptest.NewRecorder()
 	// 条件头已不透传，上游对无条件 GET 仍回 304 属异常/缓存副本有效兜底场景
@@ -71,7 +71,7 @@ func TestServeEntryHitEtag304NoContentLength(t *testing.T) {
 	var buf bytes.Buffer
 	s := newServeServer(t, &buf)
 
-	eff := s.cfg.ResolveOptions("", candidatesTargetURL)
+	eff := s.cfg.ResolveOptions("", candidatesTargetURL, true)
 	r := httptest.NewRequest(http.MethodGet, "/"+candidatesTargetURL, nil)
 	r.Header.Set("If-None-Match", `"abc"`)
 	rec := httptest.NewRecorder()
@@ -98,7 +98,7 @@ func TestServeEntry200SuccessLog(t *testing.T) {
 	var buf bytes.Buffer
 	s := newServeServer(t, &buf)
 
-	eff := s.cfg.ResolveOptions("", candidatesTargetURL)
+	eff := s.cfg.ResolveOptions("", candidatesTargetURL, true)
 	r := httptest.NewRequest(http.MethodGet, "/"+candidatesTargetURL, nil)
 	rec := httptest.NewRecorder()
 	e := &cache.Entry{Status: http.StatusOK, Header: http.Header{}, Body: []byte("content"), Source: "direct"}
@@ -125,7 +125,7 @@ func TestServeEntry200EmptyBodyNoSuccessLog(t *testing.T) {
 	var buf bytes.Buffer
 	s := newServeServer(t, &buf)
 
-	eff := s.cfg.ResolveOptions("", candidatesTargetURL)
+	eff := s.cfg.ResolveOptions("", candidatesTargetURL, true)
 	r := httptest.NewRequest(http.MethodGet, "/"+candidatesTargetURL, nil)
 	rec := httptest.NewRecorder()
 	e := &cache.Entry{Status: http.StatusOK, Header: http.Header{}, Body: nil, Source: "direct"}

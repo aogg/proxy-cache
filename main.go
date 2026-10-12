@@ -153,9 +153,15 @@ func run() error {
 		if r.URLRedirect != nil {
 			redirects = *r.URLRedirect
 		}
+		// 规则 type 生效值（Validate 已归一化为小写）：空串 = 不过滤请求类型，输出 any
+		ruleType := r.Type
+		if ruleType == "" {
+			ruleType = "any"
+		}
 		logger.Info("域名规则已加载",
 			"rule", r.Label(),
 			"match", r.Match,
+			"type", ruleType,
 			"cache_enabled", cacheEnabled,
 			"cache_path", cachePath,
 			"cache_ttl", cacheTTLLog(cacheTTL),

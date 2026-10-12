@@ -23,6 +23,14 @@ const (
 	SuccessCheckContent = "content"
 )
 
+// domain-rules 规则 type 字段的合法取值（请求类型过滤；留空 = 不过滤请求类型）。
+const (
+	// RuleTypeDocker 仅承接路径目标请求（fullURL=false，如 docker registry 的 /v2/xxx/manifests/latest）。
+	RuleTypeDocker = "docker"
+	// RuleTypeWeb 仅承接完整 URL 请求（fullURL=true，如 /https://raw.githubusercontent.com/...）。
+	RuleTypeWeb = "web"
+)
+
 // DefaultCacheTTL 全局 cache.ttl 未配置时的默认缓存时长。
 const DefaultCacheTTL = 30 * time.Minute
 
@@ -136,6 +144,18 @@ type RuleCache struct {
 type DomainRule struct {
 	// Name 规则名（可选，仅用于日志与观测）。
 	Name string `yaml:"name"`
+	// Type 请求类型过滤（可选）：限定本规则只承接哪类请求。取值（Validate 阶段做
+	// trim + 小写归一化，"Docker " 视为 "docker"，归一化结果参与匹配与日志；
+	// 非法值启动快速失败）：
+	//   - ""（留空/未配置，默认）：不过滤请求类型，任何请求都可命中本规则
+	//    （完全兼容旧配置，现有行为不变）；
+	//   - "docker"（RuleTypeDocker）：仅路径目标请求可命中本规则
+	//    （如 docker registry 的 /v2/xxx/manifests/latest）；
+	//   - "web"（RuleTypeWeb）：仅完整 URL 请求可命中本规则
+	//    （如 /https://raw.githubusercontent.com/...）。
+	// 典型用途：同一入站域名/同一段 match 下，把 docker 流量与 web 流量分流到
+	// 两条不同规则（各自的 cache / 超时 / url-redirect 候选互不影响）。
+	Type string `yaml:"type"`
 	// Match 匹配「http://<入站Host>/<目标URL>」整串的正则表达式（必填，非锚定匹配）。
 	Match string `yaml:"match"`
 	// Exclude 排除正则列表（可选，可配置多个）：match 命中后逐个检查（同样对整串非锚定匹配），
@@ -374,6 +394,13 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("domain-rules[%d] (%s) 的 match 正则无效: %w", i, r.Label(), err)
 		}
 		r.re = re
+		// type 归一化（trim + 小写，"Docker " 视为 "docker"）：归一化结果参与
+		// ResolveOptions 的请求类型过滤与「域名规则已加载」启动日志；
+		// 仅允许 docker / web，留空 = 不过滤请求类型，其他值启动快速失败
+		r.Type = strings.ToLower(strings.TrimSpace(r.Type))
+		if r.Type != "" && r.Type != RuleTypeDocker && r.Type != RuleTypeWeb {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 type 仅支持 docker / web（留空 = 不过滤请求类型），收到 %q", i, r.Label(), r.Type)
+		}
 		// exclude 正则逐个编译缓存（与 match 同样对「http://<Host>/<目标URL>」整串非锚定匹配）
 		r.excludeRe = make([]*regexp.Regexp, 0, len(r.Exclude))
 		for j, pat := range r.Exclude {
@@ -469,8 +496,24 @@ func BuildMatchStr(host, target string) string {
 	return "http://" + strings.ToLower(strings.TrimSpace(host)) + "/" + target
 }
 
-// ResolveOptions 把全局配置与第一条命中「入站 Host + 目标」的域名规则覆盖项合并，
-// 返回该请求最终生效的配置。必须在 Validate 之后调用。
+// targetKindOf 返回请求目标类型标识（日志用，与 proxy 包的 targetKind 同语义）：
+// full-url（完整 URL 目标请求，fullURL=true）/ path（路径目标请求，fullURL=false）。
+// 供 ResolveOptions 的规则 type 过滤留痕使用。
+func targetKindOf(fullURL bool) string {
+	if fullURL {
+		return "full-url"
+	}
+	return "path"
+}
+
+// ResolveOptions 把全局配置与第一条命中「入站 Host + 目标」且请求类型相符的域名规则
+// 覆盖项合并，返回该请求最终生效的配置。必须在 Validate 之后调用。
+//
+// fullURL 标识请求目标类型（与 proxy.ExtractTarget 的 fullURL 语义一致）：
+// true = 完整 URL 请求（如 /https://raw.githubusercontent.com/...），
+// false = 路径目标请求（如 docker registry 的 /v2/xxx/manifests/latest）。
+// 它仅参与规则的 type 请求类型过滤（type: docker 仅承接路径目标 / type: web 仅承接
+// 完整 URL / 留空不过滤），不影响 match/exclude 的匹配串构造。
 //
 // 域名规则匹配串构造为「http://<入站Host>/<目标>」整串（Host 归一化为小写并去除
 // 首尾空白），规则 match 与 exclude 均对该整串做非锚定匹配：既支持按入站域名路由
@@ -480,7 +523,7 @@ func BuildMatchStr(host, target string) string {
 // 注意：完整 URL 请求的缓存 key（目标 URL 的 sha256）与 allow-list / deny-list 匹配
 // 仍只对目标 URL 进行，不受入站 Host 影响；路径目标请求则对「http://<入站Host>/<路径目标>」
 // 整串做 ACL 匹配与缓存 key 输入（见 proxy 包），把入站 Host 纳入以保持拦截能力并避免跨域名缓存污染。
-func (c *Config) ResolveOptions(host, targetURL string) Options {
+func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 	// //////////////////  全局默认值  start  ////////////////////////////////////////////////
 	o := Options{
 		CacheEnabled:       c.Cache.Enabled,
@@ -504,6 +547,22 @@ func (c *Config) ResolveOptions(host, targetURL string) Options {
 	// //////////////////  应用第一条命中的域名规则覆盖项  start  ////////////////////////////////////////////////
 	for i := range c.DomainRules {
 		r := &c.DomainRules[i]
+
+		// 请求类型过滤：发生在 match/exclude 匹配之前——规则配置了 type 且与请求类型
+		// 不符时直接跳过该规则（不消耗 match/exclude 判定），继续向下尝试后续规则。
+		//   - type: docker 仅承接路径目标请求（fullURL=false，target_kind=path）；
+		//   - type: web 仅承接完整 URL 请求（fullURL=true，target_kind=full-url）；
+		//   - type 为空（未配置）= 不过滤，任何请求类型都可参与本规则匹配（默认，兼容旧配置）。
+		if r.Type != "" {
+			// 规则期望的请求类型：docker=路径目标 / web=完整 URL
+			wantFullURL := r.Type == RuleTypeWeb
+			if wantFullURL != fullURL {
+				slog.Debug("域名规则请求类型不符，跳过",
+					"rule", r.Label(), "rule_type", r.Type, "target_kind", targetKindOf(fullURL))
+				continue
+			}
+		}
+
 		// match 命中且该规则所有 exclude 均不命中才应用；
 		// 被 exclude 排除的规则视为不匹配，继续向下尝试后续规则。
 		matched, excluded := r.matchResult(matchStr)

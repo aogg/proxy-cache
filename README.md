@@ -135,6 +135,7 @@ docker run -d --name proxy-cache \
 | `name` | string | 规则名（可选，用于日志/`X-Cache` 观测） |
 | `match` | string | **必填**，正则表达式，对「**`http://<入站Host>/<目标URL>`**」整串做非锚定匹配（入站 Host 归一化为小写）。既可按入站域名写（如 `'http://github\.path\..+'`，Host 形如 `github.path.xxx` 时命中），旧的纯目标 URL 写法也兼容（如 `raw\.githubusercontent\.com`、`.*https://[^.]+\.githubusercontent\.com`） |
 | `exclude` | string[] | 排除正则列表（可选，支持多项）。`match` 命中后再逐个检查（同样对整串非锚定匹配），**任一命中即排除该规则**（视为不匹配，继续向下尝试后续规则）；全部不命中才应用本规则 |
+| `type` | string | 请求类型过滤（可选，发生在 `match`/`exclude` 匹配之前）：留空 = 不过滤请求类型（默认，完全兼容旧配置）；`docker` = 仅路径目标请求可命中本规则（如 docker registry 的 `/v2/xxx/manifests/latest`）；`web` = 仅完整 URL 请求可命中本规则（如 `/https://raw.githubusercontent.com/...`）；其他值启动时直接报错。配置自动做 trim + 小写归一化（`"Docker "` 视为 `"docker"`） |
 | `cache.enabled` | bool | 覆盖该规则的缓存开关 |
 | `cache.ttl` | duration | 覆盖该规则的缓存时长；未配置沿用全局 `cache.ttl`；`0` = 永不过期；负数非法 |
 | `cache.path` | string | 该规则的**独立缓存目录**（trim 后为空 = 未配置，沿用全局 `cache.path`；同一 URL 永远落同一规则/目录） |
@@ -146,6 +147,8 @@ docker run -d --name proxy-cache \
 | `timeout` | duration | 该规则回源超时 |
 
 规则覆盖项均为「可选」：不写则沿用全局配置；**第一条命中的规则生效**（不做多规则叠加）。
+
+> `type` 请求类型分流说明：同一入站域名/同一段 `match` 下可配置多条规则，用 `type` 把 docker 流量与 web 流量分流到两条不同规则（各自的 cache/超时/url-redirect 候选互不影响）。`type` 过滤发生在 `match`/`exclude` 匹配**之前**——类型不符的规则直接跳过（debug 日志输出 `rule_type` 与 `target_kind`），继续向下尝试后续规则；启动日志「域名规则已加载」的 `type` 字段输出归一化生效值（不过滤时为 `any`）。
 
 > 匹配范围说明：域名规则的 `match` / `exclude` 对「`http://<入站Host>/<目标URL>`」整串匹配（入站 Host 参与匹配）；**完整 URL 请求**的缓存 key（目标 URL 的 sha256）与 allow-list / deny-list 仍只对目标 URL 匹配，与入站 Host 无关；**路径目标请求**（目标不是完整 URL，如 docker registry 的 `/v2/xxx/manifests/latest`）的 ACL 匹配与缓存 key 输入则使用「`http://<入站Host>/<路径目标>`」整串（入站 Host 参与，保持拦截能力并避免跨入站域名缓存污染）。
 
@@ -173,7 +176,7 @@ cache:
   ttl: 30m                    # 0=永不过期（未配置默认 30m；负数非法）
   clean-interval: 10m
 
-domain-rules:
+domain-rules:                 # 自上而下第一条命中生效；规则可配 type 做请求类型过滤（docker=仅路径目标 / web=仅完整 URL / 留空=不过滤）
   - name: githubusercontent
     match: '.*https://[^.]+\.githubusercontent\.com'
     exclude:                     # match 命中后任一 exclude 命中即排除本规则，
@@ -290,6 +293,9 @@ docker daemon 可以把本服务当作 registry 访问：请求路径不是完�
 ```yaml
 domain-rules:
   - name: docker-registry
+    # 请求类型过滤（可选）：仅路径目标请求命中本规则，web 流量不受影响
+    #（留空 = 不过滤；同一入站域名下可另配 type: web 规则分流 web 流量）
+    type: docker
     # 入站域名（解析到本服务）形如 registry-proxy-cache.linkease.net:5480 时命中；
     # 换成自己部署的域名（match 对「http://<入站Host>/<路径目标>」整串非锚定匹配）
     match: '.+registry-proxy-cache\.linkease\...+'
@@ -328,6 +334,7 @@ curl -I -H "Host: registry-proxy-cache.linkease.net:5480" \
 ### 路径目标请求的限制与行为说明
 
 - **仅支持 GET / HEAD**：docker registry 拉取只用这两个方法；其他方法（POST/PUT 等）对路径目标返回 400（`路径目标仅支持 GET/HEAD 请求`）。POST/PUT 等对**完整 URL 目标**仍保持直接透传（现状不变）
+- **建议配置 `type: docker`**：请求类型过滤（可选）——`type: docker` 仅承接路径目标请求、`type: web` 仅承接完整 URL 请求、留空不过滤（默认，兼容旧配置）。同一入站域名既做 docker 加速又做 web 加速时，可用两条同 `match` 规则按 `type` 分流，各自的 cache/超时/候选互不影响；过滤发生在 `match`/`exclude` 之前，类型不符的规则直接跳过
 - **必须命中规则**：路径目标请求必须命中某条 domain-rules 规则且该规则生效 `url-redirect` 非空才能回源，否则 400（错误信息保留「目标 URL 必须是完整的 http/https 地址」语义并说明原因）；全局默认配置（未命中规则）不承接路径目标
 - **HEAD/GET 行为一致**：docker 用 HEAD 探测 manifest/blob——HEAD 与 GET 统一走候选轮询管线：先查缓存（命中回放响应头，无 body，`X-Cache: HIT`）；未命中按候选轮询回源（方法保持 HEAD，success-check 对 HEAD 自动按 status 语义：200 即成功，304 仍视为成功）；HEAD 响应无 body，**不写缓存**；未配置 url-redirect 时回退直连（与旧版 HEAD 行为一致）
 - **缓存 key 含入站 Host**：路径目标的缓存 key 输入为「`http://<入站Host>/<路径目标>`」（再取 sha256），不同入站域名的同路径缓存互不污染；完整 URL 请求的缓存 key 输入仍为目标 URL 原文（兼容已有缓存）

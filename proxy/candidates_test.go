@@ -50,7 +50,7 @@ func newCandidatesServer(t *testing.T, templates []string, fallbackDirect bool) 
 // fetchVia 用 fetchViaCandidates 回源 target，返回条目与命中来源（Entry.Source）。
 func fetchVia(t *testing.T, s *Server, target string) (*cache.Entry, string, error) {
 	t.Helper()
-	eff := s.cfg.ResolveOptions("", target)
+	eff := s.cfg.ResolveOptions("", target, true)
 	r := httptest.NewRequest(http.MethodGet, "/"+target, nil)
 	e, err := s.fetchViaCandidates(r, target, eff)
 	var src string
@@ -272,7 +272,7 @@ func TestConditionalHeadersNotForwarded(t *testing.T) {
 	r.Header.Set("If-Unmodified-Since", "Mon, 02 Jan 2006 15:04:05 GMT")
 	r.Header.Set("Range", "bytes=0-9")
 
-	eff := s.cfg.ResolveOptions("", candidatesTargetURL)
+	eff := s.cfg.ResolveOptions("", candidatesTargetURL, true)
 	e, err := s.fetchViaCandidates(r, candidatesTargetURL, eff)
 	if err != nil {
 		t.Fatalf("fetchViaCandidates() 意外报错: %v", err)

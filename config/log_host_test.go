@@ -57,7 +57,7 @@ func TestResolveOptionsHostRouting(t *testing.T) {
 		cfg.DomainRules = []DomainRule{githubPathRule()}
 		mustValidate(t, cfg)
 
-		o := cfg.ResolveOptions(hostGitHubPath, urlVlessYAML)
+		o := cfg.ResolveOptions(hostGitHubPath, urlVlessYAML, true)
 		if o.Rule != "github-path" {
 			t.Fatalf("Rule = %q, want %q（规则未命中则后续断言失真）", o.Rule, "github-path")
 		}
@@ -83,7 +83,7 @@ func TestResolveOptionsHostRouting(t *testing.T) {
 		mustValidate(t, cfg)
 
 		for _, host := range []string{"", "other.example.com", "githubpath.example.com"} {
-			o := cfg.ResolveOptions(host, urlVlessYAML)
+			o := cfg.ResolveOptions(host, urlVlessYAML, true)
 			if o.Rule != "" {
 				t.Errorf("host=%q: Rule = %q, want 空串（不应命中任何规则）", host, o.Rule)
 			}
@@ -107,7 +107,7 @@ func TestResolveOptionsHostCaseInsensitive(t *testing.T) {
 	cfg.DomainRules = []DomainRule{{Name: "github-path", Match: `http://github\.path\.`}}
 	mustValidate(t, cfg)
 
-	o := cfg.ResolveOptions("GitHub.Path.Example.COM", urlVlessYAML)
+	o := cfg.ResolveOptions("GitHub.Path.Example.COM", urlVlessYAML, true)
 	if o.Rule != "github-path" {
 		t.Errorf("Rule = %q, want %q（Host 应归一化为小写后命中）", o.Rule, "github-path")
 	}
@@ -121,7 +121,7 @@ func TestResolveOptionsLegacyTargetURLMatch(t *testing.T) {
 	mustValidate(t, cfg)
 
 	for _, host := range []string{"", "anything.example.com", hostGitHubPath} {
-		o := cfg.ResolveOptions(host, urlVlessYAML)
+		o := cfg.ResolveOptions(host, urlVlessYAML, true)
 		if o.Rule != "raw-legacy" {
 			t.Errorf("host=%q: Rule = %q, want %q（旧写法应对整串非锚定命中）", host, o.Rule, "raw-legacy")
 		}
@@ -141,7 +141,7 @@ func TestResolveOptionsExcludeWholeString(t *testing.T) {
 		}}
 		mustValidate(t, cfg)
 
-		o := cfg.ResolveOptions(hostGitHubPath, urlVlessYAML)
+		o := cfg.ResolveOptions(hostGitHubPath, urlVlessYAML, true)
 		if o.Rule != "" {
 			t.Errorf("Rule = %q, want 空串（被 exclude 排除后应走全局默认）", o.Rule)
 		}
@@ -167,7 +167,7 @@ func TestResolveOptionsExcludeWholeString(t *testing.T) {
 		}
 		mustValidate(t, cfg)
 
-		o := cfg.ResolveOptions(hostGitHubPath, urlVlessYAML)
+		o := cfg.ResolveOptions(hostGitHubPath, urlVlessYAML, true)
 		if o.Rule != "github-path-second" {
 			t.Errorf("Rule = %q, want %q（第一条被排除后应命中第二条）", o.Rule, "github-path-second")
 		}
@@ -261,7 +261,7 @@ func captureResolveLog(t *testing.T, level slog.Level, host string) string {
 	cfg := Default()
 	cfg.DomainRules = []DomainRule{githubPathRule()}
 	mustValidate(t, cfg)
-	cfg.ResolveOptions(host, urlVlessYAML)
+	cfg.ResolveOptions(host, urlVlessYAML, true)
 	return buf.String()
 }
 

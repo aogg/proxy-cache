@@ -90,6 +90,14 @@ cache:
 #   - 路径目标请求（路径不是完整 URL，如 docker registry 的 /v2/xxx/manifests/latest）
 #     同样按该整串匹配（target 段即路径目标），必须命中规则且规则配了 url-redirect 才能回源，
 #     见下方「Docker Registry 镜像加速」场景示例
+# type（可选）请求类型过滤：限定本规则只承接哪类请求，发生在 match/exclude 匹配之前
+#（类型不符的规则直接跳过，继续向下尝试后续规则）。取值：
+#   - 留空/未配置（默认）= 不过滤请求类型，任何请求都可命中本规则（完全兼容旧配置）
+#   - type: docker  仅路径目标请求可命中本规则（如 docker registry 的 /v2/xxx/manifests/latest）
+#   - type: web     仅完整 URL 请求可命中本规则（如 /https://raw.githubusercontent.com/...）
+#   - 其他值启动时直接报错（快速失败）；配置自动做 trim + 小写归一化（"Docker " 视为 "docker"）
+# 典型用途：同一入站域名/同一段 match 下，把 docker 流量与 web 流量分流到两条不同规则
+#（各自的 cache / 超时 / url-redirect 候选互不影响）
 # 注意 1：缓存 key 与 allow-list / deny-list：完整 URL 请求仍只对目标 URL 匹配；
 #         路径目标请求对「http://<入站Host>/<路径目标>」整串做 ACL 匹配，
 #         缓存 key 输入也为该整串（入站 Host 参与，不同入站域名互不污染）
@@ -158,6 +166,7 @@ domain-rules:
   # 用法（入站域名换成自己部署的、解析到本服务，端口对应 listen）：
   #   docker pull registry-proxy-cache.linkease.net:5480/adockero/proxy-cache
   # - name: docker-registry
+  #   type: docker              # 仅路径目标请求命中本规则（web 流量不受本规则影响，可另配 type: web 规则分流）
   #   match: '.+registry-proxy-cache\.linkease\...+'   # 换成自己的入站域名（对整串非锚定匹配）
   #   cache:
   #     enabled: true

@@ -176,7 +176,7 @@ func newDanceMirror(t *testing.T, rec *danceRec, tokenSrv *httptest.Server, toke
 // 返回条目与命中来源（Entry.Source）。
 func fetchViaMethod(t *testing.T, s *Server, method, target string) (*cache.Entry, string, error) {
 	t.Helper()
-	eff := s.cfg.ResolveOptions("", target)
+	eff := s.cfg.ResolveOptions("", target, true)
 	r := httptest.NewRequest(method, "/"+target, nil)
 	e, err := s.fetchViaCandidates(r, target, eff)
 	var src string
@@ -203,7 +203,7 @@ func TestDockerAuthDanceCandidateSuccess(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/"+candidatesTargetURL, nil)
 	r.Header.Set("Authorization", danceClientAuthz)
 	r.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
-	eff := s.cfg.ResolveOptions("", candidatesTargetURL)
+	eff := s.cfg.ResolveOptions("", candidatesTargetURL, true)
 	e, err := s.fetchViaCandidates(r, candidatesTargetURL, eff)
 	if err != nil {
 		t.Fatalf("fetchViaCandidates() 意外报错: %v", err)

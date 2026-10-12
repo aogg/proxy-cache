@@ -197,8 +197,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// //////////////////  合并全局配置与域名规则  start  ////////////////////////////////////////////////
 	// 域名规则对「http://<入站Host>/<目标>」整串匹配，入站 Host 参与匹配
-	//（路径目标请求的匹配串形如 http://registry-proxy-cache.xxx:5480/v2/xxx/manifests/latest）
-	eff := s.cfg.ResolveOptions(r.Host, target)
+	//（路径目标请求的匹配串形如 http://registry-proxy-cache.xxx:5480/v2/xxx/manifests/latest）；
+	// fullURL 传真实请求类型，供规则 type 请求类型过滤
+	//（type: docker 仅承接路径目标 / type: web 仅承接完整 URL / 留空不过滤）
+	eff := s.cfg.ResolveOptions(r.Host, target, fullURL)
 	// //////////////////  合并全局配置与域名规则  end  ////////////////////////////////////////////////
 
 	// //////////////////  路径目标请求的分发限制  start  ////////////////////////////////////////////////
