@@ -314,8 +314,15 @@ func targetKind(fullURL bool) string {
 // fullURL 区分两类目标的缓存 key 输入（见 cacheKeyInput）：完整 URL = target 原文
 //（兼容已有缓存文件）；路径目标 = 「http://<入站Host>/<路径目标>」（入站 Host 参与，
 // 避免不同入站域名的同路径缓存互相污染）。
+//
+// 路径目标请求（fullURL=false，docker registry 回源）的回源为流式透传：
+// 候选竞速选定后立即 commit（WriteHeader + 透传响应头）再边读上游边写客户端，
+// 保证首字节时间只有「选定候选」的耗时，不被上游完整下载拖到超过 docker 客户端
+// 约 30s 的响应头超时（详见 stream.go）。完整 URL 目标（web）保持整包缓冲回放不变。
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string, fullURL bool, eff config.Options, start time.Time) {
 	key := cache.Key(cacheKeyInput(r, target, fullURL))
+	// 路径目标 GET：流式透传（选定候选立即 commit）；完整 URL GET：缓冲回放（行为不变）
+	streaming := !fullURL
 	// 先判定本请求不走缓存的具体原因（空串表示可缓存），再把原因暴露到日志，
 	// 避免出现「没写缓存文件但日志看不出为什么」的排查黑洞。
 	// 可缓存条件：cache.enabled 且 ttl>=0（TTL=0 表示永不过期，同样可缓存；负数理论上
@@ -347,12 +354,37 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		}
 	}
 
+	// finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 200 且过判据写缓存，
+	// 304 / 未过判据分别留痕说明原因；条件与日志字段与旧版一致）
+	finalize := func(ent *cache.Entry) {
+		s.finalizeFetchEntry(key, target, ent, eff, disk)
+	}
+	// streamingError 流式回源错误的一致出口：commit 前失败 502；commit 后失败响应已
+	// 固化（头已写出），只能终止连接，绝不能再 writeError 污染响应
+	streamingError := func(err error, committed bool) {
+		if err != nil && !committed {
+			s.writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if err != nil {
+			s.log.Warn("流式回源失败（响应头已写出，终止本次响应）",
+				"target", truncate(r.URL.Path, 300), "err", err)
+		}
+	}
+
 	if !cacheable {
 		// 不走缓存的决策留痕：Info 级输出原因与生效规则（含未命中任何规则的 global-default），
 		// 让「为什么不写缓存文件」在日志里直接可见
 		s.log.Info("GET 请求绕过缓存（BYPASS）", "rule", eff.Rule, "reason", bypassReason,
 			"target", truncate(target, 300))
 		// //////////////////  不走缓存：直接按生效配置回源  start  ////////////////////////////////////////////////
+		if streaming {
+			// 路径目标 BYPASS（Range / no-cache / 关缓存等）同样流式透传：
+			// docker 断点续传走 Range，上游回 206 视为成功并流式透传、不写缓存
+			_, committed, err := s.fetchViaCandidatesStreaming(w, r, target, eff, "BYPASS", nil, start)
+			streamingError(err, committed)
+			return
+		}
 		e, err := s.fetchViaCandidates(r, target, eff)
 		if err != nil {
 			s.writeError(w, http.StatusBadGateway, err.Error())
@@ -378,45 +410,87 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 
 	// //////////////////  未命中：单飞回源并写缓存  start  ////////////////////////////////////////////////
 	// 单飞 key 仍为缓存 key 输入串的 sha256：同一入站域名下同一目标必然命中同一规则/目录，
-	// 必然落同一缓存实例（路径目标的 key 输入含入站 Host，跨入站域名天然不共享单飞）
-	e, err := s.flight.Do(key, func() (*cache.Entry, error) {
+	// 必然落同一缓存实例（路径目标的 key 输入含入站 Host，跨入站域名天然不共享单飞）。
+	// 流式回源（路径目标）的等待方有常量上限（flightWaitLimit=10s）：大 blob 回源可持续
+	// 几十秒到几分钟，等待方超限后自行走候选回源（cache.Set 临时文件+rename 原子替换
+	// 保证并发写缓存不互相污染），避免被首个执行方吊死到超过 docker 响应头超时；
+	// 完整 URL 目标（web）保持无限期等待（行为不变）。
+	waitLimit := time.Duration(0)
+	if streaming {
+		waitLimit = flightWaitLimit
+	}
+	e, executed, err := s.flight.DoLimit(key, waitLimit, func() (*cache.Entry, error) {
+		if streaming {
+			// 流式执行方：响应已在本次调用内 commit 并边读边写给客户端，
+			// EOF 后 finalize 写缓存，完整 Entry 返回给等待方；
+			// commit 后失败用 errStreamingCommitted 标记（响应头已固化，不得再 502）
+			ent, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start)
+			if ferr != nil && committed {
+				return nil, fmt.Errorf("%w: %v", errStreamingCommitted, ferr)
+			}
+			return ent, ferr
+		}
 		ent, ferr := s.fetchViaCandidates(r, target, eff)
 		if ferr != nil {
 			return nil, ferr
 		}
-		// 仅缓存满足成功判据的 200 响应（handleGet 只处理 GET，判据按 GET 语义）
-		if ent.Status == http.StatusOK && checkSuccess(ent, eff.SuccessCheck, http.MethodGet) {
-			ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目（0 = 永不过期）
-			if disk != nil {
-				if serr := disk.Set(key, ent); serr != nil {
-					s.log.Warn("写入缓存失败", "key", key, "target", target, "err", serr)
-				} else {
-					// 写盘成功必须可见：规则名、缓存 key、实际落盘文件路径、body 大小与生效 TTL
-					s.log.Info("写入缓存成功",
-						"rule", eff.Rule, "target", truncate(target, 300), "key", key,
-						"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))
-				}
-			}
-		} else if ent.Status == http.StatusNotModified {
-			// 回源 304（内容未变更）：条目无实体不可缓存，304 原样透传给客户端，
-			// 客户端用本地缓存副本渲染，属成功语义而非失败（条件头已不透传，
-			// 上游对无条件 GET 仍回 304 属异常/缓存副本有效兜底场景）
-			s.log.Info("回源 304 未变更，不写缓存（客户端缓存副本有效）",
-				"rule", eff.Rule, "status", ent.Status, "target", truncate(target, 300))
-		} else {
-			// 回源成功但不满足缓存判据：同样留痕，说明为什么这次没写缓存文件
-			s.log.Info("回源成功但不写缓存（未过成功判据或非 200）",
-				"rule", eff.Rule, "status", ent.Status, "check", eff.SuccessCheck,
-				"body_bytes", len(ent.Body), "target", truncate(target, 300))
-		}
+		finalize(ent)
 		return ent, nil
 	})
-	if err != nil {
+	switch {
+	case errors.Is(err, errFlightWaitTimeout):
+		// 等待同 key 单飞回源超限：自行走候选回源（不注册单飞，流式透传 + EOF 写缓存）
+		s.log.Warn("等待同 key 单飞回源超限，自行走候选回源",
+			"rule", eff.Rule, "key", key, "wait", waitLimit.String(), "target", truncate(target, 300))
+		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start)
+		streamingError(ferr, committed)
+	case errors.Is(err, errStreamingCommitted):
+		// 本调用是流式执行方且 commit 后失败：底层原因已留痕（Error），响应头已写出，
+		// 终止本次响应即可，绝不能再 writeError
+	case err != nil:
 		s.writeError(w, http.StatusBadGateway, err.Error())
+	case streaming && executed:
+		// 本调用是流式执行方：响应头已 commit、body 已边读边写、完成日志已输出，
+		// 无需再走 serveEntry 回放
+	default:
+		s.serveEntry(w, r, e, "MISS", eff, start)
+	}
+	// //////////////////  未命中：单飞回源并写缓存  end  ////////////////////////////////////////////////
+}
+
+// finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 GET，条件与日志字段与旧版一致）：
+// 仅缓存满足成功判据的 200 响应（TTL 在写入时固化）；304 与「回源成功但未过判据」
+// 分别留痕说明为什么这次没写缓存文件。
+func (s *Server) finalizeFetchEntry(key, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache) {
+	if ent == nil {
 		return
 	}
-	s.serveEntry(w, r, e, "MISS", eff, start)
-	// //////////////////  未命中：单飞回源并写缓存  end  ////////////////////////////////////////////////
+	if ent.Status == http.StatusOK && checkSuccess(ent, eff.SuccessCheck, http.MethodGet) {
+		ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目（0 = 永不过期）
+		if disk != nil {
+			if serr := disk.Set(key, ent); serr != nil {
+				s.log.Warn("写入缓存失败", "key", key, "target", target, "err", serr)
+			} else {
+				// 写盘成功必须可见：规则名、缓存 key、实际落盘文件路径、body 大小与生效 TTL
+				s.log.Info("写入缓存成功",
+					"rule", eff.Rule, "target", truncate(target, 300), "key", key,
+					"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))
+			}
+		}
+		return
+	}
+	if ent.Status == http.StatusNotModified {
+		// 回源 304（内容未变更）：条目无实体不可缓存，304 原样透传给客户端，
+		// 客户端用本地缓存副本渲染，属成功语义而非失败（条件头已不透传，
+		// 上游对无条件 GET 仍回 304 属异常/缓存副本有效兜底场景）
+		s.log.Info("回源 304 未变更，不写缓存（客户端缓存副本有效）",
+			"rule", eff.Rule, "status", ent.Status, "target", truncate(target, 300))
+		return
+	}
+	// 回源成功但不满足缓存判据：同样留痕，说明为什么这次没写缓存文件
+	s.log.Info("回源成功但不写缓存（未过成功判据或非 200）",
+		"rule", eff.Rule, "status", ent.Status, "check", eff.SuccessCheck,
+		"body_bytes", len(ent.Body), "target", truncate(target, 300))
 }
 
 // handleHead 处理 HEAD 请求（docker registry 用 HEAD 探测 manifest/blob 元信息）：
@@ -489,14 +563,14 @@ func (s *Server) cacheFor(eff config.Options) (*cache.Cache, error) {
 	return s.caches.Acquire(eff.CachePath, eff.CacheCleanInterval)
 }
 
-// fetchViaCandidates 回源获取目标内容：
+// fetchViaCandidates 回源获取目标内容（缓冲模式：整包读进内存构造 Entry，供 HEAD /
+// 完整 URL 目标（web）回放；GET 路径目标的流式透传见 fetchViaCandidatesStreaming）：
 //  1. 展开生效的 url-redirect 模板为候选 URL 列表（占位符见 RequestVars：$1 与请求级变量）；
 //     无模板且目标为完整 URL 时直接请求原始 URL，路径目标无模板直接报错
 //    （路径目标必须由规则模板拼出回源地址，没有可直连的原始 URL）；
-//  2. 按 round-robin 轮换的起始下标逐个尝试候选（请求方法沿用入站方法 GET/HEAD，
-//     docker registry 的 HEAD 探测因此同样打到镜像站），通过 success-check 判据即返回；
-//     单个候选失败后可按 url-redirect-item-error-retry 原地立即重试（总尝试 = 1+N，
-//     无退避；网络错误/超时/未过 success-check 都算失败）；
+//  2. 按 round-robin 轮换的起始下标在候选上执行「探测提速管线」（见 candidates.go）：
+//     probe-timeout 探测预算 + 硬失败快切（403 / token dance 后仍 401，跳过 item 重试）
+//     + 阶梯并发竞速（hedge，第一个通过 success-check 的候选胜出，其余取消）；
 //  3. 一轮 = 所有候选（含各自 item 重试）都失败；整轮全败后可按
 //     url-redirect-all-error-retry 整体重来最多 N 轮（总轮数 = 1+N），
 //     同一请求内的重试轮沿用同一候选顺序（同一 start 下标）；
@@ -514,82 +588,26 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 		return s.fetchDirect(r, target, eff)
 	}
 
-	// //////////////////  轮询起始下标：第 1 次请求从 0 开始，之后逐次 +1  start  ////////
-	start := int(s.rr.Add(1)-1) % len(candidates)
-	// //////////////////  轮询起始下标：第 1 次请求从 0 开始，之后逐次 +1  end  ////////
-
-	// //////////////////  轮询展开明细日志  start  ////////////////////////////////////////////////
-	// 按「本轮实际尝试顺序」输出每个候选的原始模板与占位符替换后的最终 URL，并给出本轮
-	// round-robin 起始下标（0 基，指向模板列表下标）；candidates 与 eff.URLRedirect 同序等长，
-	// details[i] 即第 (start+i)%n 个模板展开结果。Info 级保证默认日志级别下可见。
-	details := make([]string, 0, len(candidates))
-	for i := range candidates {
-		idx := (start + i) % len(candidates) // 该候选在模板列表中的原始下标
-		details = append(details, fmt.Sprintf("模板[%d] %s -> %s", idx, eff.URLRedirect[idx], candidates[idx]))
+	// //////////////////  探测提速管线竞速选定候选  start  ///////////////////////////////////////
+	res, err := s.selectCandidate(r, candidates, eff)
+	if err != nil {
+		return s.candidatesExhaustedFallback(r, target, eff, err)
 	}
-	s.log.Info("url-redirect 轮询展开", "start_index", start,
-		"count", len(candidates), "candidates", details)
-	// //////////////////  轮询展开明细日志  end  ////////////////////////////////////////////////
+	// //////////////////  探测提速管线竞速选定候选  end  /////////////////////////////////////////
 
-	// //////////////////  逐轮逐候选尝试（含 item/round 重试）  start  ////////////////////////
-	// item 重试：单个候选失败（网络错误/超时/未过 success-check）后原地立即重试 N 次
-	//（总尝试 = 1+N，无退避），全部失败才轮到下一候选；
-	// round 重试：一轮 = 所有候选（含各自 item 重试）都失败，整轮全败后整体重来最多
-	// N 轮（总轮数 = 1+N）；同一请求内的重试轮沿用同一候选顺序（同一 start 下标）。
-	// 未配置重试时 itemTotalAttempts=1、totalRounds=1，行为与旧版完全一致。
-	itemTotalAttempts := 1 + max0(eff.URLRedirectItemErrorRetry)
-	totalRounds := 1 + max0(eff.URLRedirectAllErrorRetry)
-	var lastErr error
-	for round := 0; round < totalRounds; round++ {
-		for i := 0; i < len(candidates); i++ {
-			idx := (start + i) % len(candidates) // 该候选在模板列表中的原始下标
-			cand := candidates[idx]
-			tpl := eff.URLRedirect[idx]
-			for attempt := 0; attempt < itemTotalAttempts; attempt++ {
-				s.log.Debug("尝试 url-redirect 候选",
-					"round", round+1, "round_total", totalRounds,
-					"attempt", attempt+1, "attempt_total", itemTotalAttempts,
-					"index", idx, "template", tpl, "candidate", cand)
-				candStart := time.Now() // 该次尝试耗时（含请求与响应读取）
-				// 请求方法沿用入站方法（GET/HEAD）：HEAD 探测（docker registry）同样经候选轮询打到镜像站
-				e, err := s.doRequest(r, r.Method, cand, nil, eff)
-				if err != nil {
-					lastErr = err
-					s.log.Warn("url-redirect 候选请求失败",
-						"round", round+1, "round_total", totalRounds,
-						"attempt", attempt+1, "attempt_total", itemTotalAttempts,
-						"index", idx, "template", tpl, "candidate", cand,
-						"cost", time.Since(candStart).Round(time.Millisecond).String(), "err", err)
-					continue
-				}
-				if checkSuccess(e, eff.SuccessCheck, r.Method) {
-					e.Source = cand
-					// 命中即最终返回：输出第几轮、该候选第几次尝试、模板下标与轮内尝试序、
-					// 模板与替换后 URL、HTTP 状态码与耗时，作为「最终采用哪个候选」的留痕
-					s.log.Info("url-redirect 候选命中并作为最终返回",
-						"round", round+1, "round_total", totalRounds,
-						"attempt", attempt+1, "attempt_total", itemTotalAttempts,
-						"index", idx, "template", tpl, "candidate", cand, "status", e.Status,
-						"bytes", len(e.Body), "cost", time.Since(candStart).Round(time.Millisecond).String())
-					return e, nil
-				}
-				lastErr = fmt.Errorf("候选 %s 未通过 success-check=%s（状态码 %d，body %d 字节）",
-					cand, eff.SuccessCheck, e.Status, len(e.Body))
-				s.log.Warn("url-redirect 候选未通过成功判据",
-					"round", round+1, "round_total", totalRounds,
-					"attempt", attempt+1, "attempt_total", itemTotalAttempts,
-					"index", idx, "template", tpl, "candidate", cand,
-					"check", eff.SuccessCheck, "status", e.Status, "body_bytes", len(e.Body))
-			}
-		}
-		if round+1 < totalRounds {
-			// 整轮全败且还有重试轮：留痕后整体重来（沿用同一候选顺序）
-			s.log.Warn("url-redirect 整轮候选全部失败，按 url-redirect-all-error-retry 重试下一轮",
-				"round", round+1, "round_total", totalRounds, "last_error", lastErr)
-		}
+	// 胜出候选排干为完整 Entry（缓存条目/回放语义与旧版一致）
+	e, derr := s.drainProbe(res)
+	if derr != nil {
+		return nil, derr
 	}
-	// //////////////////  逐轮逐候选尝试（含 item/round 重试）  end  //////////////////////////
+	e.Source = res.url
+	return e, nil
+}
 
+// candidatesExhaustedFallback 候选全部失败后的既有出口语义（行为不变）：
+//   - 路径目标没有完整原始 URL 可直连：fallback-direct 不适用，直接报错；
+//   - 完整 URL 目标按 fallback-direct 决定是否回退直连原始 URL（Source=direct）。
+func (s *Server) candidatesExhaustedFallback(r *http.Request, target string, eff config.Options, lastErr error) (*cache.Entry, error) {
 	// //////////////////  全部轮次失败：按配置回退直连  start  /////////////////////////////////////////
 	if !isFullURLTarget(target) {
 		// 路径目标没有完整原始 URL 可直连：fallback-direct 不适用，候选全败直接报错
@@ -635,8 +653,24 @@ func (s *Server) fetchDirect(r *http.Request, target string, eff config.Options)
 	return e, nil
 }
 
-// doRequest 向 urlStr 发起一次上游尝试。所有上游请求（直连与 url-redirect 候选）统一走这里，
-// 并应用生效配置的 http-proxy（上游代理）与三个独立超时：
+// applyForwardRequestHeaders 把入站请求头按白名单拷贝到回源请求（候选与直连共用）：
+// 条件请求头（If-Match 等）不在白名单（见 forwardRequestHeaders 注释），Range 保持透传；
+// User-Agent 缺省补 proxy-cache/<Version>。
+func applyForwardRequestHeaders(req *http.Request, r *http.Request) {
+	for _, h := range forwardRequestHeaders {
+		if vv := r.Header.Values(h); len(vv) > 0 {
+			req.Header[h] = vv
+		}
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "proxy-cache/"+Version)
+	}
+}
+
+// doRequest 向 urlStr 发起一次上游尝试（整包缓冲模式，供直连回退 / 完整 URL 目标 /
+// 非 GET/HEAD 方法使用；候选管线的探测式尝试见 probe.go 的 probeCandidateAttempt）。
+// 所有上游请求（直连与 url-redirect 候选）统一走这里，并应用生效配置的 http-proxy
+// 与三个独立超时：
 //   - http-timeout：本次尝试的总超时（建连 + 响应头 + 完整读 body + token dance 全程），
 //     每次尝试（含候选重试）独立计时；未配置（0）= 不限制；
 //   - read-timeout：无新增数据看门狗（见 progressWatchdog），响应头到达、每读到一段
@@ -672,14 +706,7 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	if err != nil {
 		return nil, fmt.Errorf("构造上游请求失败（%s）: %w", urlStr, err)
 	}
-	for _, h := range forwardRequestHeaders {
-		if vv := r.Header.Values(h); len(vv) > 0 {
-			req.Header[h] = vv
-		}
-	}
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "proxy-cache/"+Version)
-	}
+	applyForwardRequestHeaders(req, r)
 	// //////////////////  构造上游请求  end  //////////////////////////////////////////////////
 
 	// //////////////////  发起请求并读取响应  start  ////////////////////////////////////////////
@@ -763,19 +790,58 @@ type bearerChallenge struct {
 // dockerAuthDance 尝试 Docker Registry 匿名 token dance（401 → 取 token → 带 Bearer 重试一次）。
 // 调用方（doRequest）已保证 method 为 GET/HEAD 且首个响应状态码为 401；此处再要求
 // WWW-Authenticate 含可解析的 Bearer 挑战（scheme 大小写不敏感且带 realm），否则放弃。
-//   - 取 token 走进程内缓存（见 dockerToken），客户端沿用原请求；ctx 使用本次尝试的
-//     看门狗 ctx（wd.ctx），取 token 与带 token 重试同样受 http-timeout 约束，
-//     且 token 响应头/数据、重试响应头/数据都会重置 read-timeout 看门狗；
-//   - 取到 token 后复制原上游请求（同 method/URL，沿用原上游请求头）删除 Authorization
-//     后改为 Bearer 重试一次：重试响应按既有语义（深拷贝响应头 + 读 body）构建为 Entry
-//     返回（ok=true）；重试即使仍 401 也按该响应原样返回，不再 dance；
+// 整包缓冲模式：dance 请求/响应阶段见 dockerAuthDanceRetry（探测式尝试复用同一核心），
+// 这里在拿到重试响应后按既有语义读完整 body 并构建 Entry 返回：
+//   - 重试响应按既有语义（深拷贝响应头 + 读 body）构建为 Entry 返回（ok=true）；
+//     重试即使仍 401 也按该响应原样返回，不再 dance；
 //   - 挑战不可解析 / 取 token / 构造重试 / 重试失败时返回 ok=false，调用方沿用原始
 //     401 entry（行为与未实现 dance 的版本一致，绝不因 dance 引入新的失败路径）；
-//     看门狗触发（read-timeout）时失败日志经 wd.wrapErr 标注，便于日志辨认；
-//   - 确认 dance 触发后先把首个 401 响应 body 用 io.Copy(io.Discard, ...) 排干再 Close
-//    （GET 此前已读到 EOF、HEAD 天然无 body，这里是显式兜底），避免连接泄漏；
-//     调用方 defer 的重复 Close 对 http 响应体是幂等的，安全。
+//     看门狗触发（read-timeout）时失败日志经 wd.wrapErr 标注，便于日志辨认。
 func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string) (*cache.Entry, bool) {
+	resp2, _, ok := s.dockerAuthDanceRetry(wd, cl, orig, resp, urlStr)
+	if !ok {
+		return nil, false
+	}
+	defer resp2.Body.Close()
+
+	// 重试响应按既有语义读取：HEAD 天然无 body 跳过，其余读全文（经 progressReader
+	// 每读到数据都重置看门狗）；读取失败按重试失败兜底（看门狗触发时标注 read-timeout）
+	var buf []byte
+	var err error
+	if orig.Method != http.MethodHead {
+		buf, err = io.ReadAll(&progressReader{r: resp2.Body, wd: wd})
+		if err != nil {
+			s.log.Warn("读取匿名 token 重试响应失败，按原始 401 响应返回",
+				"url", truncate(urlStr, 300), "err", wd.wrapErr(err))
+			return nil, false
+		}
+	}
+	hdr := make(http.Header, len(resp2.Header))
+	for k, vv := range resp2.Header {
+		hdr[k] = append([]string(nil), vv...)
+	}
+	return &cache.Entry{
+		Status:   resp2.StatusCode,
+		Header:   hdr,
+		Body:     buf,
+		StoredAt: time.Now(),
+	}, true
+}
+
+// dockerAuthDanceRetry 是 token dance 的请求/响应阶段核心（缓冲与探测式尝试共用）：
+// 解析挑战 → 排干并关闭首个 401 响应 → 去 realm 匿名取 token（进程内缓存优先）→
+// 复制原上游请求删除 Authorization 后改为 Bearer 重试一次，重试响应头可用即返回
+//（body 未读，由调用方决定读完整（缓冲）还是只读首块（探测））。
+// 返回值：
+//   - resp2：带 token 重试的响应（ok=true 时非 nil，由调用方负责关闭）；
+//   - consumed：首个 401 响应是否已被排干并关闭（挑战可解析即 true——此后原响应
+//     不再可用，调用方失败兜底时须把其 body 标记为无剩余数据）；
+//   - ok：是否拿到了带 token 重试的响应。
+//
+// 各阶段失败均按既有语义返回 ok=false（调用方沿用原始 401 响应，绝不因 dance 引入
+// 新的失败路径）；请求 ctx 使用本次尝试的看门狗 ctx（wd.ctx），取 token 与带 token
+// 重试同样受 http-timeout / 探测预算约束，且各阶段响应头/数据到达都会重置 read-timeout。
+func (s *Server) dockerAuthDanceRetry(wd *progressWatchdog, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string) (resp2 *http.Response, consumed, ok bool) {
 	// //////////////////  解析 Bearer 挑战  start  //////////////////////////////////////////////
 	var ch *bearerChallenge
 	for _, v := range resp.Header.Values("WWW-Authenticate") {
@@ -788,7 +854,7 @@ func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *ht
 		s.log.Debug("上游 401 无可解析的 Bearer 挑战，跳过匿名 token dance",
 			"url", truncate(urlStr, 300),
 			"www_authenticate", truncate(strings.Join(resp.Header.Values("WWW-Authenticate"), ", "), 300))
-		return nil, false
+		return nil, false, false
 	}
 	// //////////////////  解析 Bearer 挑战  end  ////////////////////////////////////////////////
 
@@ -805,7 +871,7 @@ func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *ht
 	if err != nil {
 		s.log.Warn("获取 Docker Registry 匿名 token 失败，按原始 401 响应返回",
 			"url", truncate(urlStr, 300), "realm", ch.realm, "err", wd.wrapErr(err))
-		return nil, false
+		return nil, true, false
 	}
 	// //////////////////  取匿名 token（进程内缓存优先）  end  ///////////////////////////////////
 
@@ -816,45 +882,24 @@ func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *ht
 	if err != nil {
 		s.log.Warn("构造匿名 token 重试请求失败，按原始 401 响应返回",
 			"url", truncate(urlStr, 300), "err", err)
-		return nil, false
+		return nil, true, false
 	}
 	req.Header = orig.Header.Clone()
 	req.Header.Del("Authorization")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp2, err := cl.Do(req)
+	resp2, err = cl.Do(req)
 	if err != nil {
 		s.log.Warn("带匿名 token 重试上游请求失败，按原始 401 响应返回",
 			"url", truncate(urlStr, 300), "token", maskToken(token), "err", wd.wrapErr(err))
-		return nil, false
+		return nil, true, false
 	}
 	wd.reset() // 重试响应头到达 = 一次进度（read-timeout 计时器重置）
-	defer resp2.Body.Close()
 
-	// 重试响应按既有语义读取：HEAD 天然无 body 跳过，其余读全文（经 progressReader
-	// 每读到数据都重置看门狗）；读取失败按重试失败兜底（看门狗触发时标注 read-timeout）
-	var buf []byte
-	if orig.Method != http.MethodHead {
-		buf, err = io.ReadAll(&progressReader{r: resp2.Body, wd: wd})
-		if err != nil {
-			s.log.Warn("读取匿名 token 重试响应失败，按原始 401 响应返回",
-				"url", truncate(urlStr, 300), "err", wd.wrapErr(err))
-			return nil, false
-		}
-	}
-	hdr := make(http.Header, len(resp2.Header))
-	for k, vv := range resp2.Header {
-		hdr[k] = append([]string(nil), vv...)
-	}
 	// 重试结果留痕（Info）：状态码 + 脱敏 token（绝不输出完整 token 值）
 	s.log.Info("带匿名 token 重试完成", "url", truncate(urlStr, 300),
 		"status", resp2.StatusCode, "token", maskToken(token))
-	return &cache.Entry{
-		Status:   resp2.StatusCode,
-		Header:   hdr,
-		Body:     buf,
-		StoredAt: time.Now(),
-	}, true
+	return resp2, true, true
 	// //////////////////  带 token 重试一次  end  /////////////////////////////////////////////
 }
 

@@ -34,6 +34,18 @@ const (
 // DefaultCacheTTL 全局 cache.ttl 未配置时的默认缓存时长。
 const DefaultCacheTTL = 30 * time.Minute
 
+// 候选探测提速（作用于 url-redirect 候选管线：流式 GET 与 HEAD 共用）的缺省值。
+const (
+	// DefaultURLRedirectProbeTimeout 单次候选尝试的探测预算缺省值：5s。
+	// docker 客户端等响应头约 30s 就超时断开，探测预算默认压到 5s 量级，
+	// 配合 hedge 放行间隔可把「选定候选」耗时控制在 10s 量级内。
+	// 显式配置 0 = 不限制（区分「未配置走缺省」与「显式关闭预算」）。
+	DefaultURLRedirectProbeTimeout = 5 * time.Second
+	// DefaultURLRedirectHedgeDelay 候选阶梯竞速的放行间隔缺省值：2s。
+	// 显式配置 0 = 纯串行（禁用竞速：上一候选出结果后才放行下一个）。
+	DefaultURLRedirectHedgeDelay = 2 * time.Second
+)
+
 // url-redirect 模板占位符（变量名，不含 $ / ${} 包裹形式；每个变量均支持 $name 与 ${name} 写法）。
 // 占位符名统一定义在本包：模板校验（validateRedirectTemplates）与 proxy 包的模板展开
 // （ExpandCandidates）共用同一套常量，避免两处维护漂移。
@@ -201,6 +213,14 @@ type DomainRule struct {
 	//（总轮数 = 1+N），重试轮沿用同一候选顺序。
 	// nil（未配置）沿用全局；0 = 不重试；负数为配置错误（Validate 拒绝）。
 	URLRedirectAllErrorRetry *int `yaml:"url-redirect-all-error-retry"`
+	// URLRedirectProbeTimeout 该规则单次候选尝试的探测预算（语义同全局
+	// url-redirect-probe-timeout）。nil（未配置）沿用全局；0 = 不限制；
+	// 负数为配置错误（Validate 拒绝）。
+	URLRedirectProbeTimeout *Duration `yaml:"url-redirect-probe-timeout"`
+	// URLRedirectHedgeDelay 该规则候选阶梯竞速的放行间隔（语义同全局
+	// url-redirect-hedge-delay）。nil（未配置）沿用全局；0 = 纯串行禁用竞速；
+	// 负数为配置错误（Validate 拒绝）。
+	URLRedirectHedgeDelay *Duration `yaml:"url-redirect-hedge-delay"`
 
 	// re 是 Match 编译后的正则；excludeRe 是 Exclude 逐项编译后的正则列表
 	//（均在 Validate 阶段填充，不参与 YAML 解析）。
@@ -279,6 +299,19 @@ type Config struct {
 	// URLRedirectAllErrorRetry 全局「整轮候选全部失败」后的重试轮数。
 	// nil（未配置）= 0（不重试）；负数为配置错误（Validate 拒绝）。
 	URLRedirectAllErrorRetry *int `yaml:"url-redirect-all-error-retry"`
+	// URLRedirectProbeTimeout 全局单次候选尝试的探测预算：从发出请求到「响应头可用
+	//（含 401 token dance 的第二次响应）且成功判据可判定（首块读出或 EOF）」的时限，
+	// 覆盖建连后的等待与 token dance 全程；到期取消该次尝试并硬失败快切下一候选。
+	// 仅约束探测阶段：探测通过后的 body 读取（流式透传/缓冲排干）不受它约束，
+	// 仍由 http-timeout（尝试总超时）与 read-timeout（无新增数据）负责；
+	// 建连本身由 connect-timeout 负责。nil（未配置）= 缺省 5s；显式 0 = 不限制；
+	// 负数为配置错误（Validate 拒绝）。
+	URLRedirectProbeTimeout *Duration `yaml:"url-redirect-probe-timeout"`
+	// URLRedirectHedgeDelay 全局候选阶梯竞速（hedge）的放行间隔：候选按 round-robin
+	// 顺序起步，首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消）；
+	// 第一个通过成功判据的候选胜出，其余全部取消（context 取消，连接及时释放）。
+	// 0 = 纯串行禁用竞速（上一候选出结果后才放行下一个）；负数为配置错误（Validate 拒绝）。
+	URLRedirectHedgeDelay *Duration `yaml:"url-redirect-hedge-delay"`
 	// HTTPProxy 全局上游代理（http/https/socks5 地址，如 http://127.0.0.1:7890），空串表示直连。
 	HTTPProxy string `yaml:"http-proxy"`
 	// SuccessCheck url-redirect 候选成功判据：status 或 content（默认 content）。
@@ -341,6 +374,14 @@ type Options struct {
 	// URLRedirectAllErrorRetry 「整轮候选全部失败」后的重试轮数（0 = 不重试，
 	// 总轮数 = 1+N；重试轮沿用同一候选顺序）。
 	URLRedirectAllErrorRetry int
+	// URLRedirectProbeTimeout 单次候选尝试的探测预算（0 = 不限制）：从发出请求到
+	//「响应头可用（含 token dance 的第二次响应）且成功判据可判定」的时限，到期取消
+	// 该次尝试并硬失败快切下一候选；仅约束探测阶段，探测后的 body 读取不受它约束。
+	URLRedirectProbeTimeout time.Duration
+	// URLRedirectHedgeDelay 候选阶梯竞速的放行间隔（0 = 纯串行禁用竞速）：
+	// 首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消），
+	// 第一个通过成功判据的候选胜出，其余全部取消。
+	URLRedirectHedgeDelay time.Duration
 }
 
 // Default 返回内置默认配置（配置文件缺失时兜底，也是 Load 时叠加解析的底版：
@@ -430,6 +471,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := validateNonNegativeInt(c.URLRedirectAllErrorRetry, "url-redirect-all-error-retry"); err != nil {
+		return err
+	}
+	if err := validateNonNegativeDuration(c.URLRedirectProbeTimeout, "url-redirect-probe-timeout"); err != nil {
+		return err
+	}
+	if err := validateNonNegativeDuration(c.URLRedirectHedgeDelay, "url-redirect-hedge-delay"); err != nil {
 		return err
 	}
 	// log.level 仅允许四级，非法值启动快速失败；合法值转成 slog.Level 存私有字段供 LogLevel() 使用
@@ -538,6 +585,12 @@ func (c *Config) Validate() error {
 		if err := validateNonNegativeInt(r.URLRedirectAllErrorRetry, "url-redirect-all-error-retry"); err != nil {
 			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
 		}
+		if err := validateNonNegativeDuration(r.URLRedirectProbeTimeout, "url-redirect-probe-timeout"); err != nil {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
+		}
+		if err := validateNonNegativeDuration(r.URLRedirectHedgeDelay, "url-redirect-hedge-delay"); err != nil {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
+		}
 	}
 	// //////////////////  域名规则校验  end  ////////////////////////////////////////////////
 
@@ -630,6 +683,24 @@ func (c *Config) GlobalURLRedirectAllErrorRetry() int {
 	return *c.URLRedirectAllErrorRetry
 }
 
+// GlobalURLRedirectProbeTimeout 返回全局单次候选尝试的探测预算生效值：
+// nil（未配置）= 缺省 5s；显式 0 = 不限制。
+func (c *Config) GlobalURLRedirectProbeTimeout() time.Duration {
+	if c.URLRedirectProbeTimeout == nil {
+		return DefaultURLRedirectProbeTimeout
+	}
+	return c.URLRedirectProbeTimeout.D()
+}
+
+// GlobalURLRedirectHedgeDelay 返回全局候选阶梯竞速放行间隔生效值：
+// nil（未配置）= 缺省 2s；显式 0 = 纯串行禁用竞速。
+func (c *Config) GlobalURLRedirectHedgeDelay() time.Duration {
+	if c.URLRedirectHedgeDelay == nil {
+		return DefaultURLRedirectHedgeDelay
+	}
+	return c.URLRedirectHedgeDelay.D()
+}
+
 // LogLevel 返回 log.level 对应的 slog.Level。必须在 Validate 之后调用
 // （归一化结果存于私有字段 logLevel）；未经过 Validate 的构造场景兜底返回 Info。
 func (c *Config) LogLevel() slog.Level {
@@ -690,6 +761,8 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		ConnectTimeout:            c.GlobalConnectTimeout(),
 		URLRedirectItemErrorRetry: c.GlobalURLRedirectItemErrorRetry(),
 		URLRedirectAllErrorRetry:  c.GlobalURLRedirectAllErrorRetry(),
+		URLRedirectProbeTimeout:   c.GlobalURLRedirectProbeTimeout(),
+		URLRedirectHedgeDelay:     c.GlobalURLRedirectHedgeDelay(),
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
@@ -771,6 +844,12 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		}
 		if r.URLRedirectAllErrorRetry != nil {
 			o.URLRedirectAllErrorRetry = *r.URLRedirectAllErrorRetry
+		}
+		if r.URLRedirectProbeTimeout != nil {
+			o.URLRedirectProbeTimeout = r.URLRedirectProbeTimeout.D()
+		}
+		if r.URLRedirectHedgeDelay != nil {
+			o.URLRedirectHedgeDelay = r.URLRedirectHedgeDelay.D()
 		}
 		o.Rule = r.Label()
 		break // 自上而下第一条命中即生效

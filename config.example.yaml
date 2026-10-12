@@ -56,6 +56,8 @@ http-proxy: ""
 # HTTP 304（内容未变更）在两种模式下均视为成功候选：条件请求头（If-None-Match 等 5 个）
 # 不透传给上游，回源始终为无条件 GET/HEAD；若上游对无条件请求仍回 304，304 原样透传给客户端
 # （不写缓存，客户端用本地缓存副本），日志按成功留痕而非失败
+# 带 Range 头的请求：上游回 206 视为成功并流式透传、不写缓存（docker 断点续传依赖它；
+# 旧版 206 会被判据拒掉导致 Range 拉取全挂）
 success-check: content
 
 # 所有 url-redirect 候选都失败后，是否回退直接请求原始 URL
@@ -70,13 +72,46 @@ fallback-direct: true
 # url-redirect-item-error-retry  单个候选的重试次数：某候选一次尝试失败
 #                                （网络错误/超时/未过 success-check）后原地立即
 #                                重试 N 次（总尝试 = 1+N，无退避），全部失败才
-#                                轮到下一候选
+#                                轮到下一候选。注意：硬失败（上游 403 / token
+#                                dance 后仍 401 / 探测预算耗尽，见
+#                                url-redirect-probe-timeout）会跳过原地重试
+#                                直接切下一候选——这类失败重试无意义却各烧数秒
 # url-redirect-all-error-retry   整轮全错后的重试轮数：一轮 = 所有候选（含各自
 #                                item 重试）都失败；全轮失败后整体重来最多 N 轮
 #                                （总轮数 = 1+N），同一请求内的重试轮沿用同一候选顺序
 # 每次尝试/重试的日志均含：候选 URL、第几次尝试/共几次、第几轮/共几轮、失败原因
 #url-redirect-item-error-retry: 1
 #url-redirect-all-error-retry: 1
+
+# ----------------------------------------------------------------------------
+# url-redirect 候选探测提速（全局与 domain-rules 规则级都可配，规则覆盖全局）
+# 背景：docker 客户端等响应头约 30s 就超时断开（net/http: timeout awaiting response
+# headers），「选定候选」的总耗时必须压在 30s 内（越快越好）
+# ----------------------------------------------------------------------------
+# url-redirect-probe-timeout  单次候选尝试的探测预算（默认 5s，0=不限制）：
+#                             从发出请求到「响应头可用（含 401 token dance 的
+#                             第二次响应）且成功判据可判定（首块读出或 EOF）」
+#                             的时限，覆盖建连后的等待与 token dance 全程；到期
+#                             取消该次尝试并硬失败快切下一候选。
+#                             与既有三个超时的边界：
+#                               - http-timeout  管整次尝试总时长（含完整读 body），
+#                                 探测通过后 body 读取仍受它约束；
+#                               - read-timeout  管「无新增数据」idle（全程生效）；
+#                               - connect-timeout 管建连（TCP 拨号 + TLS 握手）；
+#                               - probe-timeout 只管探测阶段：探测通过即解除，
+#                                 后续读 body 不受它约束
+#url-redirect-probe-timeout: 5s
+# url-redirect-hedge-delay    候选阶梯并发竞速（hedge）的放行间隔（默认 2s，0=纯
+#                             串行禁用竞速）：候选按 round-robin 顺序起步，首个
+#                             候选立即发出，之后每隔该间隔放行下一个候选并发探测
+#                            （前一个不取消）；某候选先失败时立即放行下一候选
+#                            （不等间隔）；第一个通过成功判据的候选胜出，其余全部
+#                             取消（context 取消，连接及时释放）。
+#                             最坏「选定候选」耗时 ≈ (候选数-1)×hedge-delay +
+#                             胜者的探测耗时（如 5 候选 ≈ 4×2s + 1s ≈ 9s）；
+#                             全部候选都失败的极坏情况由内置扫描总预算（20s）兜底：
+#                             提前终止并 502，docker 客户端会自行重试该层
+#url-redirect-hedge-delay: 2s
 
 # url-redirect：回源镜像/上游代理模板列表
 # 模板占位符（每个变量均支持 $name 与 ${name} 两种写法，每个模板至少包含一个，启动时校验）：
@@ -98,7 +133,10 @@ fallback-direct: true
 # 时（如 https://docker.1panel.live/$http...）两个 / 合并为一个，保证拼出的是
 # https://docker.1panel.live/v2/... 而非 ...//v2/...；
 # 按 round-robin 轮换起始下标逐个尝试（第 1 个请求从第 1 条开始，第 2 个请求从第 2 条开始……），
-# 只要有一个候选通过 success-check 即返回（200 才写缓存；304 视为成功并原样透传、不写缓存）；
+# 默认按阶梯竞速（hedge）探测：首个候选立即发出，之后每隔 url-redirect-hedge-delay 放行下一个
+# 并发探测，第一个通过 success-check 的候选胜出（其余取消）；
+# 只要有一个候选通过 success-check 即返回（200 才写缓存；304 视为成功并原样透传、不写缓存；
+# 带 Range 的请求 206 视为成功并流式透传、不写缓存）；
 # 候选失败的重试（单候选原地重试 / 整轮全败重试）见 url-redirect-item-error-retry 与
 # url-redirect-all-error-retry；候选全部失败时按 fallback-direct 处理（路径目标请求无直连回退）
 url-redirect:
@@ -171,6 +209,9 @@ domain-rules:
     # ---- url-redirect 重试覆盖（规则没配沿用全局；未配置 = 0 不重试） ----
     # url-redirect-item-error-retry: 1       # 该规则单个候选失败后的原地重试次数
     # url-redirect-all-error-retry: 1        # 该规则整轮全败后的重试轮数
+    # ---- url-redirect 候选探测提速覆盖（规则没配沿用全局；含义见顶部全局说明） ----
+    # url-redirect-probe-timeout: 5s         # 该规则单次候选尝试的探测预算（0=不限制）
+    # url-redirect-hedge-delay: 2s           # 该规则候选阶梯竞速的放行间隔（0=纯串行）
     # url-redirect:                          # 该规则专用候选列表（设为 [] 表示该规则直连回源）
     #   - https://gh-proxy.com/$1
 
@@ -202,6 +243,11 @@ domain-rules:
   # 路径目标请求的限制：仅支持 GET/HEAD（其他方法 400）；必须命中本条规则且 url-redirect 非空
   # 才能回源（未命中规则直接 400，全局默认配置不承接路径目标）；候选全败无直连回退（直接报错）；
   # 缓存 key 输入为「http://<入站Host>/<路径目标>」（入站 Host 参与，不同入站域名互不污染）。
+  # 缓存 MISS 的回源为流式透传：候选竞速选定后立即向 docker 写响应头（commit），再边读
+  # 上游边写给 docker——docker 客户端等响应头约 30s 就超时断开（net/http: timeout awaiting
+  # response headers），流式透传把首字节时间压缩为「选定候选」的耗时，不再被大 blob 的
+  # 完整下载拖超时；EOF 后按既有条件写缓存，docker 断开后重试该层即可缓存命中（HIT）。
+  # 带 Range 的断点续传请求：上游回 206 视为成功并流式透传、不写缓存。
   # 镜像站对匿名 blob/manifest 常回 401 + WWW-Authenticate: Bearer 挑战：本代理会自动按挑战
   # 去 realm 匿名取 token 并带 Authorization: Bearer 重试一次（与 docker 客户端直连行为等价），
   # token 进程内缓存（TTL 取 expires_in，缺省 60s），不会每个 blob 层都打一次 auth 端点。
@@ -219,7 +265,9 @@ domain-rules:
   #   fallback-direct: false     # 路径目标无完整原始 URL 可直连回退，候选全败直接报错
   #   read-timeout: 120s         # 大镜像 blob 慢速但持续传输不被砍：120s 内无任何新增数据才判超时
   #   http-timeout: 600s         # 单次尝试总超时兜底（含 token dance 与读 body 全程）
-  #   url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次
+  #   url-redirect-probe-timeout: 5s     # 单候选探测预算：响应头 5s 未就绪即硬失败快切下一候选
+  #   url-redirect-hedge-delay: 2s       # 候选阶梯竞速：每 2s 放行下一个候选并发探测，先过判据者胜出
+  #   url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次（硬失败跳过）
   #   url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
   #   url-redirect:              # 多镜像站候选轮询，均用 full_url_no_server 拼回源路径
   #     - https://docker.1panel.live/$http.server.header.full_url_no_server

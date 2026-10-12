@@ -11,8 +11,9 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **通用反代**：支持任意 `http://` / `https://` 目标 URL（不限于 GitHub），状态码/响应头/Body 透传
 - **路径目标请求（docker registry 等）**：请求路径不是完整 URL（如 `/v2/<name>/manifests/<ref>`）时识别为「路径目标」，由命中的域名规则 + url-redirect 模板拼出回源地址（详见下文「[Docker Registry 镜像加速](#docker-registry-镜像加速)」）；仅支持 GET/HEAD、必须命中规则且配置 url-redirect、无直连回退，缓存 key 含入站 Host
 - **本地文件缓存**：目标 URL 的 sha256 作为缓存键（路径目标以「`http://<入站Host>/<路径目标>`」为 key 输入），命中返回 `X-Cache: HIT`，未命中回源后写缓存返回 `X-Cache: MISS`；TTL 过期自动失效（惰性删除 + 后台扫描），写入原子替换、并发安全，内置 singleflight 防缓存击穿
+- **GET 路径目标流式回源（docker registry 必备）**：缓存 MISS / BYPASS 的路径目标 GET 在候选竞速选定后**立即向客户端写出响应头（commit）**，随后边读上游边写给客户端与缓存——docker 客户端等响应头约 30s 就超时断开（`net/http: timeout awaiting response headers`），流式透传把首字节时间压缩为「选定候选」的耗时，不再被大 blob 的完整下载拖超时；EOF 后按既有条件原子写缓存，客户端中途断开也会继续读完上游只填缓存（重试该层即可 HIT）；commit 后上游读取失败则终止响应且不写缓存（半截数据绝不入库）；带 Range 的断点续传：上游 206 视为成功并流式透传、不写缓存（完整 URL 目标（web）与 HEAD 保持整包缓冲回放不变）
 - **规则级独立缓存目录**：每条 domain-rule 的 `cache` 可独立配置 `enabled`/`ttl`/`path`/`clean-interval`，支持「全局 `cache.enabled: false` 关闭缓存、命中规则的流量按规则开启并写入各自独立目录」（启动时预热创建全部缓存目录，按目录复用缓存实例与后台清理协程）
-- **url-redirect 多上游轮询回源**：模板展开为多个候选代理 URL，round-robin **起始下标逐请求轮换**（第 1 个请求从第 1 条开始、第 2 个从第 2 条开始……），逐个尝试直到通过成功判据；全部失败可回退直连原始 URL（路径目标无直连回退）
+- **url-redirect 多上游轮询回源**：模板展开为多个候选代理 URL，round-robin **起始下标逐请求轮换**（第 1 个请求从第 1 条开始、第 2 个从第 2 条开始……），默认**阶梯并发竞速**（hedge：首个候选立即发出，每隔 `url-redirect-hedge-delay` 放行下一个并发探测，第一个通过成功判据的候选胜出、其余取消；`0` 退化为纯串行）；单候选探测预算 `url-redirect-probe-timeout`（响应头/判据未就绪即硬失败快切）；硬失败（403 / token dance 后仍 401 / 探测预算耗尽）跳过原地重试直接切下一候选；全部失败可回退直连原始 URL（路径目标无直连回退），极坏情况由内置扫描总预算（20s）兜底提前 502
 - **url-redirect 模板变量**：除 `$1`（目标串，兼容保留）外支持请求级预定义变量 `$http.server.header.full_url`（入站请求完整 URL）与 `$http.server.header.full_url_no_server`（入站请求去掉 `scheme://host` 的 `/path?query`），均支持 `${...}` 大括号写法；按变量名长度降序替换（避免前缀遮蔽），未知 `$` 序列原样保留，详见下文「[url-redirect 模板变量](#url-redirect-模板变量)」
 - **HEAD 走候选轮询管线**：HEAD 与 GET 一致先查缓存（命中回放响应头，无 body），未命中按候选轮询回源（方法保持 HEAD，docker registry 的 HEAD 探测同样打到镜像站）；HEAD 响应无 body 不写缓存；未配置 url-redirect 时回退直连（与旧版一致）
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）；HEAD 响应天然无 body，content 判据对 HEAD 自动按 status 语义；HTTP 304（内容未变更）在两种模式下均视为成功候选，304 原样透传给客户端、不写缓存
@@ -35,9 +36,12 @@ proxy-cache/
 │   └── cache.go
 │   └── manager.go          # 缓存管理器：按目录复用 Cache 实例（规则级独立目录）            # 文件缓存：sha256 键、原子写、过期判定、后台清理
 ├── proxy/
-│   ├── proxy.go            # 核心反代：目标提取（完整 URL / 路径目标）、ACL、轮询回源、成功判据、透传
+│   ├── proxy.go            # 核心反代：目标提取（完整 URL / 路径目标）、ACL、回源分发、成功判据、透传
+│   ├── candidates.go       # 候选探测提速管线：probe 预算 + 硬失败快切 + 阶梯竞速（hedge）+ 扫描总预算
+│   ├── probe.go            # 探测式上游尝试：响应头可用 + 首块判据即返回（body 保持活体）、探测预算
+│   ├── stream.go           # GET 路径目标流式透传：commit 后边读上游边写客户端与缓存
 │   ├── vars.go             # url-redirect 模板变量上下文与占位符展开（$1 / $http.server.header.*）
-│   └── flight.go           # singleflight：同 URL 并发回源只执行一次
+│   └── flight.go           # singleflight：同 URL 并发回源只执行一次（等待上限 10s，超限自拔回源）
 ├── config.example.yaml     # 配置示例（含完整注释）
 ├── Dockerfile              # 二阶段构建（golang builder -> alpine runtime）
 └── README.md
@@ -108,8 +112,10 @@ docker run -d --name proxy-cache \
 | `read-timeout` | duration | 不限制（0） | **无新增数据超时（idle）**：以本次尝试累计收到的字节数为进度标志（响应头到达也算一次进度），窗口内有进度就重置计时器，窗口内无任何新数据才触发超时并取消该次尝试（错误信息含 `read-timeout` 便于辨认）——慢速但持续传输的大文件不会被误砍 |
 | `connect-timeout` | duration | 不限制（0） | 建连超时（TCP 拨号 + TLS 握手共用） |
 | `timeout` | duration | 不限制（0） | **旧字段，语义已变更**：仅为 `read-timeout` 的退化别名，不再是回源总超时；且不再有旧版的 `60s` 默认兜底（未配置 = 不限制，有意的行为变更） |
-| `url-redirect-item-error-retry` | int | `0`（不重试） | 单个候选的重试次数：某候选一次尝试失败（网络错误/超时/未过 success-check）后原地立即重试 N 次（总尝试 = 1+N，无退避），全部失败才轮到下一候选 |
+| `url-redirect-item-error-retry` | int | `0`（不重试） | 单个候选的重试次数：某候选一次尝试失败（网络错误/超时/未过 success-check）后原地立即重试 N 次（总尝试 = 1+N，无退避），全部失败才轮到下一候选。硬失败（上游 403 / token dance 后仍 401 / 探测预算耗尽）跳过原地重试直接切下一候选 |
 | `url-redirect-all-error-retry` | int | `0`（不重试） | 整轮全错后的重试轮数：一轮 = 所有候选（含各自 item 重试）都失败；全轮失败后整体重来最多 N 轮（总轮数 = 1+N），重试轮沿用同一候选顺序 |
+| `url-redirect-probe-timeout` | duration | `5s` | **单次候选尝试的探测预算**：从发出请求到「响应头可用（含 401 token dance 的第二次响应）且成功判据可判定（首块读出或 EOF）」的时限，覆盖建连后的等待与 token dance 全程；到期取消该次尝试并硬失败快切下一候选。仅约束探测阶段：探测通过后的 body 读取（流式透传/缓冲排干）不受它约束，仍由 `http-timeout`（整次尝试总超时）与 `read-timeout`（无新增数据）负责；建连本身由 `connect-timeout` 负责。显式 `0` = 不限制 |
+| `url-redirect-hedge-delay` | duration | `2s` | **候选阶梯并发竞速（hedge）的放行间隔**：候选按 round-robin 顺序起步，首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消）；某候选先失败时立即放行下一候选（不等间隔）；第一个通过成功判据的候选胜出，其余全部取消（context 取消，连接及时释放）。`0` = 纯串行禁用竞速（上一候选出结果后才放行下一个）。最坏「选定候选」耗时 ≈ (候选数-1)×该间隔 + 胜者探测耗时；全部候选都失败的极坏情况由内置扫描总预算（20s）兜底，提前终止并 502（docker 客户端会自行重试该层） |
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://` |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
@@ -157,6 +163,8 @@ docker run -d --name proxy-cache \
 | `timeout` | duration | 旧字段：仅当该规则未配置 `read-timeout` 时作为该规则 `read-timeout` 生效（退化别名，不再是总超时） |
 | `url-redirect-item-error-retry` | int | 覆盖该规则单个候选失败后的原地重试次数；未配置沿用全局 |
 | `url-redirect-all-error-retry` | int | 覆盖该规则整轮全败后的重试轮数；未配置沿用全局 |
+| `url-redirect-probe-timeout` | duration | 覆盖该规则单次候选尝试的探测预算（默认 5s，`0` = 不限制）；未配置沿用全局 |
+| `url-redirect-hedge-delay` | duration | 覆盖该规则候选阶梯竞速的放行间隔（默认 2s，`0` = 纯串行禁用竞速）；未配置沿用全局 |
 
 规则覆盖项均为「可选」：不写则沿用全局配置；**第一条命中的规则生效**（不做多规则叠加）。
 
@@ -180,12 +188,15 @@ http-proxy: ""                # 或 http://127.0.0.1:7890
 success-check: content        # status / content
 fallback-direct: true
 
-url-redirect:                 # $1 = 原始目标 URL，按顺序轮询
+url-redirect:                 # $1 = 原始目标 URL，按顺序轮询（默认阶梯竞速：首个立即发出，
+                              # 之后每隔 url-redirect-hedge-delay 放行下一个并发探测）
   - https://hk.gh-proxy.org/$1
   - https://gh-proxy.com/$1
   - https://mirror.ghproxy.com/$1
 
-url-redirect-item-error-retry: 1   # 单候选失败后原地重试（总尝试 = 1+N；0 = 不重试）
+url-redirect-probe-timeout: 5s     # 单候选探测预算：响应头/判据 5s 未就绪即快切下一候选（0=不限制）
+url-redirect-hedge-delay: 2s       # 候选阶梯竞速放行间隔（0=纯串行禁用竞速）
+url-redirect-item-error-retry: 1   # 单候选失败后原地重试（总尝试 = 1+N；0 = 不重试；硬失败跳过）
 url-redirect-all-error-retry: 1    # 整轮全败后整体重试（总轮数 = 1+N；0 = 不重试）
 
 cache:
@@ -267,11 +278,34 @@ curl "http://127.0.0.1:8080/healthz"
 | 第 3 个请求 | 2 | C2 → C0 → C1 |
 | 第 4 个请求 | 0（回到起点） | C0 → C1 → C2 |
 
-- **逐个尝试**：按轮换后的顺序依次请求候选，每个候选用 `success-check` 判据判定成功；**任一候选成功即返回**该响应（并写缓存），响应头 `X-Proxy-Upstream` 标明来源
-- **失败切换**：候选请求报错、非 200、或（content 模式下 GET 的 body 为空；HEAD 天然无 body，自动按 status 语义），都视为失败并尝试下一个候选，同时记录 warn 日志；HTTP 304（内容未变更）视为成功候选——条件请求头不透传，上游对无条件请求仍回 304 属异常/缓存副本有效语义，此时 304 原样透传给客户端（不写缓存），不再判为失败
+- **阶梯并发竞速（hedge，默认开启）**：候选按轮换后的顺序起步——首个候选立即发出，之后每隔 `url-redirect-hedge-delay`（默认 2s）放行下一个候选并发探测（**前一个不取消**）；某个候选先失败时立即放行下一候选（不等间隔，`hedge-delay: 0` 则退化为纯串行逐个尝试）；**第一个通过 success-check 判据的候选胜出**，其余全部取消（context 取消、连接及时释放）。5 候选最坏情况下「选定候选」耗时 ≈ (5-1)×2s + 胜者探测耗时（探测预算默认 5s），约 10s 量级，远低于 docker 客户端约 30s 的响应头超时；全部候选都失败的极坏情况由内置扫描总预算（20s）兜底——提前终止扫描并返回 502，docker 客户端会自行重试该层
+- **命中即返回**：胜出候选的响应即最终返回（并按条件写缓存），响应头 `X-Proxy-Upstream` 标明来源
+- **硬失败快切**：token dance 后仍 401、上游 403、探测预算（`url-redirect-probe-timeout`）耗尽这三类失败，跳过 `url-redirect-item-error-retry` 原地重试直接切下一候选（这类失败重试无意义却各烧数秒，日志会注明 `hard_fail` 原因）
+- **失败切换**：其余候选失败（请求报错、非 200、或 content 模式下 GET 的 body 为空；HEAD 天然无 body 自动按 status 语义）都视为失败并尝试/放行下一个候选，同时记录 warn 日志；HTTP 304（内容未变更）视为成功候选——条件请求头不透传，上游对无条件请求仍回 304 属异常/缓存副本有效语义，此时 304 原样透传给客户端（不写缓存），不再判为失败；带 Range 的请求上游回 206 视为成功（流式透传、不写缓存）
 - **全部失败**：`fallback-direct: true`（默认）回退直连原始 URL，直连结果原样透传（404/5xx 也如实返回）；`fallback-direct: false` 则直接返回 502 JSON 错误
 - 轮询计数器为全局原子计数，命中不同域名规则使用各自候选列表时同样共享该计数（起始下标依旧逐请求轮换）
 - 未配置 `url-redirect`（或规则覆盖为 `[]`）时，所有请求直接回源原始 URL，不套用成功判据
+
+## 流式回源与 docker ~30s 响应头超时
+
+docker 客户端拉取镜像时，对每个请求只等约 30s 的响应头（`net/http: timeout awaiting response headers`），超时即断开重试。旧版实现把上游 body **整包读进内存**后才 `WriteHeader`，首字节时间 = 候选轮询全部耗时 + 上游完整下载时间——一个 1.7MB 的 blob 在慢镜像站上就能把首字节拖过 30s，docker 断开后就出现 broken pipe。
+
+现版对 **GET 路径目标（docker registry 回源）的缓存 MISS / BYPASS** 改为流式透传：
+
+1. **探测阶段**（可自由切换候选）：候选按 hedge 竞速探测，只等「响应头到达 + 成功判据可判定」（content 判据读首块 ≤64KB 判非空），第一个通过判据的候选胜出；
+2. **commit**：胜出后立即向客户端 `WriteHeader` 并透传响应头（沿用逐跳头过滤与 `X-Cache` / `X-Proxy-Upstream` 观测头；`Content-Length` 用上游声明值，上游没有就不设），随后把已缓冲首块写给客户端——**commit 之前绝不给客户端输出任何字节，commit 之后绝不再切换候选或改变状态码**；
+3. **边读边写**：把上游 body 同时写给客户端与内存累积缓冲；客户端写失败（docker 已断开）保持既有行为——继续读完上游只填缓存，docker 重试该层即可 HIT；
+4. **EOF**：仅 200 且过判据时用 `cache.Set` 原子写缓存（临时文件 + rename，并发写不互相污染），并把完整 Entry 返回给单飞等待方；commit 后上游读取失败则记日志、终止本次响应、**不写缓存**（半截数据绝不入库）。
+
+配套保障：
+
+- **单飞等待上限**：大 blob 流式回源可持续几十秒到几分钟，同一缓存 key 的并发 MISS 等待 singleflight 超过 10s（内置常量）就自行走候选回源（不再排队），避免被首个执行方吊死到超过 docker 响应头超时；
+- **HEAD 与完整 URL 目标（web）不变**：HEAD 探测沿用候选竞速管线但不写缓存、整包缓冲回放；web 请求仍整包缓冲后回放（行为不变）；
+- **Range 断点续传**：带 `Range` 的请求绕过缓存读取，上游回 206 视为成功并流式透传、不写缓存（旧版 206 会被成功判据拒掉导致续传全挂）。
+
+## 单飞（singleflight）与等待上限
+
+同一缓存 key 的并发未命中通过 singleflight 只回源一次，其余请求等待共享结果。大 blob 的流式回源可能持续几分钟，等待方最多等待 **10s**（内置常量）：超限的等待方自行走候选回源并同样参与写缓存——`cache.Set` 的临时文件 + rename 原子替换保证并发写缓存互不污染，读取方要么看到旧条目、要么看到完整新条目。完整 URL 目标（web）保持无限期等待（行为不变）。
 
 ## url-redirect 模板变量
 
@@ -326,7 +360,9 @@ domain-rules:
     fallback-direct: false     # 路径目标无完整原始 URL 可直连，候选全败直接报错
     read-timeout: 120s         # 大镜像 blob 慢速但持续传输不被砍：120s 内无任何新增数据才判超时
     http-timeout: 600s         # 单次尝试总超时兜底（含 token dance 与读 body 全程）
-    url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次
+    url-redirect-probe-timeout: 5s   # 单候选探测预算：响应头 5s 未就绪即硬失败快切下一候选
+    url-redirect-hedge-delay: 2s     # 候选阶梯竞速：每 2s 放行下一个候选并发探测，先过判据者胜出
+    url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次（硬失败跳过）
     url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
     url-redirect:              # 多镜像站候选轮询，均用 full_url_no_server 拼回源路径
       - https://docker.1panel.live/$http.server.header.full_url_no_server
@@ -334,6 +370,10 @@ domain-rules:
       - https://docker.m.daocloud.io/$http.server.header.full_url_no_server
       - https://docker.1ms.run/$http.server.header.full_url_no_server
 ```
+
+### 流式回源（docker pull 必读）
+
+路径目标 GET 的缓存 MISS / BYPASS 回源为**流式透传**（详见「[流式回源与 docker ~30s 响应头超时](#流式回源与-docker-30s-响应头超时)」）：候选竞速选定后立即向 docker 写响应头（commit），再边读上游边写给 docker 与缓存。docker 客户端等响应头约 30s 就超时断开，流式透传保证首字节时间只有「选定候选」的耗时（hedge 竞速下 5 候选最坏约 10s 量级），大 blob 的完整下载时间不再计入首字节。commit 后 docker 断开（broken pipe）时继续读完上游只填缓存，docker 重试该层即可缓存命中（HIT）。带 `Range` 的断点续传：上游 206 视为成功并流式透传、不写缓存。
 
 ### 镜像站匿名 401 挑战与自动 token 获取
 
@@ -379,10 +419,10 @@ log:
 
 | 级别 | 能看到什么 |
 | --- | --- |
-| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200 且 body 非空时输出来源/状态码/字节数/缓存状态）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、每条访问完成日志（`代理请求完成`） |
-| `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched` / `excluded` 明细）、每次候选尝试开始、缓存查询 MISS 细节 |
-| `warn` | 候选请求失败 / 未过成功判据 / 回退直连、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
-| `error` | 仅错误：回源彻底失败（502）等 |
+| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、每条访问完成日志（`代理请求完成`） |
+| `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched` / `excluded` 明细）、每次候选尝试开始、候选竞速放行（`url-redirect 候选竞速放行`）、候选被取消（其他候选胜出/扫描预算到期）、缓存查询 MISS 细节 |
+| `warn` | 候选请求失败 / 未过成功判据 / 回退直连、等待单飞超限自拔回源（`等待同 key 单飞回源超限，自行走候选回源`）、commit 后客户端断开（`写响应体失败`）、commit 后读上游失败（`流式回源读上游失败...不写缓存`）、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
+| `error` | 仅错误：回源彻底失败（502）、候选扫描总预算耗尽（`url-redirect 候选扫描总预算耗尽，提前终止候选扫描`）、候选尝试 panic 等 |
 
 ### 排障指引
 
@@ -410,13 +450,17 @@ log:
 | --- | --- |
 | `GET /` | 返回用法说明文本（含 Docker Registry 加速用法提示） |
 | `GET /healthz` | 健康检查，返回 `{"status":"ok"}` |
-| HEAD（完整 URL 或路径目标） | 与 GET 一致走候选轮询管线：先查缓存，命中回放响应头（无 body，`X-Cache: HIT`）；未命中按候选轮询回源（方法保持 HEAD，成功判据按 status 语义），**不写缓存**；未配置 url-redirect 时直连回源（`X-Cache: MISS` 或不可读缓存时 `BYPASS`） |
+| HEAD（完整 URL 或路径目标） | 与 GET 一致走候选竞速管线：先查缓存，命中回放响应头（无 body，`X-Cache: HIT`）；未命中按候选竞速回源（方法保持 HEAD，成功判据按 status 语义），**不写缓存**；未配置 url-redirect 时直连回源（`X-Cache: MISS` 或不可读缓存时 `BYPASS`） |
 | POST / PUT 等其他方法（完整 URL 目标） | 直接透传到原始 URL（不走缓存、不走 url-redirect 轮询），`X-Cache: BYPASS`（现状不变） |
 | POST / PUT 等其他方法（路径目标） | 400：路径目标仅支持 GET/HEAD（JSON 错误体） |
 | 路径目标未命中任何规则，或命中规则但生效 url-redirect 为空 | 400：路径目标必须有命中的域名规则提供 url-redirect 才能回源（全局默认配置不承接路径目标；错误信息保留「目标 URL 必须是完整的 http/https 地址」语义） |
 | 路径目标 url-redirect 候选全部失败 | 502：无直连回退（没有完整原始 URL 可直连，fallback-direct 不适用） |
 | 目标 URL 非 http/https（如 `/not-an-url`） | 识别为路径目标：未命中规则 / 非 GET/HEAD 时 400（JSON 错误体）；ACL 对「`http://<Host>/<路径>`」整串匹配 |
-| 缓存未启用 / Range / no-cache | 直接回源（仍走 url-redirect 轮询），`X-Cache: BYPASS` |
+| 缓存未启用 / Range / no-cache | 直接回源（仍走 url-redirect 候选竞速），`X-Cache: BYPASS`；路径目标 GET 同样流式透传 |
+| 带 Range 的请求，上游回 206 | 视为成功并流式透传、**不写缓存**（docker 断点续传必需；旧版 206 会被成功判据拒掉导致续传全挂） |
+| 流式回源 commit 后客户端断开 | 保持既有行为：继续读完上游只填缓存（日志「写缓存成功」），docker 重试该层即可 HIT |
+| 流式回源 commit 后上游读取失败 | 记日志、终止本次响应、**不写缓存**（半截数据绝不入库）；单飞等待方得到 502 |
+| 同 key 单飞回源等待超过 10s | 等待方自行走候选回源（不排队），`cache.Set` 原子替换保证并发写缓存互不污染 |
 | 缓存命中且 `If-None-Match` 匹配 ETag（或上游对无条件请求回 304） | 返回 304（不带 `Content-Length` 实体头），客户端使用本地缓存副本，日志记为成功（`内容未变更（304）`） |
 | 客户端条件请求头（`If-Match` 等 5 个） | 不透传给上游：回源始终为无条件 GET/HEAD（其余请求头按白名单透传，含 `Range`） |
 | 命中 deny-list 或未命中非空 allow-list | 403 |
