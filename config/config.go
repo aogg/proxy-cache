@@ -172,8 +172,35 @@ type DomainRule struct {
 	SuccessCheck *string `yaml:"success-check"`
 	// FallbackDirect 该规则下候选全部失败后是否回退直连。
 	FallbackDirect *bool `yaml:"fallback-direct"`
-	// Timeout 该规则回源请求的总超时。
+	// Timeout 该规则回源的「无新增数据超时」退化别名（旧字段，语义已变更）：
+	// 仅当本规则未配置 read-timeout 时，才作为该规则生效的 read-timeout；
+	// 不再是回源总超时（总超时用 http-timeout），也不再有任何默认值兜底。
+	// 0 = 不限制；负数为配置错误（Validate 拒绝）。
 	Timeout *Duration `yaml:"timeout"`
+	// HTTPTimeout 该规则单次上游尝试的总超时：覆盖「建连 + 响应头 + 完整读 body +
+	// 401 后 token dance 及其带 token 重试」整个尝试过程，按每次尝试独立计时
+	//（候选重试/整轮重试时每次重新计时）。nil（未配置）沿用全局 http-timeout；
+	// 0 = 不限制；负数为配置错误（Validate 拒绝）。
+	HTTPTimeout *Duration `yaml:"http-timeout"`
+	// ReadTimeout 该规则的「无新增数据超时」（idle）：以本次尝试累计收到的字节数为
+	// 进度标志（响应头到达也算一次进度），窗口内有进度就重置计时器，窗口内无任何
+	// 新数据才触发超时并取消该次尝试——慢速但持续传输的大文件不会被误砍。
+	// 生效优先级：本字段 > 本规则 timeout > 全局 read-timeout > 全局 timeout > 0（不限制）；
+	// 负数为配置错误（Validate 拒绝）。
+	ReadTimeout *Duration `yaml:"read-timeout"`
+	// ConnectTimeout 该规则的建连超时（TCP 拨号 + TLS 握手共用）。
+	// nil（未配置）沿用全局 connect-timeout；0 = 不限制；负数为配置错误（Validate 拒绝）。
+	ConnectTimeout *Duration `yaml:"connect-timeout"`
+	// URLRedirectItemErrorRetry 该规则单个候选失败后的原地立即重试次数（无退避）：
+	// 某候选一次尝试失败（网络错误/超时/未过 success-check）后原地重试 N 次
+	//（总尝试 = 1+N），全部失败才轮到下一候选。
+	// nil（未配置）沿用全局；0 = 不重试；负数为配置错误（Validate 拒绝）。
+	URLRedirectItemErrorRetry *int `yaml:"url-redirect-item-error-retry"`
+	// URLRedirectAllErrorRetry 该规则「整轮候选全部失败」后的重试轮数：
+	// 一轮 = 所有候选（含各自 item 重试）都失败；全轮失败后整体重来最多 N 轮
+	//（总轮数 = 1+N），重试轮沿用同一候选顺序。
+	// nil（未配置）沿用全局；0 = 不重试；负数为配置错误（Validate 拒绝）。
+	URLRedirectAllErrorRetry *int `yaml:"url-redirect-all-error-retry"`
 
 	// re 是 Match 编译后的正则；excludeRe 是 Exclude 逐项编译后的正则列表
 	//（均在 Validate 阶段填充，不参与 YAML 解析）。
@@ -231,8 +258,27 @@ type CacheConfig struct {
 type Config struct {
 	// Listen HTTP 服务监听地址，默认 0.0.0.0:8080。
 	Listen string `yaml:"listen"`
-	// Timeout 回源请求（含 url-redirect 候选请求）的总超时，默认 60s。
+	// Timeout 回源「无新增数据超时」的退化别名（旧字段，语义已变更）：
+	// 仅当全局未配置 read-timeout 时，才作为全局生效的 read-timeout；
+	// 不再是回源总超时（总超时用 http-timeout），也不再有任何默认值兜底（旧版为 60s）。
+	// 未配置/0 = 不限制；负数为配置错误（Validate 拒绝）。
 	Timeout Duration `yaml:"timeout"`
+	// HTTPTimeout 全局单次上游尝试的总超时（语义同 DomainRule.HTTPTimeout）。
+	// nil（未配置）= 不限制；负数为配置错误（Validate 拒绝）。
+	HTTPTimeout *Duration `yaml:"http-timeout"`
+	// ReadTimeout 全局「无新增数据超时」（语义同 DomainRule.ReadTimeout）。
+	// nil（未配置）回落到全局 timeout（旧字段退化别名），仍无 = 不限制；
+	// 负数为配置错误（Validate 拒绝）。
+	ReadTimeout *Duration `yaml:"read-timeout"`
+	// ConnectTimeout 全局建连超时（TCP 拨号 + TLS 握手共用）。
+	// nil（未配置）= 不限制；负数为配置错误（Validate 拒绝）。
+	ConnectTimeout *Duration `yaml:"connect-timeout"`
+	// URLRedirectItemErrorRetry 全局单个候选失败后的原地立即重试次数。
+	// nil（未配置）= 0（不重试）；负数为配置错误（Validate 拒绝）。
+	URLRedirectItemErrorRetry *int `yaml:"url-redirect-item-error-retry"`
+	// URLRedirectAllErrorRetry 全局「整轮候选全部失败」后的重试轮数。
+	// nil（未配置）= 0（不重试）；负数为配置错误（Validate 拒绝）。
+	URLRedirectAllErrorRetry *int `yaml:"url-redirect-all-error-retry"`
 	// HTTPProxy 全局上游代理（http/https/socks5 地址，如 http://127.0.0.1:7890），空串表示直连。
 	HTTPProxy string `yaml:"http-proxy"`
 	// SuccessCheck url-redirect 候选成功判据：status 或 content（默认 content）。
@@ -281,8 +327,20 @@ type Options struct {
 	SuccessCheck string
 	// FallbackDirect 候选全部失败后是否回退直连。
 	FallbackDirect bool
-	// Timeout 该请求回源总超时。
-	Timeout time.Duration
+	// HTTPTimeout 单次上游尝试的总超时（0 = 不限制）：覆盖建连 + 响应头 + 完整读
+	// body + 401 后 token dance 及其带 token 重试，按每次尝试独立计时。
+	HTTPTimeout time.Duration
+	// ReadTimeout 该请求生效的「无新增数据超时」（0 = 不限制）：
+	// rule.read-timeout > rule.timeout > global.read-timeout > global.timeout 的最终结果。
+	ReadTimeout time.Duration
+	// ConnectTimeout 该请求的建连超时（TCP 拨号 + TLS 握手共用；0 = 不限制）。
+	ConnectTimeout time.Duration
+	// URLRedirectItemErrorRetry 单个候选失败后的原地立即重试次数（0 = 不重试，
+	// 总尝试 = 1+N）。
+	URLRedirectItemErrorRetry int
+	// URLRedirectAllErrorRetry 「整轮候选全部失败」后的重试轮数（0 = 不重试，
+	// 总轮数 = 1+N；重试轮沿用同一候选顺序）。
+	URLRedirectAllErrorRetry int
 }
 
 // Default 返回内置默认配置（配置文件缺失时兜底，也是 Load 时叠加解析的底版：
@@ -291,7 +349,6 @@ func Default() *Config {
 	yes := true
 	return &Config{
 		Listen:         "0.0.0.0:8080",
-		Timeout:        Duration(60 * time.Second),
 		SuccessCheck:   SuccessCheckContent,
 		FallbackDirect: &yes,
 		Cache: CacheConfig{
@@ -327,9 +384,8 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Listen) == "" {
 		c.Listen = "0.0.0.0:8080"
 	}
-	if c.Timeout <= 0 {
-		c.Timeout = Duration(60 * time.Second)
-	}
+	// 旧 timeout 字段不再做任何默认值兜底（旧版此处会兜底 60s，属有意的行为变更）：
+	// 未配置/0 = read-timeout 不限制，负数在下方取值校验阶段报错
 	if strings.TrimSpace(c.Cache.Path) == "" {
 		c.Cache.Path = "./cache-data"
 	}
@@ -355,6 +411,26 @@ func (c *Config) Validate() error {
 	// //////////////////  全局取值校验  start  ////////////////////////////////////////////////
 	if c.SuccessCheck != SuccessCheckStatus && c.SuccessCheck != SuccessCheckContent {
 		return fmt.Errorf("success-check 仅支持 status 或 content，当前为 %q", c.SuccessCheck)
+	}
+	// 全局超时/重试参数：负数为配置错误；0/缺省 = 该项不限制或不重试
+	//（旧 timeout 已是 read-timeout 的退化别名，同样无默认值兜底）
+	if c.Timeout < 0 {
+		return fmt.Errorf("timeout 不能为负数（未配置或 0 = read-timeout 不限制，已无默认 60s 兜底），当前为 %s", c.Timeout)
+	}
+	if err := validateNonNegativeDuration(c.HTTPTimeout, "http-timeout"); err != nil {
+		return err
+	}
+	if err := validateNonNegativeDuration(c.ReadTimeout, "read-timeout"); err != nil {
+		return err
+	}
+	if err := validateNonNegativeDuration(c.ConnectTimeout, "connect-timeout"); err != nil {
+		return err
+	}
+	if err := validateNonNegativeInt(c.URLRedirectItemErrorRetry, "url-redirect-item-error-retry"); err != nil {
+		return err
+	}
+	if err := validateNonNegativeInt(c.URLRedirectAllErrorRetry, "url-redirect-all-error-retry"); err != nil {
+		return err
 	}
 	// log.level 仅允许四级，非法值启动快速失败；合法值转成 slog.Level 存私有字段供 LogLevel() 使用
 	switch c.Log.Level {
@@ -442,8 +518,25 @@ func (c *Config) Validate() error {
 			}
 			r.SuccessCheck = &v
 		}
-		if r.Timeout != nil && r.Timeout.D() <= 0 {
-			return fmt.Errorf("domain-rules[%d] (%s) 的 timeout 必须大于 0", i, r.Label())
+		// 规则级超时/重试参数：负数为配置错误；0/缺省 = 不限制、不重试或按优先级回落
+		//（旧 timeout 不再要求 >0：0 = read-timeout 不限制，属有意的行为变更）
+		if r.Timeout != nil && r.Timeout.D() < 0 {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 timeout 不能为负数（旧字段，现仅作 read-timeout 的退化别名；未配置或 0 = 不限制）", i, r.Label())
+		}
+		if err := validateNonNegativeDuration(r.HTTPTimeout, "http-timeout"); err != nil {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
+		}
+		if err := validateNonNegativeDuration(r.ReadTimeout, "read-timeout"); err != nil {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
+		}
+		if err := validateNonNegativeDuration(r.ConnectTimeout, "connect-timeout"); err != nil {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
+		}
+		if err := validateNonNegativeInt(r.URLRedirectItemErrorRetry, "url-redirect-item-error-retry"); err != nil {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
+		}
+		if err := validateNonNegativeInt(r.URLRedirectAllErrorRetry, "url-redirect-all-error-retry"); err != nil {
+			return fmt.Errorf("domain-rules[%d] (%s) 的 %w", i, r.Label(), err)
 		}
 	}
 	// //////////////////  域名规则校验  end  ////////////////////////////////////////////////
@@ -468,6 +561,22 @@ func (c *Config) fallbackDirect() bool {
 	return *c.FallbackDirect
 }
 
+// validateNonNegativeDuration 校验可选时长字段非负（nil = 未配置，合法）。
+func validateNonNegativeDuration(d *Duration, name string) error {
+	if d != nil && d.D() < 0 {
+		return fmt.Errorf("%s 不能为负数（未配置或 0 = 不限制），当前为 %s", name, d)
+	}
+	return nil
+}
+
+// validateNonNegativeInt 校验可选次数字段非负（nil = 未配置，合法）。
+func validateNonNegativeInt(n *int, name string) error {
+	if n != nil && *n < 0 {
+		return fmt.Errorf("%s 不能为负数（未配置或 0 = 不重试），当前为 %d", name, *n)
+	}
+	return nil
+}
+
 // GlobalCacheTTL 返回全局 cache.ttl 的生效时长：Validate 之后必然非 nil
 // （未配置已兜底 DefaultCacheTTL）；显式 0 = 永不过期，原样返回 0。
 // 方法内做 nil 防御，供未经过 Validate 的构造场景兜底，
@@ -477,6 +586,48 @@ func (c *Config) GlobalCacheTTL() time.Duration {
 		return DefaultCacheTTL
 	}
 	return c.Cache.TTL.D()
+}
+
+// GlobalReadTimeout 返回全局 read-timeout 生效值（旧 timeout 退化别名的全局半段）：
+// 全局 read-timeout 未配置时回落到全局 timeout；两者都未配置 = 0（不限制）。
+// 规则级回落见 ResolveOptions（rule.read-timeout > rule.timeout > 本方法）。
+func (c *Config) GlobalReadTimeout() time.Duration {
+	if c.ReadTimeout != nil {
+		return c.ReadTimeout.D()
+	}
+	return c.Timeout.D()
+}
+
+// GlobalHTTPTimeout 返回全局 http-timeout 生效值（nil = 0，不限制）。
+func (c *Config) GlobalHTTPTimeout() time.Duration {
+	if c.HTTPTimeout == nil {
+		return 0
+	}
+	return c.HTTPTimeout.D()
+}
+
+// GlobalConnectTimeout 返回全局 connect-timeout 生效值（nil = 0，不限制）。
+func (c *Config) GlobalConnectTimeout() time.Duration {
+	if c.ConnectTimeout == nil {
+		return 0
+	}
+	return c.ConnectTimeout.D()
+}
+
+// GlobalURLRedirectItemErrorRetry 返回全局单个候选失败后的原地重试次数（nil = 0，不重试）。
+func (c *Config) GlobalURLRedirectItemErrorRetry() int {
+	if c.URLRedirectItemErrorRetry == nil {
+		return 0
+	}
+	return *c.URLRedirectItemErrorRetry
+}
+
+// GlobalURLRedirectAllErrorRetry 返回全局整轮候选全败后的重试轮数（nil = 0，不重试）。
+func (c *Config) GlobalURLRedirectAllErrorRetry() int {
+	if c.URLRedirectAllErrorRetry == nil {
+		return 0
+	}
+	return *c.URLRedirectAllErrorRetry
 }
 
 // LogLevel 返回 log.level 对应的 slog.Level。必须在 Validate 之后调用
@@ -526,15 +677,19 @@ func targetKindOf(fullURL bool) string {
 func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 	// //////////////////  全局默认值  start  ////////////////////////////////////////////////
 	o := Options{
-		CacheEnabled:       c.Cache.Enabled,
-		CacheTTL:           c.GlobalCacheTTL(),
-		CachePath:          c.Cache.Path,
-		CacheCleanInterval: c.Cache.CleanInterval.D(),
-		HTTPProxy:          strings.TrimSpace(c.HTTPProxy),
-		URLRedirect:        c.URLRedirect,
-		SuccessCheck:       c.SuccessCheck,
-		FallbackDirect:     c.fallbackDirect(),
-		Timeout:            c.Timeout.D(),
+		CacheEnabled:              c.Cache.Enabled,
+		CacheTTL:                  c.GlobalCacheTTL(),
+		CachePath:                 c.Cache.Path,
+		CacheCleanInterval:        c.Cache.CleanInterval.D(),
+		HTTPProxy:                 strings.TrimSpace(c.HTTPProxy),
+		URLRedirect:               c.URLRedirect,
+		SuccessCheck:              c.SuccessCheck,
+		FallbackDirect:            c.fallbackDirect(),
+		HTTPTimeout:               c.GlobalHTTPTimeout(),
+		ReadTimeout:               c.GlobalReadTimeout(),
+		ConnectTimeout:            c.GlobalConnectTimeout(),
+		URLRedirectItemErrorRetry: c.GlobalURLRedirectItemErrorRetry(),
+		URLRedirectAllErrorRetry:  c.GlobalURLRedirectAllErrorRetry(),
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
@@ -597,8 +752,25 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		if r.FallbackDirect != nil {
 			o.FallbackDirect = *r.FallbackDirect
 		}
-		if r.Timeout != nil {
-			o.Timeout = r.Timeout.D()
+		// 超时/重试覆盖：规则没配（nil）沿用全局值；read-timeout 特殊——规则未配置
+		// read-timeout 时回落到规则的 timeout（旧字段退化别名），仍未配置才是全局值
+		if r.HTTPTimeout != nil {
+			o.HTTPTimeout = r.HTTPTimeout.D()
+		}
+		switch {
+		case r.ReadTimeout != nil:
+			o.ReadTimeout = r.ReadTimeout.D()
+		case r.Timeout != nil:
+			o.ReadTimeout = r.Timeout.D()
+		}
+		if r.ConnectTimeout != nil {
+			o.ConnectTimeout = r.ConnectTimeout.D()
+		}
+		if r.URLRedirectItemErrorRetry != nil {
+			o.URLRedirectItemErrorRetry = *r.URLRedirectItemErrorRetry
+		}
+		if r.URLRedirectAllErrorRetry != nil {
+			o.URLRedirectAllErrorRetry = *r.URLRedirectAllErrorRetry
 		}
 		o.Rule = r.Label()
 		break // 自上而下第一条命中即生效

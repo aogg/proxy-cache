@@ -17,7 +17,7 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **HEAD 走候选轮询管线**：HEAD 与 GET 一致先查缓存（命中回放响应头，无 body），未命中按候选轮询回源（方法保持 HEAD，docker registry 的 HEAD 探测同样打到镜像站）；HEAD 响应无 body 不写缓存；未配置 url-redirect 时回退直连（与旧版一致）
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）；HEAD 响应天然无 body，content 判据对 HEAD 自动按 status 语义；HTTP 304（内容未变更）在两种模式下均视为成功候选，304 原样透传给客户端、不写缓存
 - **条件请求头不透传**：回源（候选与直连）按请求头白名单透传（含 `Range`），但 `If-Match` / `If-Modified-Since` / `If-None-Match` / `If-Range` / `If-Unmodified-Since` 不透传——回源始终为无条件 GET/HEAD，保证上游返回 200 + 完整 body 以过判据、写缓存；客户端的 304 语义由代理自身缓存 ETag 逻辑（HIT 命中时返回 304）负责
-- **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`timeout` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
+- **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`timeout`（read-timeout 退化别名）、`http-timeout`、`read-timeout`、`connect-timeout`、`url-redirect-item-error-retry`、`url-redirect-all-error-retry` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
 - **上游代理支持**：全局与规则级 `http-proxy`（http/https/socks5），所有回源请求（含 url-redirect 候选请求）均可走代理
 - **allow-list / deny-list**：正则白/黑名单访问控制（deny 优先，allow 非空即白名单模式）
 - **可观测性**：`X-Cache`（HIT/MISS/BYPASS）与 `X-Proxy-Upstream`（本次内容来源）响应头、结构化日志、`/healthz` 健康检查
@@ -104,7 +104,12 @@ docker run -d --name proxy-cache \
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `listen` | string | `0.0.0.0:8080` | HTTP 服务监听地址 |
-| `timeout` | duration | `60s` | 回源请求（含候选请求）总超时 |
+| `http-timeout` | duration | 不限制（0） | 单次上游尝试的**总超时**：覆盖「建连 + 响应头 + 完整读 body + 401 后 token dance 及其带 token 重试」，按每次尝试独立计时（候选重试/整轮重试时每次重新计时） |
+| `read-timeout` | duration | 不限制（0） | **无新增数据超时（idle）**：以本次尝试累计收到的字节数为进度标志（响应头到达也算一次进度），窗口内有进度就重置计时器，窗口内无任何新数据才触发超时并取消该次尝试（错误信息含 `read-timeout` 便于辨认）——慢速但持续传输的大文件不会被误砍 |
+| `connect-timeout` | duration | 不限制（0） | 建连超时（TCP 拨号 + TLS 握手共用） |
+| `timeout` | duration | 不限制（0） | **旧字段，语义已变更**：仅为 `read-timeout` 的退化别名，不再是回源总超时；且不再有旧版的 `60s` 默认兜底（未配置 = 不限制，有意的行为变更） |
+| `url-redirect-item-error-retry` | int | `0`（不重试） | 单个候选的重试次数：某候选一次尝试失败（网络错误/超时/未过 success-check）后原地立即重试 N 次（总尝试 = 1+N，无退避），全部失败才轮到下一候选 |
+| `url-redirect-all-error-retry` | int | `0`（不重试） | 整轮全错后的重试轮数：一轮 = 所有候选（含各自 item 重试）都失败；全轮失败后整体重来最多 N 轮（总轮数 = 1+N），重试轮沿用同一候选顺序 |
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://` |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
@@ -116,6 +121,8 @@ docker run -d --name proxy-cache \
 | `deny-list` | string[] | 空 | 拒绝列表（正则）。命中即返回 403 |
 
 > 时长格式统一支持：Go duration（`30s`/`30m`/`1h30m`）、纯数字（按秒）、`2d`（天）、`1w`（周）。
+
+> **超时模型（与旧版差异）**：三个超时（`http-timeout` / `read-timeout` / `connect-timeout`）相互独立，全局与规则级都可配——同一字段规则没配就用全局，全局也没有 = 该项不限制（0）。`read-timeout` 的生效优先级：`rule.read-timeout` > `rule.timeout` > `global.read-timeout` > `global.timeout` > 不限制。与旧版行为差异：① 旧 `timeout` 是「回源总超时，未配置兜底 `60s`」，现仅为 `read-timeout` 别名且**无任何默认兜底**（有意的行为变更）；② 旧版 TCP 拨号/TLS 握手固定 `10s` 超时，现由 `connect-timeout` 控制、未配置不限制；③ 大 blob 在旧版可能因「总超时内没读完」被整体砍掉（数据在稳定传输也照砍），现 `read-timeout` 按数据进度判定，慢速但持续传输不会被砍；候选级/整轮重试为新增能力，未配置时不重试（行为与旧版一致）。
 
 ### cache 配置
 
@@ -144,7 +151,12 @@ docker run -d --name proxy-cache \
 | `url-redirect` | string[] | 该规则专用候选列表（覆盖全局；`[]` 表示该规则直连回源） |
 | `success-check` | string | 该规则的成功判据 |
 | `fallback-direct` | bool | 该规则是否允许回退直连 |
-| `timeout` | duration | 该规则回源超时 |
+| `http-timeout` | duration | 覆盖该规则单次上游尝试的总超时；未配置沿用全局 |
+| `read-timeout` | duration | 覆盖该规则的无新增数据超时；未配置时回落到该规则 `timeout`，仍未配置才沿用全局（`global.read-timeout` > `global.timeout`） |
+| `connect-timeout` | duration | 覆盖该规则建连超时（TCP 拨号 + TLS 握手）；未配置沿用全局 |
+| `timeout` | duration | 旧字段：仅当该规则未配置 `read-timeout` 时作为该规则 `read-timeout` 生效（退化别名，不再是总超时） |
+| `url-redirect-item-error-retry` | int | 覆盖该规则单个候选失败后的原地重试次数；未配置沿用全局 |
+| `url-redirect-all-error-retry` | int | 覆盖该规则整轮全败后的重试轮数；未配置沿用全局 |
 
 规则覆盖项均为「可选」：不写则沿用全局配置；**第一条命中的规则生效**（不做多规则叠加）。
 
@@ -160,7 +172,10 @@ docker run -d --name proxy-cache \
 
 ```yaml
 listen: "0.0.0.0:8080"
-timeout: 60s
+http-timeout: 300s            # 单次上游尝试总超时（未配置 = 不限制）
+read-timeout: 60s             # 无新增数据超时（未配置 = 不限制；60s 内无任何新数据才判超时）
+connect-timeout: 10s          # 建连超时（未配置 = 不限制）
+# timeout: 60s                # 旧字段：仅当 read-timeout 未配置时作为 read-timeout 生效
 http-proxy: ""                # 或 http://127.0.0.1:7890
 success-check: content        # status / content
 fallback-direct: true
@@ -169,6 +184,9 @@ url-redirect:                 # $1 = 原始目标 URL，按顺序轮询
   - https://hk.gh-proxy.org/$1
   - https://gh-proxy.com/$1
   - https://mirror.ghproxy.com/$1
+
+url-redirect-item-error-retry: 1   # 单候选失败后原地重试（总尝试 = 1+N；0 = 不重试）
+url-redirect-all-error-retry: 1    # 整轮全败后整体重试（总轮数 = 1+N；0 = 不重试）
 
 cache:
   enabled: true
@@ -306,7 +324,10 @@ domain-rules:
       clean-interval: 30m
     success-check: status      # registry /v2/ ping 等响应可能空 body，content 判据会误拒
     fallback-direct: false     # 路径目标无完整原始 URL 可直连，候选全败直接报错
-    timeout: 300s              # 大镜像 blob 拉取耗时较长，放宽回源总超时
+    read-timeout: 120s         # 大镜像 blob 慢速但持续传输不被砍：120s 内无任何新增数据才判超时
+    http-timeout: 600s         # 单次尝试总超时兜底（含 token dance 与读 body 全程）
+    url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次
+    url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
     url-redirect:              # 多镜像站候选轮询，均用 full_url_no_server 拼回源路径
       - https://docker.1panel.live/$http.server.header.full_url_no_server
       - https://hub.rat.dev/$http.server.header.full_url_no_server
@@ -318,7 +339,7 @@ domain-rules:
 
 daocloud / 1ms.run / hub.rat.dev 等镜像站对匿名 GET/HEAD 的 blob/manifest 请求常直接返回 **401**，响应带 `WWW-Authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:<name>:pull"` 挑战。docker 客户端直连时会自动「按 challenge 去 realm 匿名取 token → 带 `Authorization: Bearer <token>` 重试」，所以直连能成功；反代场景若只透传裸请求，所有 url-redirect 候选都会被 401 拒绝、最终 502。
 
-本代理已在回源链路自动完成这套**匿名 token dance**（与 docker 客户端直连行为等价）：GET/HEAD 回源收到 401 且挑战为 Bearer（含 realm）时，自动向 realm 匿名换取 token（仅附带挑战里的 service/scope 查询参数，绝不携带客户端的 Authorization）并带 `Authorization: Bearer <token>` 重试一次（仍 401 则按该响应原样返回，不循环）；token 按 `realm|service|scope` 进程内缓存（TTL 取响应 `expires_in`，缺省 60s），避免每个 blob 层都打一次 auth 端点。取 token 或重试失败时按原始 401 响应返回，继续走既有的候选轮询与成功判据（不影响缓存写盘语义）。大镜像 blob 拉取耗时较长，建议放宽该规则 `timeout`（如示例中的 `timeout: 300s`）——token 获取与重试共用该回源总超时。
+本代理已在回源链路自动完成这套**匿名 token dance**（与 docker 客户端直连行为等价）：GET/HEAD 回源收到 401 且挑战为 Bearer（含 realm）时，自动向 realm 匿名换取 token（仅附带挑战里的 service/scope 查询参数，绝不携带客户端的 Authorization）并带 `Authorization: Bearer <token>` 重试一次（仍 401 则按该响应原样返回，不循环）；token 按 `realm|service|scope` 进程内缓存（TTL 取响应 `expires_in`，缺省 60s），避免每个 blob 层都打一次 auth 端点。取 token 或重试失败时按原始 401 响应返回，继续走既有的候选轮询与成功判据（不影响缓存写盘语义）。token 获取、带 token 重试与读 body 全程都计入该规则的 `http-timeout`（单次尝试总超时），且 dance 各阶段的响应头/数据到达都会重置 `read-timeout` 看门狗。大镜像 blob 拉取耗时较长，建议为该规则配置 `read-timeout`（如示例中的 `read-timeout: 120s`——数据持续传输就不会被砍，仅当窗口内无任何新增数据才判超时）与 `http-timeout`（如 `600s` 兜底）；旧版「放宽 `timeout` 总超时」的写法已不适用（`timeout` 现仅为 read-timeout 的退化别名）。
 
 ### 用法
 

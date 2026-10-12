@@ -23,8 +23,27 @@ log:
   level: info
   # level: debug
 
-# 回源请求（含 url-redirect 候选请求）的总超时
-timeout: 60s
+# ----------------------------------------------------------------------------
+# 回源超时（三个相互独立；全局与 domain-rules 规则级都可配，规则覆盖全局，
+# 同一字段规则没配就用全局，全局也没有 = 该项不限制）
+# ----------------------------------------------------------------------------
+# http-timeout    单次上游尝试的总超时：覆盖「建连 + 响应头 + 完整读 body +
+#                 401 后 token dance 及其带 token 重试」整个尝试，按每次尝试
+#                 独立计时（候选重试/整轮重试时每次重新计时）；未配置 = 不限制
+# read-timeout    无新增数据超时（idle）：以本次尝试累计收到的字节数为进度标志
+#                 （响应头到达也算一次进度），窗口内有进度就重置计时器，窗口内
+#                 无任何新数据才触发超时并取消该次尝试——慢速但持续传输的大文件
+#                 不会被误砍；未配置 = 不限制
+# connect-timeout 建连超时（TCP 拨号 + TLS 握手共用）；未配置 = 不限制
+# 旧字段 timeout 语义已变更（有意的行为变更）：
+#   - 旧版是「回源总超时，未配置兜底 60s」；现仅为 read-timeout 的退化别名，
+#     且不再有 60s 默认值兜底（未配置 = 不限制）
+#   - read-timeout 生效优先级：rule.read-timeout > rule.timeout >
+#     global.read-timeout > global.timeout > 0（不限制）
+#http-timeout: 300s
+#read-timeout: 60s
+#connect-timeout: 10s
+#timeout: 60s              # 旧字段：仅当 read-timeout 未配置时才作为 read-timeout 生效
 
 # 全局上游代理（http/https/socks5 地址），所有回源请求都会走它；留空表示直连
 # 域名规则里可用 http-proxy 单独覆盖
@@ -43,6 +62,21 @@ success-check: content
 # 注意：路径目标请求（见下方 Docker Registry 场景示例）没有完整原始 URL 可直连，
 # fallback-direct 不适用——候选全败直接报错（错误信息注明路径目标无直连回退）
 fallback-direct: true
+
+# ----------------------------------------------------------------------------
+# url-redirect 候选失败重试（全局与 domain-rules 规则级都可配，规则覆盖全局；
+# 未配置 = 0，即不重试，行为与旧版一致）
+# ----------------------------------------------------------------------------
+# url-redirect-item-error-retry  单个候选的重试次数：某候选一次尝试失败
+#                                （网络错误/超时/未过 success-check）后原地立即
+#                                重试 N 次（总尝试 = 1+N，无退避），全部失败才
+#                                轮到下一候选
+# url-redirect-all-error-retry   整轮全错后的重试轮数：一轮 = 所有候选（含各自
+#                                item 重试）都失败；全轮失败后整体重来最多 N 轮
+#                                （总轮数 = 1+N），同一请求内的重试轮沿用同一候选顺序
+# 每次尝试/重试的日志均含：候选 URL、第几次尝试/共几次、第几轮/共几轮、失败原因
+#url-redirect-item-error-retry: 1
+#url-redirect-all-error-retry: 1
 
 # url-redirect：回源镜像/上游代理模板列表
 # 模板占位符（每个变量均支持 $name 与 ${name} 两种写法，每个模板至少包含一个，启动时校验）：
@@ -65,7 +99,8 @@ fallback-direct: true
 # https://docker.1panel.live/v2/... 而非 ...//v2/...；
 # 按 round-robin 轮换起始下标逐个尝试（第 1 个请求从第 1 条开始，第 2 个请求从第 2 条开始……），
 # 只要有一个候选通过 success-check 即返回（200 才写缓存；304 视为成功并原样透传、不写缓存）；
-# 候选全部失败时按 fallback-direct 处理（路径目标请求无直连回退）
+# 候选失败的重试（单候选原地重试 / 整轮全败重试）见 url-redirect-item-error-retry 与
+# url-redirect-all-error-retry；候选全部失败时按 fallback-direct 处理（路径目标请求无直连回退）
 url-redirect:
   - https://hk.gh-proxy.org/$1
   - https://gh-proxy.com/$1
@@ -128,7 +163,14 @@ domain-rules:
     # http-proxy: "http://127.0.0.1:7890"   # 该规则的回源走指定代理
     # success-check: status                  # 该规则 200 即算成功
     # fallback-direct: false                 # 候选全败时不回退直连
-    # timeout: 120s                          # 该规则回源超时
+    # ---- 超时覆盖（规则没配的字段沿用全局；含义见顶部全局说明） ----
+    # http-timeout: 120s                     # 该规则单次上游尝试的总超时
+    # read-timeout: 60s                      # 该规则无新增数据超时（idle）
+    # connect-timeout: 10s                   # 该规则建连超时（TCP 拨号 + TLS 握手）
+    # timeout: 120s                          # 旧字段：仅当该规则未配 read-timeout 时作为 read-timeout 生效
+    # ---- url-redirect 重试覆盖（规则没配沿用全局；未配置 = 0 不重试） ----
+    # url-redirect-item-error-retry: 1       # 该规则单个候选失败后的原地重试次数
+    # url-redirect-all-error-retry: 1        # 该规则整轮全败后的重试轮数
     # url-redirect:                          # 该规则专用候选列表（设为 [] 表示该规则直连回源）
     #   - https://gh-proxy.com/$1
 
@@ -175,7 +217,10 @@ domain-rules:
   #     clean-interval: 30m      # 该目录的后台清理间隔（不写则沿用全局 cache.clean-interval）
   #   success-check: status      # registry /v2/ ping 等响应可能空 body，content 判据会误拒，用 status
   #   fallback-direct: false     # 路径目标无完整原始 URL 可直连回退，候选全败直接报错
-  #   timeout: 300s              # 大镜像 blob 拉取耗时较长，放宽回源总超时
+  #   read-timeout: 120s         # 大镜像 blob 慢速但持续传输不被砍：120s 内无任何新增数据才判超时
+  #   http-timeout: 600s         # 单次尝试总超时兜底（含 token dance 与读 body 全程）
+  #   url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次
+  #   url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
   #   url-redirect:              # 多镜像站候选轮询，均用 full_url_no_server 拼回源路径
   #     - https://docker.1panel.live/$http.server.header.full_url_no_server
   #     - https://hub.rat.dev/$http.server.header.full_url_no_server

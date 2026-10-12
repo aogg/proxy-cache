@@ -42,6 +42,16 @@ var forwardRequestHeaders = []string{
 	"Content-Type", "Range", "User-Agent",
 }
 
+// upstreamClientKey 标识一个可复用的上游 http.Client 组合：上游代理地址 + 建连超时。
+// connect-timeout 进入 Transport 的拨号/TLS 握手超时，不同值必须各一个 Transport；
+// 相同组合共享同一 Client/Transport，保证连接复用不被破坏。
+type upstreamClientKey struct {
+	// proxy 上游代理地址（空串 = 直连）。
+	proxy string
+	// connectTimeout 建连超时（0 = 不限制）。
+	connectTimeout time.Duration
+}
+
 // Server 是代理服务 HTTP 处理器，实现 http.Handler。
 type Server struct {
 	// cfg 已校验的运行期只读配置。
@@ -53,8 +63,11 @@ type Server struct {
 	// rr url-redirect 轮询起始下标计数器：第 1 个使用该列表的请求从 0 开始，
 	// 之后每个请求 +1，实现候选列表的起始位置轮换（round-robin 负载轮询）。
 	rr atomic.Uint64
-	// clients 上游代理地址 -> 复用的 http.Client（初始化后只读，并发安全）。
-	clients map[string]*http.Client
+	// clientsMu 保护 clients 的惰性补建（同一组合并发首用时只建一次）。
+	clientsMu sync.Mutex
+	// clients 可复用的上游 http.Client：key = (上游代理地址, connect-timeout)。
+	// New 预构建配置里出现的全部组合，运行期对遗漏组合（防御）惰性补建。
+	clients map[upstreamClientKey]*http.Client
 	// flight 同一缓存键的单飞组，防止缓存击穿。
 	flight flightGroup
 	// dockerTokenMu 保护 dockerTokens 的并发读写。
@@ -73,36 +86,67 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	}
 	s := &Server{cfg: cfg, caches: caches, log: logger, dockerTokens: make(map[string]dockerTokenEntry)}
 
-	// 收集全部可能用到的上游代理地址（空串代表直连），各建一个可复用 Client
-	proxySet := map[string]struct{}{"": {}}
-	if cfg.HTTPProxy != "" {
-		proxySet[cfg.HTTPProxy] = struct{}{}
+	// 预构建全局与各域名规则可能用到的 (上游代理, connect-timeout) 组合客户端：
+	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建
+	comboSet := map[upstreamClientKey]struct{}{
+		{proxy: "", connectTimeout: cfg.GlobalConnectTimeout()}: {},
+	}
+	if p := strings.TrimSpace(cfg.HTTPProxy); p != "" {
+		comboSet[upstreamClientKey{proxy: p, connectTimeout: cfg.GlobalConnectTimeout()}] = struct{}{}
 	}
 	for i := range cfg.DomainRules {
-		if p := cfg.DomainRules[i].HTTPProxy; p != nil && *p != "" {
-			proxySet[*p] = struct{}{}
+		r := &cfg.DomainRules[i]
+		proxy := strings.TrimSpace(cfg.HTTPProxy) // 规则未配 http-proxy 时沿用全局
+		if r.HTTPProxy != nil {
+			proxy = strings.TrimSpace(*r.HTTPProxy) // 规则显式空串 = 直连
 		}
+		ct := cfg.GlobalConnectTimeout() // 规则未配 connect-timeout 时沿用全局
+		if r.ConnectTimeout != nil {
+			ct = r.ConnectTimeout.D()
+		}
+		comboSet[upstreamClientKey{proxy: proxy, connectTimeout: ct}] = struct{}{}
 	}
-	s.clients = make(map[string]*http.Client, len(proxySet))
-	for p := range proxySet {
-		cl, err := buildHTTPClient(p)
+	s.clients = make(map[upstreamClientKey]*http.Client, len(comboSet))
+	for c := range comboSet {
+		cl, err := buildHTTPClient(c.proxy, c.connectTimeout)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("预构建上游客户端失败（proxy=%q connect-timeout=%s）: %w",
+				c.proxy, c.connectTimeout, err)
 		}
-		s.clients[p] = cl
+		s.clients[c] = cl
 	}
 	return s, nil
 }
 
-// buildHTTPClient 构建指定上游代理（空串=直连）的 http.Client。
-func buildHTTPClient(proxyAddr string) (*http.Client, error) {
+// newUpstreamDialer 构建上游拨号器：connect-timeout 用于 TCP 拨号超时（0 = 不限制）。
+func newUpstreamDialer(connectTimeout time.Duration) *net.Dialer {
+	return &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+}
+
+// buildHTTPClient 构建指定上游代理（空串=直连）与建连超时的 http.Client：
+// connect-timeout 同时用于 TCP 拨号与 TLS 握手，0 = 不设超时（不限制，
+// 旧版硬编码的 10s 建连/TLS 超时已被该模型取代）。相同 (代理, connect-timeout)
+// 组合应共享同一 Client 实例（见 Server.client），保证连接复用不被破坏。
+func buildHTTPClient(proxyAddr string, connectTimeout time.Duration) (*http.Client, error) {
+	tr, err := newUpstreamTransport(proxyAddr, connectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Transport: tr}, nil
+}
+
+// newUpstreamTransport 构建上游 Transport：独立成函数便于测试直接检视
+// connect-timeout 是否正确落到拨号器与 TLS 握手超时上。
+func newUpstreamTransport(proxyAddr string, connectTimeout time.Duration) (*http.Transport, error) {
 	tr := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		// TCP 拨号与 TLS 握手共用 connect-timeout；0 值在 net.Dialer 与
+		// TLSHandshakeTimeout 的语义即为无超时（不限制）
+		DialContext:           newUpstreamDialer(connectTimeout).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   connectTimeout,
 		ExpectContinueTimeout: time.Second,
 	}
 	if proxyAddr != "" {
@@ -115,15 +159,32 @@ func buildHTTPClient(proxyAddr string) (*http.Client, error) {
 		}
 		tr.Proxy = http.ProxyURL(u)
 	}
-	return &http.Client{Transport: tr}, nil
+	return tr, nil
 }
 
-// client 返回生效代理对应的 Client（未知代理地址兜底直连客户端）。
-func (s *Server) client(proxyAddr string) *http.Client {
-	if cl, ok := s.clients[proxyAddr]; ok && cl != nil {
+// client 返回（上游代理, connect-timeout）组合对应的 Client：New 已预构建配置内
+// 全部组合，这里对防御性遗漏的组合惰性补建并缓存（同一组合只建一次，连接复用不受影响）。
+func (s *Server) client(proxyAddr string, connectTimeout time.Duration) *http.Client {
+	key := upstreamClientKey{proxy: proxyAddr, connectTimeout: connectTimeout}
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	if cl, ok := s.clients[key]; ok && cl != nil {
 		return cl
 	}
-	return s.clients[""]
+	// 防御分支：代理地址已在配置校验/启动预构建阶段验证过，正常不会走到这里；
+	// 补建失败兜底直连客户端，绝不让请求因客户端构建问题而 panic
+	cl, err := buildHTTPClient(proxyAddr, connectTimeout)
+	if err != nil {
+		s.log.Error("惰性构建上游客户端失败，兜底直连客户端",
+			"proxy", proxyAddr, "connect_timeout", connectTimeout.String(), "err", err)
+		if direct, ok := s.clients[upstreamClientKey{}]; ok && direct != nil {
+			cl = direct
+		} else {
+			cl, _ = buildHTTPClient("", 0)
+		}
+	}
+	s.clients[key] = cl
+	return cl
 }
 
 // ServeHTTP 是 http.Handler 入口：分流首页 / 健康检查 /healthz / 代理请求。
@@ -434,7 +495,12 @@ func (s *Server) cacheFor(eff config.Options) (*cache.Cache, error) {
 //    （路径目标必须由规则模板拼出回源地址，没有可直连的原始 URL）；
 //  2. 按 round-robin 轮换的起始下标逐个尝试候选（请求方法沿用入站方法 GET/HEAD，
 //     docker registry 的 HEAD 探测因此同样打到镜像站），通过 success-check 判据即返回；
-//  3. 候选全部失败时，完整 URL 目标按 fallback-direct 决定是否回退直连原始 URL；
+//     单个候选失败后可按 url-redirect-item-error-retry 原地立即重试（总尝试 = 1+N，
+//     无退避；网络错误/超时/未过 success-check 都算失败）；
+//  3. 一轮 = 所有候选（含各自 item 重试）都失败；整轮全败后可按
+//     url-redirect-all-error-retry 整体重来最多 N 轮（总轮数 = 1+N），
+//     同一请求内的重试轮沿用同一候选顺序（同一 start 下标）；
+//  4. 所有轮次都失败时，完整 URL 目标按 fallback-direct 决定是否回退直连原始 URL；
 //     路径目标没有完整原始 URL 可直连，fallback-direct 不适用，一律直接报错（无直连回退）。
 func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.Options) (*cache.Entry, error) {
 	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target))
@@ -465,42 +531,66 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 		"count", len(candidates), "candidates", details)
 	// //////////////////  轮询展开明细日志  end  ////////////////////////////////////////////////
 
-	// //////////////////  逐个尝试候选  start  ////////////////////////////////////////////////
+	// //////////////////  逐轮逐候选尝试（含 item/round 重试）  start  ////////////////////////
+	// item 重试：单个候选失败（网络错误/超时/未过 success-check）后原地立即重试 N 次
+	//（总尝试 = 1+N，无退避），全部失败才轮到下一候选；
+	// round 重试：一轮 = 所有候选（含各自 item 重试）都失败，整轮全败后整体重来最多
+	// N 轮（总轮数 = 1+N）；同一请求内的重试轮沿用同一候选顺序（同一 start 下标）。
+	// 未配置重试时 itemTotalAttempts=1、totalRounds=1，行为与旧版完全一致。
+	itemTotalAttempts := 1 + max0(eff.URLRedirectItemErrorRetry)
+	totalRounds := 1 + max0(eff.URLRedirectAllErrorRetry)
 	var lastErr error
-	for i := 0; i < len(candidates); i++ {
-		idx := (start + i) % len(candidates) // 该候选在模板列表中的原始下标
-		cand := candidates[idx]
-		tpl := eff.URLRedirect[idx]
-		s.log.Debug("尝试 url-redirect 候选", "attempt", i, "index", idx,
-			"template", tpl, "candidate", cand)
-		candStart := time.Now() // 该候选耗时（含请求与响应读取）
-		// 请求方法沿用入站方法（GET/HEAD）：HEAD 探测（docker registry）同样经候选轮询打到镜像站
-		e, err := s.doRequest(r, r.Method, cand, nil, eff)
-		if err != nil {
-			lastErr = err
-			s.log.Warn("url-redirect 候选请求失败", "attempt", i, "index", idx,
-				"template", tpl, "candidate", cand,
-				"cost", time.Since(candStart).Round(time.Millisecond).String(), "err", err)
-			continue
+	for round := 0; round < totalRounds; round++ {
+		for i := 0; i < len(candidates); i++ {
+			idx := (start + i) % len(candidates) // 该候选在模板列表中的原始下标
+			cand := candidates[idx]
+			tpl := eff.URLRedirect[idx]
+			for attempt := 0; attempt < itemTotalAttempts; attempt++ {
+				s.log.Debug("尝试 url-redirect 候选",
+					"round", round+1, "round_total", totalRounds,
+					"attempt", attempt+1, "attempt_total", itemTotalAttempts,
+					"index", idx, "template", tpl, "candidate", cand)
+				candStart := time.Now() // 该次尝试耗时（含请求与响应读取）
+				// 请求方法沿用入站方法（GET/HEAD）：HEAD 探测（docker registry）同样经候选轮询打到镜像站
+				e, err := s.doRequest(r, r.Method, cand, nil, eff)
+				if err != nil {
+					lastErr = err
+					s.log.Warn("url-redirect 候选请求失败",
+						"round", round+1, "round_total", totalRounds,
+						"attempt", attempt+1, "attempt_total", itemTotalAttempts,
+						"index", idx, "template", tpl, "candidate", cand,
+						"cost", time.Since(candStart).Round(time.Millisecond).String(), "err", err)
+					continue
+				}
+				if checkSuccess(e, eff.SuccessCheck, r.Method) {
+					e.Source = cand
+					// 命中即最终返回：输出第几轮、该候选第几次尝试、模板下标与轮内尝试序、
+					// 模板与替换后 URL、HTTP 状态码与耗时，作为「最终采用哪个候选」的留痕
+					s.log.Info("url-redirect 候选命中并作为最终返回",
+						"round", round+1, "round_total", totalRounds,
+						"attempt", attempt+1, "attempt_total", itemTotalAttempts,
+						"index", idx, "template", tpl, "candidate", cand, "status", e.Status,
+						"bytes", len(e.Body), "cost", time.Since(candStart).Round(time.Millisecond).String())
+					return e, nil
+				}
+				lastErr = fmt.Errorf("候选 %s 未通过 success-check=%s（状态码 %d，body %d 字节）",
+					cand, eff.SuccessCheck, e.Status, len(e.Body))
+				s.log.Warn("url-redirect 候选未通过成功判据",
+					"round", round+1, "round_total", totalRounds,
+					"attempt", attempt+1, "attempt_total", itemTotalAttempts,
+					"index", idx, "template", tpl, "candidate", cand,
+					"check", eff.SuccessCheck, "status", e.Status, "body_bytes", len(e.Body))
+			}
 		}
-		if checkSuccess(e, eff.SuccessCheck, r.Method) {
-			e.Source = cand
-			// 命中即最终返回：输出命中的是第几个候选（模板下标 + 轮内尝试序）、
-			// 模板与替换后 URL、HTTP 状态码与耗时，作为「最终采用哪个候选」的留痕
-			s.log.Info("url-redirect 候选命中并作为最终返回", "attempt", i, "index", idx,
-				"template", tpl, "candidate", cand, "status", e.Status,
-				"bytes", len(e.Body), "cost", time.Since(candStart).Round(time.Millisecond).String())
-			return e, nil
+		if round+1 < totalRounds {
+			// 整轮全败且还有重试轮：留痕后整体重来（沿用同一候选顺序）
+			s.log.Warn("url-redirect 整轮候选全部失败，按 url-redirect-all-error-retry 重试下一轮",
+				"round", round+1, "round_total", totalRounds, "last_error", lastErr)
 		}
-		lastErr = fmt.Errorf("候选 %s 未通过 success-check=%s（状态码 %d，body %d 字节）",
-			cand, eff.SuccessCheck, e.Status, len(e.Body))
-		s.log.Warn("url-redirect 候选未通过成功判据", "attempt", i, "index", idx,
-			"template", tpl, "candidate", cand,
-			"check", eff.SuccessCheck, "status", e.Status, "body_bytes", len(e.Body))
 	}
-	// //////////////////  逐个尝试候选  end  ////////////////////////////////////////////////
+	// //////////////////  逐轮逐候选尝试（含 item/round 重试）  end  //////////////////////////
 
-	// //////////////////  全部失败：按配置回退直连  start  ////////////////////////////////////////////////
+	// //////////////////  全部轮次失败：按配置回退直连  start  /////////////////////////////////////////
 	if !isFullURLTarget(target) {
 		// 路径目标没有完整原始 URL 可直连：fallback-direct 不适用，候选全败直接报错
 		//（错误信息注明路径目标无直连回退）
@@ -517,7 +607,16 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 		return e, nil
 	}
 	return nil, fmt.Errorf("全部 url-redirect 候选失败（fallback-direct 已关闭）: %w", lastErr)
-	// //////////////////  全部失败：按配置回退直连  end  ////////////////////////////////////////////////
+	// //////////////////  全部轮次失败：按配置回退直连  end  ///////////////////////////////////////////
+}
+
+// max0 返回 n 与 0 的较大值（重试次数防御：配置校验已拒绝负数，此处兜底避免负数
+// 导致循环异常）。
+func max0(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // fetchDirect 直接请求原始 URL：保留客户端方法，非 GET/HEAD 时透传请求体。
@@ -536,25 +635,40 @@ func (s *Server) fetchDirect(r *http.Request, target string, eff config.Options)
 	return e, nil
 }
 
-// doRequest 向 urlStr 发起请求。所有上游请求（直连与 url-redirect 候选）统一走这里，
-// 并应用生效配置的 http-proxy（上游代理）与 timeout（总超时）。
+// doRequest 向 urlStr 发起一次上游尝试。所有上游请求（直连与 url-redirect 候选）统一走这里，
+// 并应用生效配置的 http-proxy（上游代理）与三个独立超时：
+//   - http-timeout：本次尝试的总超时（建连 + 响应头 + 完整读 body + token dance 全程），
+//     每次尝试（含候选重试）独立计时；未配置（0）= 不限制；
+//   - read-timeout：无新增数据看门狗（见 progressWatchdog），响应头到达、每读到一段
+//     body 字节都重置计时器，窗口内无任何新数据才取消本次尝试（错误含 "read-timeout"）；
+//   - connect-timeout：建连超时，按 (代理, connect-timeout) 组合选择 Transport。
+//
 // GET/HEAD 回源遇上游 401 + WWW-Authenticate: Bearer 挑战时，自动完成 Docker Registry
 // 匿名 token dance（401 → 取 token → 带 Bearer 重试一次，见 dockerAuthDance）；
 // 其余方法（fetchDirect 透传 r.Body 的那类）不做 dance。
 func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reader, eff config.Options) (*cache.Entry, error) {
-	// //////////////////  校验参数  start  ////////////////////////////////////////////////
-	timeout := eff.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
+	// //////////////////  构造尝试级 ctx（http-timeout 总超时）  start  ///////////////////////
+	// 与客户端连接解耦（WithoutCancel）：首个客户端断开也不中断回源，
+	// 保证缓存填充与单飞等待方仍能拿到完整结果。
+	// http-timeout 按「本次尝试」独立计时：候选重试/整轮重试时每次都会重新进入本函数，
+	// 因此每次尝试都拿到全新的总超时窗口。0 = 未配置，不限制。
+	attemptParent := context.WithoutCancel(r.Context())
+	if eff.HTTPTimeout > 0 {
+		var cancelTimeout context.CancelFunc
+		attemptParent, cancelTimeout = context.WithTimeout(attemptParent, eff.HTTPTimeout)
+		defer cancelTimeout()
 	}
-	// //////////////////  校验参数  end  ////////////////////////////////////////////////
+	// //////////////////  构造尝试级 ctx（http-timeout 总超时）  end  /////////////////////////
+
+	// //////////////////  挂载 read-timeout 看门狗  start  /////////////////////////////////////
+	// 看门狗与总超时并存、先到先取消：慢速但持续有数据时只有总超时能砍（读不进总窗口），
+	// 窗口内无任何新数据时看门狗先砍（cancel 本次尝试的 ctx）
+	wd := newProgressWatchdog(attemptParent, eff.ReadTimeout)
+	defer wd.Stop()
+	// //////////////////  挂载 read-timeout 看门狗  end  ///////////////////////////////////////
 
 	// //////////////////  构造上游请求  start  ////////////////////////////////////////////////
-	// 与客户端连接解耦（WithoutCancel）：首个客户端断开也不中断回源，
-	// 保证缓存填充与单飞等待方仍能拿到完整结果
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), timeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, urlStr, body)
+	req, err := http.NewRequestWithContext(wd.ctx, method, urlStr, body)
 	if err != nil {
 		return nil, fmt.Errorf("构造上游请求失败（%s）: %w", urlStr, err)
 	}
@@ -566,21 +680,25 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "proxy-cache/"+Version)
 	}
-	// //////////////////  构造上游请求  end  ////////////////////////////////////////////////
+	// //////////////////  构造上游请求  end  //////////////////////////////////////////////////
 
-	// //////////////////  发起请求并读取响应  start  ////////////////////////////////////////////////
-	resp, err := s.client(eff.HTTPProxy).Do(req)
+	// //////////////////  发起请求并读取响应  start  ////////////////////////////////////////////
+	resp, err := s.client(eff.HTTPProxy, eff.ConnectTimeout).Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("请求上游失败（%s）: %w", urlStr, err)
+		// 看门狗已触发时把错误标注为 read-timeout（与 http-timeout 到期的 deadline exceeded 区分）
+		return nil, fmt.Errorf("请求上游失败（%s）: %w", urlStr, wd.wrapErr(err))
 	}
+	wd.reset() // 响应头到达 = 一次进度（read-timeout 计时器重置）
 	defer resp.Body.Close()
 	// HEAD 响应天然无 body（不读 body 语义）：跳过读取，Body 保持为空，
 	// 状态码与响应头（含 Content-Length / Docker-Content-Digest 等）照常透传
 	var buf []byte
 	if method != http.MethodHead {
-		buf, err = io.ReadAll(resp.Body)
+		// 经 progressReader 读取：每收到 n>0 字节都算进度并重置看门狗，
+		// 慢速但持续传输的大 blob 不会被 read-timeout 误砍
+		buf, err = io.ReadAll(&progressReader{r: resp.Body, wd: wd})
 		if err != nil {
-			return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, err)
+			return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, wd.wrapErr(err))
 		}
 	}
 	// 深拷贝响应头，避免与连接复用的上游对象共享底层数据
@@ -588,7 +706,7 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	for k, vv := range resp.Header {
 		hdr[k] = append([]string(nil), vv...)
 	}
-	// //////////////////  发起请求并读取响应  end  ////////////////////////////////////////////////
+	// //////////////////  发起请求并读取响应  end  ////////////////////////////////////////////
 
 	entry := &cache.Entry{
 		Status:   resp.StatusCode,
@@ -604,8 +722,9 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	// 否则候选裸请求全被 401 拒绝、整轮轮询全败最终 502。触发条件（GET/HEAD 回源 + 上游
 	// 401 + Bearer 挑战）与失败兜底（沿用原始 401 响应）见 dockerAuthDance；
 	// 每个 doRequest 只 dance 一次，不循环（重试响应即使仍 401 也原样返回）。
+	// dance 全程共用本次尝试的看门狗（wd.ctx 受 http-timeout 与 read-timeout 共同约束）。
 	if resp.StatusCode == http.StatusUnauthorized && (method == http.MethodGet || method == http.MethodHead) {
-		if e2, ok := s.dockerAuthDance(ctx, s.client(eff.HTTPProxy), req, resp, urlStr); ok {
+		if e2, ok := s.dockerAuthDance(wd, s.client(eff.HTTPProxy, eff.ConnectTimeout), req, resp, urlStr); ok {
 			entry = e2 // 重试响应作为最终响应，继续既有的返回 Entry 语义
 		}
 	}
@@ -644,16 +763,19 @@ type bearerChallenge struct {
 // dockerAuthDance 尝试 Docker Registry 匿名 token dance（401 → 取 token → 带 Bearer 重试一次）。
 // 调用方（doRequest）已保证 method 为 GET/HEAD 且首个响应状态码为 401；此处再要求
 // WWW-Authenticate 含可解析的 Bearer 挑战（scheme 大小写不敏感且带 realm），否则放弃。
-//   - 取 token 走进程内缓存（见 dockerToken），客户端与 ctx 均沿用原请求（受同一 timeout 约束）；
+//   - 取 token 走进程内缓存（见 dockerToken），客户端沿用原请求；ctx 使用本次尝试的
+//     看门狗 ctx（wd.ctx），取 token 与带 token 重试同样受 http-timeout 约束，
+//     且 token 响应头/数据、重试响应头/数据都会重置 read-timeout 看门狗；
 //   - 取到 token 后复制原上游请求（同 method/URL，沿用原上游请求头）删除 Authorization
 //     后改为 Bearer 重试一次：重试响应按既有语义（深拷贝响应头 + 读 body）构建为 Entry
 //     返回（ok=true）；重试即使仍 401 也按该响应原样返回，不再 dance；
 //   - 挑战不可解析 / 取 token / 构造重试 / 重试失败时返回 ok=false，调用方沿用原始
 //     401 entry（行为与未实现 dance 的版本一致，绝不因 dance 引入新的失败路径）；
+//     看门狗触发（read-timeout）时失败日志经 wd.wrapErr 标注，便于日志辨认；
 //   - 确认 dance 触发后先把首个 401 响应 body 用 io.Copy(io.Discard, ...) 排干再 Close
 //    （GET 此前已读到 EOF、HEAD 天然无 body，这里是显式兜底），避免连接泄漏；
 //     调用方 defer 的重复 Close 对 http 响应体是幂等的，安全。
-func (s *Server) dockerAuthDance(ctx context.Context, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string) (*cache.Entry, bool) {
+func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string) (*cache.Entry, bool) {
 	// //////////////////  解析 Bearer 挑战  start  //////////////////////////////////////////////
 	var ch *bearerChallenge
 	for _, v := range resp.Header.Values("WWW-Authenticate") {
@@ -671,17 +793,18 @@ func (s *Server) dockerAuthDance(ctx context.Context, cl *http.Client, orig *htt
 	// //////////////////  解析 Bearer 挑战  end  ////////////////////////////////////////////////
 
 	// 排干首个 401 响应 body 并关闭：dance 触发后原响应不再复用，不排干会占住连接造成泄漏
-	_, _ = io.Copy(io.Discard, resp.Body) // body 已废弃，排干错误无补救动作
+	//（排干同样经 progressReader：读到数据即向看门狗报告进度）
+	_, _ = io.Copy(io.Discard, &progressReader{r: resp.Body, wd: wd}) // body 已废弃，排干错误无补救动作
 	_ = resp.Body.Close()
 
 	s.log.Info("触发 Docker Registry 匿名 token dance",
 		"url", truncate(urlStr, 300), "realm", ch.realm, "service", ch.service, "scope", ch.scope)
 
 	// //////////////////  取匿名 token（进程内缓存优先）  start  ///////////////////////////////
-	token, err := s.dockerToken(ctx, cl, ch)
+	token, err := s.dockerToken(wd, cl, ch)
 	if err != nil {
 		s.log.Warn("获取 Docker Registry 匿名 token 失败，按原始 401 响应返回",
-			"url", truncate(urlStr, 300), "realm", ch.realm, "err", err)
+			"url", truncate(urlStr, 300), "realm", ch.realm, "err", wd.wrapErr(err))
 		return nil, false
 	}
 	// //////////////////  取匿名 token（进程内缓存优先）  end  ///////////////////////////////////
@@ -689,7 +812,7 @@ func (s *Server) dockerAuthDance(ctx context.Context, cl *http.Client, orig *htt
 	// //////////////////  带 token 重试一次  start  /////////////////////////////////////////////
 	// 复制原请求（同 method/URL），头沿用原上游请求头：删除客户端 Authorization 后改为
 	// Bearer <token>（GET/HEAD 回源 body 恒为 nil，无需透传请求体）
-	req, err := http.NewRequestWithContext(ctx, orig.Method, urlStr, nil)
+	req, err := http.NewRequestWithContext(wd.ctx, orig.Method, urlStr, nil)
 	if err != nil {
 		s.log.Warn("构造匿名 token 重试请求失败，按原始 401 响应返回",
 			"url", truncate(urlStr, 300), "err", err)
@@ -702,18 +825,20 @@ func (s *Server) dockerAuthDance(ctx context.Context, cl *http.Client, orig *htt
 	resp2, err := cl.Do(req)
 	if err != nil {
 		s.log.Warn("带匿名 token 重试上游请求失败，按原始 401 响应返回",
-			"url", truncate(urlStr, 300), "token", maskToken(token), "err", err)
+			"url", truncate(urlStr, 300), "token", maskToken(token), "err", wd.wrapErr(err))
 		return nil, false
 	}
+	wd.reset() // 重试响应头到达 = 一次进度（read-timeout 计时器重置）
 	defer resp2.Body.Close()
 
-	// 重试响应按既有语义读取：HEAD 天然无 body 跳过，其余读全文；读取失败按重试失败兜底
+	// 重试响应按既有语义读取：HEAD 天然无 body 跳过，其余读全文（经 progressReader
+	// 每读到数据都重置看门狗）；读取失败按重试失败兜底（看门狗触发时标注 read-timeout）
 	var buf []byte
 	if orig.Method != http.MethodHead {
-		buf, err = io.ReadAll(resp2.Body)
+		buf, err = io.ReadAll(&progressReader{r: resp2.Body, wd: wd})
 		if err != nil {
 			s.log.Warn("读取匿名 token 重试响应失败，按原始 401 响应返回",
-				"url", truncate(urlStr, 300), "err", err)
+				"url", truncate(urlStr, 300), "err", wd.wrapErr(err))
 			return nil, false
 		}
 	}
@@ -736,7 +861,8 @@ func (s *Server) dockerAuthDance(ctx context.Context, cl *http.Client, orig *htt
 // dockerToken 返回挑战对应的匿名 token：优先命中进程内缓存（key = realm|service|scope，
 // 未过期直接复用，避免每个 blob 层都打一次 auth 端点），未命中或已过期才请求 realm
 // 换取新 token 并写回缓存（TTL = expires_in，>0 才用，否则缺省 60s）。
-func (s *Server) dockerToken(ctx context.Context, cl *http.Client, ch *bearerChallenge) (string, error) {
+// 请求 ctx 使用本次尝试的看门狗 ctx（wd.ctx）。
+func (s *Server) dockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge) (string, error) {
 	key := ch.realm + "|" + ch.service + "|" + ch.scope
 	now := time.Now()
 
@@ -752,7 +878,7 @@ func (s *Server) dockerToken(ctx context.Context, cl *http.Client, ch *bearerCha
 	}
 	s.dockerTokenMu.Unlock()
 
-	token, ttl, err := fetchDockerToken(ctx, cl, ch)
+	token, ttl, err := fetchDockerToken(wd, cl, ch)
 	if err != nil {
 		return "", err
 	}
@@ -770,9 +896,12 @@ func (s *Server) dockerToken(ctx context.Context, cl *http.Client, ch *bearerCha
 //     query 合并，已有键不覆盖；
 //   - 请求头仅 Accept: application/json 与固定 User-Agent（proxy-cache/<Version>），
 //     绝不携带客户端的 Authorization；
+//   - 请求 ctx 使用本次尝试的看门狗 ctx（wd.ctx）：token 响应头到达与 body 数据
+//     同样向看门狗报告进度（read-timeout 触发时错误标注 read-timeout）；
 //   - 响应 JSON 优先取 "token" 字段、为空再取 "access_token"，两者皆空视为失败；
 //     "expires_in"（秒，整数，>0 才生效）作为缓存 TTL，缺省 60s。
-func fetchDockerToken(ctx context.Context, cl *http.Client, ch *bearerChallenge) (string, time.Duration, error) {
+func fetchDockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge) (string, time.Duration, error) {
+	ctx := wd.ctx // 受本次尝试的 http-timeout 与 read-timeout 共同约束
 	u, err := url.Parse(ch.realm)
 	if err != nil {
 		return "", 0, fmt.Errorf("解析 token realm %q 失败: %w", ch.realm, err)
@@ -795,15 +924,16 @@ func fetchDockerToken(ctx context.Context, cl *http.Client, ch *bearerChallenge)
 
 	resp, err := cl.Do(req)
 	if err != nil {
-		return "", 0, fmt.Errorf("请求 token 端点失败（%s）: %w", u.String(), err)
+		return "", 0, fmt.Errorf("请求 token 端点失败（%s）: %w", u.String(), wd.wrapErr(err))
 	}
 	defer resp.Body.Close()
+	wd.reset() // token 响应头到达 = 一次进度（read-timeout 计时器重置）
 	if resp.StatusCode != http.StatusOK {
 		return "", 0, fmt.Errorf("token 端点返回异常状态码 %d（%s）", resp.StatusCode, u.String())
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, dockerTokenBodyLimit))
+	body, err := io.ReadAll(io.LimitReader(&progressReader{r: resp.Body, wd: wd}, dockerTokenBodyLimit))
 	if err != nil {
-		return "", 0, fmt.Errorf("读取 token 响应失败（%s）: %w", u.String(), err)
+		return "", 0, fmt.Errorf("读取 token 响应失败（%s）: %w", u.String(), wd.wrapErr(err))
 	}
 	var tok struct {
 		Token       string `json:"token"`
