@@ -59,7 +59,7 @@ func (rec *upstreamRecord) last() (string, string) {
 // match 为 hostRegex（对「http://<入站Host>/<目标>」整串匹配），规则级 url-redirect 为 templates。
 // cacheDir 非空时启用缓存（目录用 cacheDir，实例来自 caches 管理器）；
 // cacheDir 为空时显式关闭缓存，X-Cache 恒为 BYPASS、不落盘。
-func newRegistryServer(t *testing.T, hostRegex, cacheDir string, templates []string, caches *cache.Manager) *Server {
+func newRegistryServer(t *testing.T, hostRegex, cacheDir string, templates []config.URLRedirectItem, caches *cache.Manager) *Server {
 	t.Helper()
 	cfg := config.Default()
 	if cacheDir != "" {
@@ -102,7 +102,7 @@ func TestServeHTTPRegistryGetPathTarget(t *testing.T) {
 	s := newRegistryServer(t,
 		`http://registry-proxy-cache\.linkease\.net:5480/`,
 		"",
-		[]string{upstream.URL + "/$http.server.header.full_url_no_server"},
+		[]config.URLRedirectItem{{Template: upstream.URL + "/$http.server.header.full_url_no_server"}},
 		nil)
 
 	r := httptest.NewRequest(http.MethodGet,
@@ -154,7 +154,7 @@ func TestServeHTTPRegistryHeadPathTarget(t *testing.T) {
 	s := newRegistryServer(t,
 		`http://registry-proxy-cache\.linkease\.net:5480/`,
 		"",
-		[]string{upstream.URL + "/$http.server.header.full_url_no_server"},
+		[]config.URLRedirectItem{{Template: upstream.URL + "/$http.server.header.full_url_no_server"}},
 		nil)
 
 	r := httptest.NewRequest(http.MethodHead,
@@ -195,7 +195,7 @@ func TestServeHTTPRegistryPathTargetNoRule(t *testing.T) {
 	s := newRegistryServer(t,
 		`http://registry-proxy-cache\.linkease\.net:5480/`, // 只命中 docker 入站 Host
 		"",
-		[]string{upstream.URL + "/$http.server.header.full_url_no_server"},
+		[]config.URLRedirectItem{{Template: upstream.URL + "/$http.server.header.full_url_no_server"}},
 		nil)
 
 	// 入站 Host 不命中规则的路径目标请求
@@ -228,7 +228,7 @@ func TestServeHTTPRegistryPathTargetPostRejected(t *testing.T) {
 	s := newRegistryServer(t,
 		`http://registry-proxy-cache\.linkease\.net:5480/`,
 		"",
-		[]string{upstream.URL + "/$http.server.header.full_url_no_server"},
+		[]config.URLRedirectItem{{Template: upstream.URL + "/$http.server.header.full_url_no_server"}},
 		nil)
 
 	r := httptest.NewRequest(http.MethodPost,
@@ -257,7 +257,7 @@ func TestServeHTTPRegistryPathTargetNoDirectFallback(t *testing.T) {
 	s := newRegistryServer(t,
 		`http://registry-proxy-cache\.linkease\.net:5480/`,
 		"",
-		[]string{upstream.URL + "/$http.server.header.full_url_no_server"},
+		[]config.URLRedirectItem{{Template: upstream.URL + "/$http.server.header.full_url_no_server"}},
 		nil) // Default 的 fallback-direct=true
 
 	r := httptest.NewRequest(http.MethodGet,
@@ -296,7 +296,7 @@ func TestServeHTTPRegistryCacheKeyIncludesHost(t *testing.T) {
 	s := newRegistryServer(t,
 		`http://registry-[ab]\.example\.com/`, // 同时覆盖 registry-a / registry-b 两个入站 Host
 		t.TempDir(),
-		[]string{upstream.URL + "/$http.server.header.full_url_no_server"},
+		[]config.URLRedirectItem{{Template: upstream.URL + "/$http.server.header.full_url_no_server"}},
 		mgr)
 
 	do := func(method, host string) *httptest.ResponseRecorder {

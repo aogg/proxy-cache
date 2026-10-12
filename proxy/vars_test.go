@@ -14,6 +14,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"proxy-cache/config"
 )
 
 // 规格示例里的入站 Host 与目标（来自 docker / github 真实使用场景，仅用于构造请求，不出网）。
@@ -185,23 +187,29 @@ func TestExpandCandidates(t *testing.T) {
 			if tt.useTLS {
 				r.TLS = &tls.ConnectionState{} // 模拟 TLS 入站（影响 scheme 推断）
 			}
-			got := ExpandCandidates(tt.templates, NewRequestVars(r, tt.target))
+			// 适配：url-redirect 候选现为对象列表（string 模板 -> URLRedirectItem.Template），
+			// 展开行为（占位符替换/斜杠接缝去重）与断言语义不变
+			items := make([]config.URLRedirectItem, len(tt.templates))
+			for i, tpl := range tt.templates {
+				items[i] = config.URLRedirectItem{Template: tpl}
+			}
+			got := ExpandCandidates(items, NewRequestVars(r, tt.target), config.Options{})
 			if len(got) != len(tt.want) {
 				t.Fatalf("ExpandCandidates() 返回 %d 个候选, want %d（got: %v）", len(got), len(tt.want), got)
 			}
 			for i := range tt.want {
-				if got[i] != tt.want[i] {
-					t.Errorf("候选[%d] = %q, want 逐字符相等 %q\n模板: %q", i, got[i], tt.want[i], tt.templates[i])
+				if got[i].url != tt.want[i] {
+					t.Errorf("候选[%d] = %q, want 逐字符相等 %q\n模板: %q", i, got[i].url, tt.want[i], tt.templates[i])
 				}
 			}
 		})
 	}
 }
 
-// TestExpandCandidatesEmpty 验证空模板列表返回 nil（无候选）。
+// TestExpandCandidatesEmpty 验证空候选列表返回 nil（无候选）。
 func TestExpandCandidatesEmpty(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "http://h.example.com/v2/x", nil)
-	if got := ExpandCandidates(nil, NewRequestVars(r, "v2/x")); got != nil {
+	if got := ExpandCandidates(nil, NewRequestVars(r, "v2/x"), config.Options{}); got != nil {
 		t.Errorf("ExpandCandidates(nil, ...) = %v, want nil", got)
 	}
 }

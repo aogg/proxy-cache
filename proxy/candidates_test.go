@@ -32,7 +32,7 @@ func quietLogger() *slog.Logger {
 
 // newCandidatesServer 构建已校验配置（全局 url-redirect=templates、指定 fallback-direct）
 // 且禁用缓存的 Server。
-func newCandidatesServer(t *testing.T, templates []string, fallbackDirect bool) *Server {
+func newCandidatesServer(t *testing.T, templates []config.URLRedirectItem, fallbackDirect bool) *Server {
 	t.Helper()
 	cfg := config.Default()
 	cfg.URLRedirect = templates
@@ -83,7 +83,7 @@ func TestFetchViaCandidatesFirstHit(t *testing.T) {
 	upstream := contentUpstream(t)
 	defer upstream.Close()
 
-	s := newCandidatesServer(t, []string{upstream.URL + "/$1"}, true)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: upstream.URL + "/$1"}}, true)
 	e, src, err := fetchVia(t, s, candidatesTargetURL)
 	if err != nil {
 		t.Fatalf("fetchViaCandidates() 意外报错: %v", err)
@@ -108,7 +108,7 @@ func TestFetchViaCandidatesRotatesToNext(t *testing.T) {
 	good := contentUpstream(t)
 	defer good.Close()
 
-	s := newCandidatesServer(t, []string{bad.URL + "/$1", good.URL + "/$1"}, true)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: bad.URL + "/$1"}, {Template: good.URL + "/$1"}}, true)
 	e, src, err := fetchVia(t, s, candidatesTargetURL)
 	if err != nil {
 		t.Fatalf("fetchViaCandidates() 意外报错: %v", err)
@@ -129,7 +129,7 @@ func TestFetchViaCandidatesRoundRobinStartIndex(t *testing.T) {
 	up2 := contentUpstream(t)
 	defer up2.Close()
 
-	s := newCandidatesServer(t, []string{up1.URL + "/$1", up2.URL + "/$1"}, true)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: up1.URL + "/$1"}, {Template: up2.URL + "/$1"}}, true)
 
 	for i, want := range []*httptest.Server{up1, up2} {
 		_, src, err := fetchVia(t, s, candidatesTargetURL)
@@ -151,7 +151,7 @@ func TestFetchViaCandidatesFallbackDirect(t *testing.T) {
 	defer good.Close()
 
 	t.Run("开启时回退直连原始URL", func(t *testing.T) {
-		s := newCandidatesServer(t, []string{bad.URL + "/$1"}, true)
+		s := newCandidatesServer(t, []config.URLRedirectItem{{Template: bad.URL + "/$1"}}, true)
 		// 目标 URL 直接指向必成功的假上游：候选必失败，直连必成功，结果可断言
 		target := good.URL + "/file.yaml"
 		e, src, err := fetchVia(t, s, target)
@@ -167,7 +167,7 @@ func TestFetchViaCandidatesFallbackDirect(t *testing.T) {
 	})
 
 	t.Run("关闭时全部失败返回错误", func(t *testing.T) {
-		s := newCandidatesServer(t, []string{bad.URL + "/$1"}, false)
+		s := newCandidatesServer(t, []config.URLRedirectItem{{Template: bad.URL + "/$1"}}, false)
 		_, _, err := fetchVia(t, s, candidatesTargetURL)
 		if err == nil {
 			t.Fatal("fetchViaCandidates() 期望报错（全部候选失败且关闭回退直连），实际为 nil")
@@ -261,7 +261,7 @@ func TestConditionalHeadersNotForwarded(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	s := newCandidatesServer(t, []string{upstream.URL + "/$1"}, true)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: upstream.URL + "/$1"}}, true)
 
 	// 客户端带全量条件请求头 + Range 发起代理请求
 	r := httptest.NewRequest(http.MethodGet, "/"+candidatesTargetURL, nil)

@@ -53,7 +53,7 @@ type candidateOutcome struct {
 //
 // 轮询起始下标沿用全局 rr 计数器（round-robin 语义不变，每个请求 +1）；
 // 请求方法沿用入站方法（GET/HEAD），Range 透传与否由成功判据（probePassed）处理。
-func (s *Server) selectCandidate(r *http.Request, candidates []string, eff config.Options) (*probeResult, error) {
+func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff config.Options) (*probeResult, error) {
 	n := len(candidates)
 	// //////////////////  轮询起始下标：第 1 次请求从 0 开始，之后逐次 +1  start  ////////
 	start := int(s.rr.Add(1)-1) % n
@@ -62,11 +62,11 @@ func (s *Server) selectCandidate(r *http.Request, candidates []string, eff confi
 
 	// //////////////////  轮询展开明细日志  start  ////////////////////////////////////////////////
 	// 与旧版一致：按「本轮实际尝试顺序」输出每个候选的模板与展开后 URL，并给出本轮
-	// round-robin 起始下标（0 基，指向模板列表下标）。Info 级保证默认日志级别下可见。
+	// round-robin 起始下标（0 基，指向候选对象列表下标）。Info 级保证默认日志级别下可见。
 	details := make([]string, 0, n)
 	for i := range candidates {
-		idx := (start + i) % n // 该候选在模板列表中的原始下标
-		details = append(details, fmt.Sprintf("模板[%d] %s -> %s", idx, eff.URLRedirect[idx], candidates[idx]))
+		idx := (start + i) % n // 该候选在候选对象列表中的原始下标
+		details = append(details, fmt.Sprintf("模板[%d] %s -> %s", idx, eff.URLRedirect[idx].Template, candidates[idx].url))
 	}
 	s.log.Info("url-redirect 轮询展开", "start_index", start,
 		"count", n, "candidates", details)
@@ -97,9 +97,9 @@ func (s *Server) selectCandidate(r *http.Request, candidates []string, eff confi
 	// 探测结果（流结束后释放），失败/被取消时自行回收。
 	// roundNo 为轮次（1 基，值传递避免与主循环共享变量产生数据竞争）。
 	runCandidate := func(slot, roundNo int, ctx context.Context, cancel context.CancelFunc) {
-		idx := (start + slot) % n // 该候选在模板列表中的原始下标
-		cand := candidates[idx]
-		tpl := eff.URLRedirect[idx]
+		idx := (start + slot) % n // 该候选在候选对象列表中的原始下标
+		cand := candidates[idx]   // 含该候选生效的 insecure-skip-verify
+		tpl := eff.URLRedirect[idx].Template
 		handOff := false // 胜出后取消权已移交给 probeResult
 		defer func() {
 			if !handOff {
@@ -112,7 +112,7 @@ func (s *Server) selectCandidate(r *http.Request, candidates []string, eff confi
 			if rec := recover(); rec != nil && !handOff {
 				s.log.Error("url-redirect 候选尝试 panic，已按该候选失败处理",
 					"round", roundNo, "round_total", totalRounds,
-					"index", idx, "template", tpl, "candidate", cand, "panic", rec)
+					"index", idx, "template", tpl, "candidate", cand.url, "panic", rec)
 				done <- candidateOutcome{err: fmt.Errorf("候选尝试 panic: %v", rec), slot: slot}
 			}
 		}()
@@ -124,7 +124,7 @@ func (s *Server) selectCandidate(r *http.Request, candidates []string, eff confi
 			s.log.Debug("尝试 url-redirect 候选",
 				"round", roundNo, "round_total", totalRounds,
 				"attempt", attempt, "attempt_total", itemTotalAttempts,
-				"index", idx, "template", tpl, "candidate", cand)
+				"index", idx, "template", tpl, "candidate", cand.url)
 			candStart := time.Now()
 			res, err, hard, hardReason := s.probeCandidateAttempt(ctx, r, cand, eff)
 			cost := time.Since(candStart).Round(time.Millisecond)
@@ -132,20 +132,20 @@ func (s *Server) selectCandidate(r *http.Request, candidates []string, eff confi
 				if ctx.Err() != nil {
 					// 被取消导致的失败（其他候选胜出/预算到期）：降为 Debug，避免噪音
 					s.log.Debug("url-redirect 候选已取消（其他候选胜出或扫描预算到期）",
-						"index", idx, "template", tpl, "candidate", cand)
+						"index", idx, "template", tpl, "candidate", cand.url)
 					break
 				}
 				candLast = err
 				s.log.Warn("url-redirect 候选请求失败",
 					"round", roundNo, "round_total", totalRounds,
 					"attempt", attempt, "attempt_total", itemTotalAttempts,
-					"index", idx, "template", tpl, "candidate", cand,
+					"index", idx, "template", tpl, "candidate", cand.url,
 					"cost", cost.String(), "err", err)
 				if hard {
 					s.log.Warn("url-redirect 候选硬失败，跳过原地重试直接下一候选",
 						"round", roundNo, "round_total", totalRounds,
 						"attempt", attempt, "attempt_total", itemTotalAttempts,
-						"index", idx, "template", tpl, "candidate", cand,
+						"index", idx, "template", tpl, "candidate", cand.url,
 						"hard_fail", hardReason)
 					break
 				}
@@ -156,21 +156,21 @@ func (s *Server) selectCandidate(r *http.Request, candidates []string, eff confi
 					hard, hardReason = true, hr
 				}
 				candLast = fmt.Errorf("候选 %s 未通过 success-check=%s（状态码 %d，body %d 字节）",
-					cand, eff.SuccessCheck, res.status, len(res.first))
+					cand.url, eff.SuccessCheck, res.status, len(res.first))
 				if hard {
 					candLast = fmt.Errorf("%w（hard-fail: %s）", candLast, hardReason)
 				}
 				s.log.Warn("url-redirect 候选未通过成功判据",
 					"round", roundNo, "round_total", totalRounds,
 					"attempt", attempt, "attempt_total", itemTotalAttempts,
-					"index", idx, "template", tpl, "candidate", cand,
+					"index", idx, "template", tpl, "candidate", cand.url,
 					"check", eff.SuccessCheck, "status", res.status, "body_bytes", len(res.first))
 				res.Close()
 				if hard {
 					s.log.Warn("url-redirect 候选硬失败，跳过原地重试直接下一候选",
 						"round", roundNo, "round_total", totalRounds,
 						"attempt", attempt, "attempt_total", itemTotalAttempts,
-						"index", idx, "template", tpl, "candidate", cand,
+						"index", idx, "template", tpl, "candidate", cand.url,
 						"hard_fail", hardReason)
 					break
 				}
@@ -180,7 +180,7 @@ func (s *Server) selectCandidate(r *http.Request, candidates []string, eff confi
 			s.log.Info("url-redirect 候选命中并作为最终返回",
 				"round", roundNo, "round_total", totalRounds,
 				"attempt", attempt, "attempt_total", itemTotalAttempts,
-				"index", idx, "template", tpl, "candidate", cand, "status", res.status,
+				"index", idx, "template", tpl, "candidate", cand.url, "status", res.status,
 				"bytes", len(res.first), "cost", cost.String())
 			res.onClose(cancel) // 该候选 ctx 的回收随流结束/放弃执行
 			handOff = true

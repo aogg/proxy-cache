@@ -71,6 +71,23 @@ success-check: content
 fallback-direct: true
 
 # ----------------------------------------------------------------------------
+# 忽略 TLS 证书校验（insecure-skip-verify）：三级优先级从高到低
+#   1. url-redirect 候选对象内 insecure-skip-verify（见下方 url-redirect 对象写法）
+#   2. domain-rules 规则级 insecure-skip-verify（见 domain-rules 可选覆盖项）
+#   3. 全局 insecure-skip-verify（本项）
+# 候选最终生效值 = 候选显式值 ?? 规则显式值 ?? 全局值
+# ----------------------------------------------------------------------------
+# 典型场景：镜像站证书链不全（候选探测报 tls: failed to verify certificate:
+# x509: certificate signed by unknown authority，每轮候选重试全部烧在证书错误上）、
+# 内网自签证书的上游
+# 安全代价：开启后该路径上的所有上游连接都跳过证书校验（连接仍加密，但无法确认
+# 对端身份）——包括 30x 重定向目标（如 1ms.run -> cloudfront）、token dance 的
+# 取 token 与带 token 重试、fallback 直连。等于关闭该路径的服务端身份验证与
+# 防中间人/窃听保护，仅建议按需开启；推荐对个别镜像站用「候选级」精确开启，
+# 而非打开规则级/全局开关
+#insecure-skip-verify: false
+
+# ----------------------------------------------------------------------------
 # url-redirect 候选失败重试（全局与 domain-rules 规则级都可配，规则覆盖全局；
 # 未配置 = 0，即不重试，行为与旧版一致）
 # ----------------------------------------------------------------------------
@@ -118,7 +135,12 @@ fallback-direct: true
 #                             提前终止并 502，docker 客户端会自行重试该层
 #url-redirect-hedge-delay: 2s
 
-# url-redirect：回源镜像/上游代理模板列表
+# url-redirect：回源镜像/上游代理候选列表（对象数组，破坏性变更：不再支持旧版纯字符串写法，
+# 解析期报错并给出迁移示例；候选对象支持字段见下方示例与 README「url-redirect 候选对象」小节）
+# 候选对象字段：
+#   template               必填非空，即旧版的模板字符串，占位符语义不变
+#   insecure-skip-verify   可选（bool），候选级「忽略 TLS 证书校验」，仅对该候选生效
+#                          （优先级高于规则级/全局；省略 = 继承规则级，再继承全局）
 # 模板占位符（每个变量均支持 $name 与 ${name} 两种写法，每个模板至少包含一个，启动时校验）：
 #   $1 / ${1} —— 目标串（兼容保留）：
 #       完整 URL 请求 = 目标 URL 原文，如
@@ -145,9 +167,12 @@ fallback-direct: true
 # 候选失败的重试（单候选原地重试 / 整轮全败重试）见 url-redirect-item-error-retry 与
 # url-redirect-all-error-retry；候选全部失败时按 fallback-direct 处理（路径目标请求无直连回退）
 url-redirect:
-  - https://hk.gh-proxy.org/$1
-  - https://gh-proxy.com/$1
-  - https://mirror.ghproxy.com/$1
+  - template: https://hk.gh-proxy.org/$1
+  - template: https://gh-proxy.com/$1
+  - template: https://mirror.ghproxy.com/$1
+  # 仅某个候选证书不受信时精确开启（省略则继承规则级/全局配置）：
+  # - template: https://docker.actima.top/$http.server.header.full_url_no_server
+  #   insecure-skip-verify: true
 
 # 缓存配置
 # 注意：整块注释掉 cache: 并不等于关闭缓存！未配置时启用内置默认值
@@ -206,6 +231,8 @@ domain-rules:
     # http-proxy: "http://127.0.0.1:7890"   # 该规则的回源走指定代理
     # success-check: status                  # 该规则 200 即算成功
     # fallback-direct: false                 # 候选全败时不回退直连
+    # insecure-skip-verify: false            # 该规则忽略 TLS 证书校验（覆盖全局；url-redirect
+    #                                        # 候选对象内的显式值优先级更高；安全代价见顶部全局说明）
     # ---- 超时覆盖（规则没配的字段沿用全局；含义见顶部全局说明） ----
     # http-timeout: 120s                     # 该规则单次上游尝试的总超时
     # read-timeout: 60s                      # 该规则无新增数据超时（idle）
@@ -218,7 +245,7 @@ domain-rules:
     # url-redirect-probe-timeout: 5s         # 该规则单次候选尝试的探测预算（0=不限制）
     # url-redirect-hedge-delay: 2s           # 该规则候选阶梯竞速的放行间隔（0=纯串行）
     # url-redirect:                          # 该规则专用候选列表（设为 [] 表示该规则直连回源）
-    #   - https://gh-proxy.com/$1
+    #   - template: https://gh-proxy.com/$1
 
   - name: github-release
     match: 'github\.com/[^/]+/[^/]+/releases/download/'
@@ -274,11 +301,15 @@ domain-rules:
   #   url-redirect-hedge-delay: 2s       # 候选阶梯竞速：每 2s 放行下一个候选并发探测，先过判据者胜出
   #   url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次（硬失败跳过）
   #   url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
-  #   url-redirect:              # 多镜像站候选轮询，均用 full_url_no_server 拼回源路径
-  #     - https://docker.1panel.live/$http.server.header.full_url_no_server
-  #     - https://hub.rat.dev/$http.server.header.full_url_no_server
-  #     - https://docker.m.daocloud.io/$http.server.header.full_url_no_server
-  #     - https://docker.1ms.run/$http.server.header.full_url_no_server
+  #   url-redirect:              # 多镜像站候选轮询（对象数组），均用 full_url_no_server 拼回源路径；
+  #                              # 候选级 insecure-skip-verify 仅对该候选生效（三级优先级最高，
+  #                              # 适合个别镜像站证书链不全的情况，如 actima）
+  #     - template: https://docker.1panel.live/$http.server.header.full_url_no_server
+  #     - template: https://hub.rat.dev/$http.server.header.full_url_no_server
+  #     - template: https://docker.m.daocloud.io/$http.server.header.full_url_no_server
+  #     - template: https://docker.1ms.run/$http.server.header.full_url_no_server
+  #     - template: https://docker.actima.top/$http.server.header.full_url_no_server
+  #       insecure-skip-verify: true   # 仅这个镜像站证书不受信，候选级精确开启
 
 # 允许/拒绝列表（正则，优先级高于缓存与回源）：完整 URL 请求对目标 URL 匹配；
 # 路径目标请求对「http://<入站Host>/<路径目标>」整串匹配（保持拦截能力）

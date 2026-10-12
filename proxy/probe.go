@@ -158,8 +158,12 @@ func probeHardFailReason(res *probeResult) string {
 //   - read-timeout：无新增数据看门狗（progressWatchdog），探测与读 body 全程生效，
 //     慢速但持续传输不会被误砍；
 //   - connect-timeout：建连（TCP 拨号 + TLS 握手），落在 (代理, connect-timeout) 组合
-//     的 Transport 上（与既有 client() 复用逻辑一致）。
-func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, urlStr string, eff config.Options) (res *probeResult, err error, hard bool, hardReason string) {
+//     的 Transport 上（与既有 client() 复用逻辑一致）；
+//   - insecure-skip-verify（候选级三级生效值，随 cand 传入）：true 时该次尝试走
+//     insecure 专属 http.Client（TLSClientConfig.InsecureSkipVerify=true），该候选路径
+//     上的所有连接——含 30x 重定向目标与 token dance 的第二次请求——都跳过证书校验。
+func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, cand candidate, eff config.Options) (res *probeResult, err error, hard bool, hardReason string) {
+	urlStr := cand.url // 候选最终 URL（占位符展开后）
 	// //////////////////  http-timeout（整次尝试总预算）  start  //////////////////////////////
 	// 与客户端连接解耦由上层 ctx（WithoutCancel）保证；这里的总预算不能 defer cancel——
 	// 活体 body 在本函数返回后仍需存活，预算取消链注册进 probeResult 由 Close 统一触发。
@@ -221,7 +225,9 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 	}
 	applyForwardRequestHeaders(req, r)
 
-	cl := s.client(eff.HTTPProxy, eff.ConnectTimeout)
+	// 按该候选生效的 insecure-skip-verify 选择客户端（true = 跳过上游证书校验，
+	// 同一 (代理, connect-timeout, insecure) 组合复用同一 Client，连接复用不受影响）
+	cl := s.client(eff.HTTPProxy, eff.ConnectTimeout, cand.insecureSkipVerify)
 	resp, err := cl.Do(req)
 	if err != nil {
 		err = fmt.Errorf("请求上游失败（%s）: %w", urlStr, wd.wrapErr(err))

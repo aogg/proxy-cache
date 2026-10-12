@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,14 +43,20 @@ var forwardRequestHeaders = []string{
 	"Content-Type", "Range", "User-Agent",
 }
 
-// upstreamClientKey 标识一个可复用的上游 http.Client 组合：上游代理地址 + 建连超时。
-// connect-timeout 进入 Transport 的拨号/TLS 握手超时，不同值必须各一个 Transport；
+// upstreamClientKey 标识一个可复用的上游 http.Client 组合：上游代理地址 + 建连超时 +
+// 忽略证书校验。connect-timeout 进入 Transport 的拨号/TLS 握手超时，insecure 进入
+// Transport 的 TLSClientConfig，不同值必须各一个 Transport；
 // 相同组合共享同一 Client/Transport，保证连接复用不被破坏。
 type upstreamClientKey struct {
 	// proxy 上游代理地址（空串 = 直连）。
 	proxy string
 	// connectTimeout 建连超时（0 = 不限制）。
 	connectTimeout time.Duration
+	// insecure 跳过上游 TLS 证书校验（insecure-skip-verify 的生效值）：
+	// true 时 TLSClientConfig.InsecureSkipVerify=true——该客户端内的所有上游连接
+	//（含 30x 重定向目标如 1ms.run→cloudfront、token dance 的第二次请求）都跳过校验，
+	// 这正是「信任该候选/规则/全局配置所指向的上游」的语义。
+	insecure bool
 }
 
 // Server 是代理服务 HTTP 处理器，实现 http.Handler。
@@ -87,12 +94,15 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	s := &Server{cfg: cfg, caches: caches, log: logger, dockerTokens: make(map[string]dockerTokenEntry)}
 
 	// 预构建全局与各域名规则可能用到的 (上游代理, connect-timeout) 组合客户端：
-	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建
-	comboSet := map[upstreamClientKey]struct{}{
+	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建。
+	// insecure-skip-verify 维度：insecure=false 变体始终构建；仅当配置里存在任一 true
+	//（全局 flag / 规则 flag / 候选 item flag）时，才为每个组合额外预构建 insecure=true
+	// 变体（无任何 insecure 配置时不建多余的 Transport）。
+	baseCombos := map[upstreamClientKey]struct{}{
 		{proxy: "", connectTimeout: cfg.GlobalConnectTimeout()}: {},
 	}
 	if p := strings.TrimSpace(cfg.HTTPProxy); p != "" {
-		comboSet[upstreamClientKey{proxy: p, connectTimeout: cfg.GlobalConnectTimeout()}] = struct{}{}
+		baseCombos[upstreamClientKey{proxy: p, connectTimeout: cfg.GlobalConnectTimeout()}] = struct{}{}
 	}
 	for i := range cfg.DomainRules {
 		r := &cfg.DomainRules[i]
@@ -104,18 +114,58 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 		if r.ConnectTimeout != nil {
 			ct = r.ConnectTimeout.D()
 		}
-		comboSet[upstreamClientKey{proxy: proxy, connectTimeout: ct}] = struct{}{}
+		baseCombos[upstreamClientKey{proxy: proxy, connectTimeout: ct}] = struct{}{}
+	}
+	comboSet := make(map[upstreamClientKey]struct{}, 2*len(baseCombos))
+	anyInsecure := configHasInsecureSkipVerify(cfg)
+	for c := range baseCombos {
+		comboSet[c] = struct{}{} // insecure=false 恒预构建
+		if anyInsecure {
+			inc := c
+			inc.insecure = true
+			comboSet[inc] = struct{}{}
+		}
 	}
 	s.clients = make(map[upstreamClientKey]*http.Client, len(comboSet))
 	for c := range comboSet {
-		cl, err := buildHTTPClient(c.proxy, c.connectTimeout)
+		cl, err := buildHTTPClient(c.proxy, c.connectTimeout, c.insecure)
 		if err != nil {
-			return nil, fmt.Errorf("预构建上游客户端失败（proxy=%q connect-timeout=%s）: %w",
-				c.proxy, c.connectTimeout, err)
+			return nil, fmt.Errorf("预构建上游客户端失败（proxy=%q connect-timeout=%s insecure=%v）: %w",
+				c.proxy, c.connectTimeout, c.insecure, err)
 		}
 		s.clients[c] = cl
 	}
 	return s, nil
+}
+
+// configHasInsecureSkipVerify 扫描配置里是否存在任一「忽略 TLS 证书校验」的开启：
+// 全局 insecure-skip-verify、任一域名规则的 insecure-skip-verify 或任一候选对象的
+// insecure-skip-verify 显式 true（候选/规则的 nil = 继承下一级，不算显式开启）。
+// 供 New 决定是否需要预构建 insecure=true 客户端变体。
+func configHasInsecureSkipVerify(cfg *config.Config) bool {
+	if cfg.InsecureSkipVerify {
+		return true
+	}
+	for i := range cfg.DomainRules {
+		r := &cfg.DomainRules[i]
+		if r.InsecureSkipVerify != nil && *r.InsecureSkipVerify {
+			return true
+		}
+		if r.URLRedirect == nil {
+			continue
+		}
+		for _, item := range *r.URLRedirect {
+			if item.InsecureSkipVerify != nil && *item.InsecureSkipVerify {
+				return true
+			}
+		}
+	}
+	for _, item := range cfg.URLRedirect {
+		if item.InsecureSkipVerify != nil && *item.InsecureSkipVerify {
+			return true
+		}
+	}
+	return false
 }
 
 // newUpstreamDialer 构建上游拨号器：connect-timeout 用于 TCP 拨号超时（0 = 不限制）。
@@ -123,12 +173,12 @@ func newUpstreamDialer(connectTimeout time.Duration) *net.Dialer {
 	return &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 }
 
-// buildHTTPClient 构建指定上游代理（空串=直连）与建连超时的 http.Client：
+// buildHTTPClient 构建指定上游代理（空串=直连）、建连超时与忽略证书校验的 http.Client：
 // connect-timeout 同时用于 TCP 拨号与 TLS 握手，0 = 不设超时（不限制，
-// 旧版硬编码的 10s 建连/TLS 超时已被该模型取代）。相同 (代理, connect-timeout)
+// 旧版硬编码的 10s 建连/TLS 超时已被该模型取代）。相同 (代理, connect-timeout, insecure)
 // 组合应共享同一 Client 实例（见 Server.client），保证连接复用不被破坏。
-func buildHTTPClient(proxyAddr string, connectTimeout time.Duration) (*http.Client, error) {
-	tr, err := newUpstreamTransport(proxyAddr, connectTimeout)
+func buildHTTPClient(proxyAddr string, connectTimeout time.Duration, insecureSkipVerify bool) (*http.Client, error) {
+	tr, err := newUpstreamTransport(proxyAddr, connectTimeout, insecureSkipVerify)
 	if err != nil {
 		return nil, err
 	}
@@ -136,8 +186,11 @@ func buildHTTPClient(proxyAddr string, connectTimeout time.Duration) (*http.Clie
 }
 
 // newUpstreamTransport 构建上游 Transport：独立成函数便于测试直接检视
-// connect-timeout 是否正确落到拨号器与 TLS 握手超时上。
-func newUpstreamTransport(proxyAddr string, connectTimeout time.Duration) (*http.Transport, error) {
+// connect-timeout 是否正确落到拨号器与 TLS 握手超时上、insecure 是否落到 TLSClientConfig。
+// insecureSkipVerify=true 时设置 TLSClientConfig.InsecureSkipVerify=true：该 Transport 上的
+// 所有上游连接（含 30x 重定向目标与 token dance 的第二次请求）都跳过 TLS 证书校验，
+// 即「信任该上游路径」的显式语义（insecure-skip-verify 配置生效的落地点）。
+func newUpstreamTransport(proxyAddr string, connectTimeout time.Duration, insecureSkipVerify bool) (*http.Transport, error) {
 	tr := &http.Transport{
 		// TCP 拨号与 TLS 握手共用 connect-timeout；0 值在 net.Dialer 与
 		// TLSHandshakeTimeout 的语义即为无超时（不限制）
@@ -148,6 +201,9 @@ func newUpstreamTransport(proxyAddr string, connectTimeout time.Duration) (*http
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   connectTimeout,
 		ExpectContinueTimeout: time.Second,
+	}
+	if insecureSkipVerify {
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	if proxyAddr != "" {
 		u, err := url.Parse(proxyAddr)
@@ -162,10 +218,10 @@ func newUpstreamTransport(proxyAddr string, connectTimeout time.Duration) (*http
 	return tr, nil
 }
 
-// client 返回（上游代理, connect-timeout）组合对应的 Client：New 已预构建配置内
+// client 返回（上游代理, connect-timeout, insecure）组合对应的 Client：New 已预构建配置内
 // 全部组合，这里对防御性遗漏的组合惰性补建并缓存（同一组合只建一次，连接复用不受影响）。
-func (s *Server) client(proxyAddr string, connectTimeout time.Duration) *http.Client {
-	key := upstreamClientKey{proxy: proxyAddr, connectTimeout: connectTimeout}
+func (s *Server) client(proxyAddr string, connectTimeout time.Duration, insecureSkipVerify bool) *http.Client {
+	key := upstreamClientKey{proxy: proxyAddr, connectTimeout: connectTimeout, insecure: insecureSkipVerify}
 	s.clientsMu.Lock()
 	defer s.clientsMu.Unlock()
 	if cl, ok := s.clients[key]; ok && cl != nil {
@@ -173,14 +229,15 @@ func (s *Server) client(proxyAddr string, connectTimeout time.Duration) *http.Cl
 	}
 	// 防御分支：代理地址已在配置校验/启动预构建阶段验证过，正常不会走到这里；
 	// 补建失败兜底直连客户端，绝不让请求因客户端构建问题而 panic
-	cl, err := buildHTTPClient(proxyAddr, connectTimeout)
+	cl, err := buildHTTPClient(proxyAddr, connectTimeout, insecureSkipVerify)
 	if err != nil {
 		s.log.Error("惰性构建上游客户端失败，兜底直连客户端",
-			"proxy", proxyAddr, "connect_timeout", connectTimeout.String(), "err", err)
+			"proxy", proxyAddr, "connect_timeout", connectTimeout.String(),
+			"insecure", insecureSkipVerify, "err", err)
 		if direct, ok := s.clients[upstreamClientKey{}]; ok && direct != nil {
 			cl = direct
 		} else {
-			cl, _ = buildHTTPClient("", 0)
+			cl, _ = buildHTTPClient("", 0, false)
 		}
 	}
 	s.clients[key] = cl
@@ -577,7 +634,7 @@ func (s *Server) cacheFor(eff config.Options) (*cache.Cache, error) {
 //  4. 所有轮次都失败时，完整 URL 目标按 fallback-direct 决定是否回退直连原始 URL；
 //     路径目标没有完整原始 URL 可直连，fallback-direct 不适用，一律直接报错（无直连回退）。
 func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.Options) (*cache.Entry, error) {
-	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target))
+	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target), eff)
 	if len(candidates) == 0 {
 		if !isFullURLTarget(target) {
 			// 防御分支：handleProxy 已拦截「路径目标未配置 url-redirect」，此处兜底绝不直连
@@ -710,7 +767,9 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	// //////////////////  构造上游请求  end  //////////////////////////////////////////////////
 
 	// //////////////////  发起请求并读取响应  start  ////////////////////////////////////////////
-	resp, err := s.client(eff.HTTPProxy, eff.ConnectTimeout).Do(req)
+	// 直连回退/直连透传路径的 insecure 按「规则 ?? 全局」生效值（eff.InsecureSkipVerify）
+	// 执行：30x 重定向目标与下方 token dance 共用同一 Client，一并跳过证书校验
+	resp, err := s.client(eff.HTTPProxy, eff.ConnectTimeout, eff.InsecureSkipVerify).Do(req)
 	if err != nil {
 		// 看门狗已触发时把错误标注为 read-timeout（与 http-timeout 到期的 deadline exceeded 区分）
 		return nil, fmt.Errorf("请求上游失败（%s）: %w", urlStr, wd.wrapErr(err))
@@ -751,7 +810,7 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	// 每个 doRequest 只 dance 一次，不循环（重试响应即使仍 401 也原样返回）。
 	// dance 全程共用本次尝试的看门狗（wd.ctx 受 http-timeout 与 read-timeout 共同约束）。
 	if resp.StatusCode == http.StatusUnauthorized && (method == http.MethodGet || method == http.MethodHead) {
-		if e2, ok := s.dockerAuthDance(wd, s.client(eff.HTTPProxy, eff.ConnectTimeout), req, resp, urlStr); ok {
+		if e2, ok := s.dockerAuthDance(wd, s.client(eff.HTTPProxy, eff.ConnectTimeout, eff.InsecureSkipVerify), req, resp, urlStr); ok {
 			entry = e2 // 重试响应作为最终响应，继续既有的返回 Entry 语义
 		}
 	}

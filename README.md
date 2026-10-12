@@ -15,10 +15,11 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **规则级独立缓存目录**：每条 domain-rule 的 `cache` 可独立配置 `enabled`/`ttl`/`path`/`clean-interval`，支持「全局 `cache.enabled: false` 关闭缓存、命中规则的流量按规则开启并写入各自独立目录」（启动时预热创建全部缓存目录，按目录复用缓存实例与后台清理协程）
 - **url-redirect 多上游轮询回源**：模板展开为多个候选代理 URL，round-robin **起始下标逐请求轮换**（第 1 个请求从第 1 条开始、第 2 个从第 2 条开始……），默认**阶梯并发竞速**（hedge：首个候选立即发出，每隔 `url-redirect-hedge-delay` 放行下一个并发探测，第一个通过成功判据的候选胜出、其余取消；`0` 退化为纯串行）；单候选探测预算 `url-redirect-probe-timeout`（响应头/判据未就绪即硬失败快切）；硬失败（403 / token dance 后仍 401 / 探测预算耗尽）跳过原地重试直接切下一候选；全部失败可回退直连原始 URL（路径目标无直连回退），极坏情况由内置扫描总预算（20s）兜底提前 502
 - **url-redirect 模板变量**：除 `$1`（目标串，兼容保留）外支持请求级预定义变量 `$http.server.header.full_url`（入站请求完整 URL）与 `$http.server.header.full_url_no_server`（入站请求去掉 `scheme://host` 的 `/path?query`），均支持 `${...}` 大括号写法；按变量名长度降序替换（避免前缀遮蔽），未知 `$` 序列原样保留，详见下文「[url-redirect 模板变量](#url-redirect-模板变量)」
+- **url-redirect 候选对象与忽略证书校验**：`url-redirect` 为**对象数组**（破坏性变更：旧版纯字符串写法解析期报错并给出迁移示例），候选 = `template`（原模板字符串，占位符语义不变）+ 可选 `insecure-skip-verify`；「忽略 TLS 证书校验」三级优先级**候选 > 规则 > 全局**（未配置逐级继承），开启后该路径所有上游连接（含 30x 重定向目标与 token dance 的第二次请求）都跳过证书校验，适合镜像站证书链不全的场景，详见下文「[url-redirect 候选对象与忽略 TLS 证书校验](#url-redirect-候选对象与忽略-tls-证书校验)」
 - **HEAD 走候选轮询管线**：HEAD 与 GET 一致先查缓存（命中回放响应头，无 body），未命中按候选轮询回源（方法保持 HEAD，docker registry 的 HEAD 探测同样打到镜像站）；HEAD 响应无 body 不写缓存；未配置 url-redirect 时回退直连（与旧版一致）
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）；HEAD 响应天然无 body，content 判据对 HEAD 自动按 status 语义；HTTP 304（内容未变更）在两种模式下均视为成功候选，304 原样透传给客户端、不写缓存
 - **条件请求头不透传**：回源（候选与直连）按请求头白名单透传（含 `Range`），但 `If-Match` / `If-Modified-Since` / `If-None-Match` / `If-Range` / `If-Unmodified-Since` 不透传——回源始终为无条件 GET/HEAD，保证上游返回 200 + 完整 body 以过判据、写缓存；客户端的 304 语义由代理自身缓存 ETag 逻辑（HIT 命中时返回 304）负责
-- **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`timeout`（read-timeout 退化别名）、`http-timeout`、`read-timeout`、`connect-timeout`、`url-redirect-item-error-retry`、`url-redirect-all-error-retry` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
+- **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`insecure-skip-verify`、`timeout`（read-timeout 退化别名）、`http-timeout`、`read-timeout`、`connect-timeout`、`url-redirect-item-error-retry`、`url-redirect-all-error-retry` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
 - **上游代理支持**：全局与规则级 `http-proxy`（http/https/socks5），所有回源请求（含 url-redirect 候选请求）均可走代理
 - **allow-list / deny-list**：正则白/黑名单访问控制（deny 优先，allow 非空即白名单模式）
 - **可观测性**：`X-Cache`（HIT/MISS/BYPASS）与 `X-Proxy-Upstream`（本次内容来源）响应头、结构化日志、`/healthz` 健康检查
@@ -119,7 +120,8 @@ docker run -d --name proxy-cache \
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://` |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
-| `url-redirect` | string[] | 空 | 回源候选模板列表，占位符 `$1`/`${1}`（目标串）或 `$http.server.header.full_url(_no_server)`（入站请求 URL 变量，见下文「url-redirect 模板变量」）替换后得到候选 URL；空列表 = 全部直连回源 |
+| `insecure-skip-verify` | bool | `false` | 全局「忽略 TLS 证书校验」：开启后该路径所有上游连接（候选 / fallback 直连 / 30x 重定向目标 / token dance 两次请求）都跳过证书校验。三级优先级（高→低）：**候选对象 > 域名规则 > 全局**，未配置逐级继承，详见下文「[url-redirect 候选对象与忽略 TLS 证书校验](#url-redirect-候选对象与忽略-tls-证书校验)」；安全代价：等于关闭该路径的身份与窃听防护，仅建议对证书链不全的镜像站按候选级精确开启 |
+| `url-redirect` | object[] | 空 | 回源候选**对象列表**（破坏性变更：不再支持旧版纯字符串写法，解析期报错并给出迁移示例）。每个对象：`template`（必填非空，原模板字符串，占位符 `$1`/`${1}` 或 `$http.server.header.full_url(_no_server)`，见下文「url-redirect 模板变量」）与 `insecure-skip-verify`（可选 bool，候选级忽略证书校验）；空列表 = 全部直连回源；其余字段（含预留字段）一律解析报错，详见下文「[url-redirect 候选对象与忽略 TLS 证书校验](#url-redirect-候选对象与忽略-tls-证书校验)」 |
 | `cache.*` | object | 见下 | 全局缓存配置 |
 | `log.level` | string | `info` | 日志级别：`debug` / `info` / `warn` / `error`（大小写不敏感，非法值启动时直接报错），详见下文「日志」 |
 | `log.progress-interval` | duration | `10s` | 流式透传进度日志的输出间隔：GET 路径目标流式回源（docker pull 大 blob）期间每隔该间隔输出一条「流式透传进度」日志（已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收），上游停滞无新数据期间自然不输出；整条流在该间隔内完成则一条进度日志都不出（最终日志已有）。`<=0` 关闭进度日志 |
@@ -155,9 +157,10 @@ docker run -d --name proxy-cache \
 | `cache.path` | string | 该规则的**独立缓存目录**（trim 后为空 = 未配置，沿用全局 `cache.path`；同一 URL 永远落同一规则/目录） |
 | `cache.clean-interval` | duration | 该规则缓存目录的后台过期扫描间隔（必须 >=0，`0` 关闭；未配置沿用全局 `cache.clean-interval`） |
 | `http-proxy` | string | 该规则回源走指定代理（覆盖全局） |
-| `url-redirect` | string[] | 该规则专用候选列表（覆盖全局；`[]` 表示该规则直连回源） |
+| `url-redirect` | object[] | 该规则专用候选对象列表（覆盖全局；`[]` 表示该规则直连回源；对象字段同全局 `url-redirect`：`template` 必填 + `insecure-skip-verify` 可选） |
 | `success-check` | string | 该规则的成功判据 |
 | `fallback-direct` | bool | 该规则是否允许回退直连 |
+| `insecure-skip-verify` | bool | 覆盖该规则「忽略 TLS 证书校验」（未配置沿用全局；url-redirect 候选对象内的显式值优先级更高，三级优先级见「[url-redirect 候选对象与忽略 TLS 证书校验](#url-redirect-候选对象与忽略-tls-证书校验)」） |
 | `http-timeout` | duration | 覆盖该规则单次上游尝试的总超时；未配置沿用全局 |
 | `read-timeout` | duration | 覆盖该规则的无新增数据超时；未配置时回落到该规则 `timeout`，仍未配置才沿用全局（`global.read-timeout` > `global.timeout`） |
 | `connect-timeout` | duration | 覆盖该规则建连超时（TCP 拨号 + TLS 握手）；未配置沿用全局 |
@@ -189,11 +192,15 @@ http-proxy: ""                # 或 http://127.0.0.1:7890
 success-check: content        # status / content
 fallback-direct: true
 
-url-redirect:                 # $1 = 原始目标 URL，按顺序轮询（默认阶梯竞速：首个立即发出，
+url-redirect:                 # 对象数组：$1 = 原始目标 URL，按顺序轮询（默认阶梯竞速：首个立即发出，
                               # 之后每隔 url-redirect-hedge-delay 放行下一个并发探测）
-  - https://hk.gh-proxy.org/$1
-  - https://gh-proxy.com/$1
-  - https://mirror.ghproxy.com/$1
+  - template: https://hk.gh-proxy.org/$1
+  - template: https://gh-proxy.com/$1
+  - template: https://mirror.ghproxy.com/$1
+  # - template: https://docker.actima.top/$1
+  #   insecure-skip-verify: true   # 仅这个候选证书不受信，候选级精确开启（优先级最高）
+
+# insecure-skip-verify: false  # 全局忽略 TLS 证书校验（默认 false；规则级可覆盖、候选级优先，见 README 专节）
 
 url-redirect-probe-timeout: 5s     # 单候选探测预算：响应头/判据 5s 未就绪即快切下一候选（0=不限制）
 url-redirect-hedge-delay: 2s       # 候选阶梯竞速放行间隔（0=纯串行禁用竞速）
@@ -310,7 +317,7 @@ docker 客户端拉取镜像时，对每个请求只等约 30s 的响应头（`n
 
 ## url-redirect 模板变量
 
-模板里可使用的占位符（每个变量均支持 `$name` 与 `${name}` 两种写法；展开按**变量名长度降序**替换——`full_url_no_server` 先于 `full_url`，避免同名前缀遮蔽；长变量先替换也规避了递归展开；未知的 `$` 序列原样保留为字面量；**斜杠接缝去重**：`full_url_no_server` 的值以 `/` 开头，模板里占位符前紧邻 `/` 时（如 `https://docker.1panel.live/$http...`）两个 `/` 合并为一个，拼出 `.../v2/...` 而非 `...//v2/...`）：
+模板配置在候选对象的 `template` 字段（`url-redirect` 现为对象数组，见下文「[url-redirect 候选对象与忽略 TLS 证书校验](#url-redirect-候选对象与忽略-tls-证书校验)」，`template` 即旧版的模板字符串，占位符语义不变）。模板里可使用的占位符（每个变量均支持 `$name` 与 `${name}` 两种写法；展开按**变量名长度降序**替换——`full_url_no_server` 先于 `full_url`，避免同名前缀遮蔽；长变量先替换也规避了递归展开；未知的 `$` 序列原样保留为字面量；**斜杠接缝去重**：`full_url_no_server` 的值以 `/` 开头，模板里占位符前紧邻 `/` 时（如 `https://docker.1panel.live/$http...`）两个 `/` 合并为一个，拼出 `.../v2/...` 而非 `...//v2/...`）：
 
 | 占位符 | 含义 |
 | --- | --- |
@@ -335,7 +342,52 @@ $http.server.header.full_url_no_server = /https://raw.githubusercontent.com/dong
 展开: https://hk.gh-proxy.org/https://raw.githubusercontent.com/dongchengjie/airport/main/subs/merged/tested_within_vless.yaml
 ```
 
-模板在启动时校验（`config.Validate`）：每个模板必须以 `http://` 或 `https://` 开头，且至少包含一个已知占位符（`$1`/`${1}`，或任一已知 `$http.server.header.*` 变量的 `$` / `${}` 形式），否则启动报错并列出全部合法占位符写法。
+模板在启动时校验（`config.Validate`）：候选必须是键值对象（旧版纯字符串写法解析期报错并给出迁移示例），`template` 必须以 `http://` 或 `https://` 开头且至少包含一个已知占位符（`$1`/`${1}`，或任一已知 `$http.server.header.*` 变量的 `$` / `${}` 形式），否则启动报错并列出全部合法占位符写法；候选对象内的未知字段（含预留未实现字段）同样解析期报错。
+
+## url-redirect 候选对象与忽略 TLS 证书校验
+
+### 候选对象
+
+`url-redirect`（全局与规则级同构）为**对象数组**（破坏性变更：旧版纯字符串写法不再兼容，解析期报错并给出迁移示例）：
+
+```yaml
+url-redirect:
+  - template: https://docker.1panel.live/$http.server.header.full_url_no_server
+  - template: https://docker.actima.top/$http.server.header.full_url_no_server
+    insecure-skip-verify: true   # 仅这个镜像站证书不受信，候选级精确开启
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `template` | string | **必填**（trim 后非空）：即旧版的模板字符串，占位符语义不变（见上文「[url-redirect 模板变量](#url-redirect-模板变量)」）；启动时校验 http(s):// 前缀与至少一个占位符 |
+| `insecure-skip-verify` | bool | 可选：候选级「忽略 TLS 证书校验」。省略（nil）= 继承规则级，再继承全局 |
+
+候选对象做严格字段检查：配置了任何其他字段都会在解析期报错并列出支持字段（绝不静默忽略拼写错误）。
+
+**预留字段（已规划、本期未实现，配置即报错）**：
+
+| 预留字段 | 规划语义 |
+| --- | --- |
+| `enabled` | 临时下线某个候选（不用注释整行） |
+| `http-proxy` | 候选级回源代理（覆盖规则/全局 `http-proxy`） |
+| `weight` | 加权轮询（替代纯 round-robin 起始下标轮换） |
+| `probe-timeout` / `hedge-delay` | 候选级覆盖探测预算 / 竞速放行间隔 |
+
+### 「忽略 TLS 证书校验」三级优先级
+
+从高到低（某候选最终生效值 = **候选显式值 ?? 规则显式值 ?? 全局值**）：
+
+1. **候选对象内** `insecure-skip-verify`：对单个镜像站精确开启/关闭；
+2. **域名规则级** `insecure-skip-verify`：对整条规则的上游覆盖全局；
+3. **全局** `insecure-skip-verify`（默认 `false`）。
+
+开启后**该路径上的所有上游连接都跳过 TLS 证书校验**，作用范围包括：
+
+- url-redirect 候选上游与 fallback 直连 / 完整 URL 直连透传；
+- 响应中的 30x 重定向目标（如 1ms.run → cloudfront）；
+- Docker token dance 的两次请求（去 realm 取 token + 带 token 重试）。
+
+**安全代价**：跳过证书校验等于关闭该路径的服务端身份验证与中间人/窃听防护（连接仍加密，但无法确认对端身份）。典型场景：内网自签证书上游，或镜像站证书链不全——候选探测报 `tls: failed to verify certificate: x509: certificate signed by unknown authority`，每轮候选探测的重试全部烧在同一个证书错误上。**建议**：全局保持默认 `false`，仅对证书链不全的镜像站在候选级精确开启；整条规则的上游都属内网自签时再用规则级。
 
 ## Docker Registry 镜像加速
 
@@ -365,12 +417,17 @@ domain-rules:
     url-redirect-hedge-delay: 2s     # 候选阶梯竞速：每 2s 放行下一个候选并发探测，先过判据者胜出
     url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次（硬失败跳过）
     url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
-    url-redirect:              # 多镜像站候选轮询，均用 full_url_no_server 拼回源路径
-      - https://docker.1panel.live/$http.server.header.full_url_no_server
-      - https://hub.rat.dev/$http.server.header.full_url_no_server
-      - https://docker.m.daocloud.io/$http.server.header.full_url_no_server
-      - https://docker.1ms.run/$http.server.header.full_url_no_server
+    url-redirect:              # 多镜像站候选轮询（对象数组），均用 full_url_no_server 拼回源路径；
+                               # 候选级 insecure-skip-verify 仅对该候选生效（三级优先级最高）
+      - template: https://docker.1panel.live/$http.server.header.full_url_no_server
+      - template: https://hub.rat.dev/$http.server.header.full_url_no_server
+      - template: https://docker.m.daocloud.io/$http.server.header.full_url_no_server
+      - template: https://docker.1ms.run/$http.server.header.full_url_no_server
+      - template: https://docker.actima.top/$http.server.header.full_url_no_server
+        insecure-skip-verify: true   # 仅这个镜像站证书不受信（x509: unknown authority），候选级精确开启
 ```
+
+> 候选探测报 `tls: failed to verify certificate: x509: certificate signed by unknown authority`（证书链不全的镜像站，每轮候选的重试会全部烧在同一个证书错误上）时，按上例对该候选配置 `insecure-skip-verify: true` 精确开启；优先级与安全代价见上文「[url-redirect 候选对象与忽略 TLS 证书校验](#url-redirect-候选对象与忽略-tls-证书校验)」。
 
 ### 流式回源（docker pull 必读）
 
@@ -466,6 +523,7 @@ log:
 | 客户端条件请求头（`If-Match` 等 5 个） | 不透传给上游：回源始终为无条件 GET/HEAD（其余请求头按白名单透传，含 `Range`） |
 | 命中 deny-list 或未命中非空 allow-list | 403 |
 | 上游回 401 + `WWW-Authenticate: Bearer` 挑战（GET/HEAD 回源） | 自动匿名取 token 并带 `Authorization: Bearer` 重试一次（token 进程内缓存，详见「Docker Registry 镜像加速」）；取 token / 重试失败按原始 401 走既有判据 |
+| 上游 TLS 证书校验失败（`x509: certificate signed by unknown authority` 等）且未开启忽略证书校验 | 该次尝试按软失败处理（可按 `url-redirect-item-error-retry` 原地重试、失败后轮换下一候选）；对候选/规则/全局开启 `insecure-skip-verify` 后跳过校验继续回源（见「[url-redirect 候选对象与忽略 TLS 证书校验](#url-redirect-候选对象与忽略-tls-证书校验)」） |
 | 回源彻底失败（候选全败且无/失败直连） | 502（JSON 错误体） |
 | 配置文件不存在 | 使用内置默认配置启动并输出告警 |
 

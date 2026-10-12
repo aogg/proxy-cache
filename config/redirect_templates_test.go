@@ -43,7 +43,7 @@ func TestValidateRedirectTemplates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Default()
-			cfg.URLRedirect = []string{tt.tpl}
+			cfg.URLRedirect = []URLRedirectItem{{Template: tt.tpl}}
 			err := cfg.Validate()
 			if tt.wantErr == "" {
 				if err != nil {
@@ -65,7 +65,7 @@ func TestValidateRedirectTemplates(t *testing.T) {
 // 列出全部合法占位符写法：RedirectPlaceholders() 每个变量的 $name 与 ${name} 两种形式都出现。
 func TestValidateRedirectTemplatesErrorListsAllPlaceholders(t *testing.T) {
 	cfg := Default()
-	cfg.URLRedirect = []string{"https://mirror.example.com/raw/foo/bar"}
+	cfg.URLRedirect = []URLRedirectItem{{Template: "https://mirror.example.com/raw/foo/bar"}}
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("Validate() 期望报错（模板无占位符），实际为 nil")
@@ -87,7 +87,7 @@ func TestValidateRedirectTemplatesErrorListsAllPlaceholders(t *testing.T) {
 // 同样走占位符校验：无占位符报错且错误信息定位到规则与字段。
 func TestValidateRedirectTemplatesRuleScope(t *testing.T) {
 	cfg := Default()
-	bad := []string{"https://mirror.example.com/raw/foo/bar"}
+	bad := []URLRedirectItem{{Template: "https://mirror.example.com/raw/foo/bar"}}
 	cfg.DomainRules = []DomainRule{{
 		Name:        "no-placeholder-rule",
 		Match:       `http://github\.path\..+`,

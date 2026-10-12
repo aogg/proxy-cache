@@ -23,11 +23,11 @@ const (
 	urlVlessYAML   = "https://raw.githubusercontent.com/dongchengjie/airport/main/subs/merged/tested_within_vless.yaml"
 )
 
-// githubPathTemplates 是用户真实场景规则级 url-redirect 的三条候选模板。
-var githubPathTemplates = []string{
-	"https://gh-proxy.com/$1",
-	"https://ghproxy.net/$1",
-	"https://mirror.ghproxy.com/$1",
+// githubPathTemplates 是用户真实场景规则级 url-redirect 的三条候选（对象形态）。
+var githubPathTemplates = []URLRedirectItem{
+	{Template: "https://gh-proxy.com/$1"},
+	{Template: "https://ghproxy.net/$1"},
+	{Template: "https://mirror.ghproxy.com/$1"},
 }
 
 // githubPathRule 构造一条按入站子域 github.path.* 路由的规则：
@@ -65,8 +65,8 @@ func TestResolveOptionsHostRouting(t *testing.T) {
 			t.Fatalf("URLRedirect 长度 = %d, want %d（规则候选应为三条模板）", len(o.URLRedirect), len(githubPathTemplates))
 		}
 		for i, want := range githubPathTemplates {
-			if o.URLRedirect[i] != want {
-				t.Errorf("URLRedirect[%d] = %q, want 规则候选 %q", i, o.URLRedirect[i], want)
+			if o.URLRedirect[i].Template != want.Template {
+				t.Errorf("URLRedirect[%d] = %q, want 规则候选 %q", i, o.URLRedirect[i].Template, want.Template)
 			}
 		}
 		if o.CacheTTL != 2*time.Hour {

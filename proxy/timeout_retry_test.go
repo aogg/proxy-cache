@@ -22,8 +22,8 @@ import (
 	"proxy-cache/config"
 )
 
-// effFor 组装候选拉取用的生效配置（content 判据 + 指定候选模板 + 可选超时/重试）。
-func effFor(templates []string, mutate func(o *config.Options)) config.Options {
+// effFor 组装候选拉取用的生效配置（content 判据 + 指定候选对象 + 可选超时/重试）。
+func effFor(templates []config.URLRedirectItem, mutate func(o *config.Options)) config.Options {
 	o := config.Options{
 		URLRedirect:    templates,
 		SuccessCheck:   config.SuccessCheckContent,
@@ -204,7 +204,7 @@ func TestNewUpstreamTransportConnectTimeout(t *testing.T) {
 	if d := newUpstreamDialer(0); d.Timeout != 0 {
 		t.Errorf("connect-timeout=0 时拨号器应不限制（0），得到 %s", d.Timeout)
 	}
-	tr, err := newUpstreamTransport("", 1500*time.Millisecond)
+	tr, err := newUpstreamTransport("", 1500*time.Millisecond, false)
 	if err != nil {
 		t.Fatalf("构建 Transport 失败: %v", err)
 	}
@@ -214,14 +214,14 @@ func TestNewUpstreamTransportConnectTimeout(t *testing.T) {
 	if tr.Proxy != nil {
 		t.Error("直连 Transport 不应配置代理")
 	}
-	tr2, err := newUpstreamTransport("http://127.0.0.1:7890", time.Second)
+	tr2, err := newUpstreamTransport("http://127.0.0.1:7890", time.Second, false)
 	if err != nil {
 		t.Fatalf("带代理构建 Transport 失败: %v", err)
 	}
 	if tr2.Proxy == nil {
 		t.Error("http-proxy 应体现在 Transport.Proxy")
 	}
-	if _, err := newUpstreamTransport("ftp://example.com", 0); err == nil {
+	if _, err := newUpstreamTransport("ftp://example.com", 0, false); err == nil {
 		t.Error("不支持的代理协议应报错")
 	}
 }
@@ -243,13 +243,13 @@ func TestClientCacheByConnectTimeout(t *testing.T) {
 	if pre == nil {
 		t.Fatal("New 应预构建 (直连, 全局 connect-timeout) 组合")
 	}
-	if got := s.client("", 2*time.Second); got != pre {
+	if got := s.client("", 2*time.Second, false); got != pre {
 		t.Error("相同组合应复用预构建 Client")
 	}
-	if got := s.client("", 2*time.Second); got != pre {
+	if got := s.client("", 2*time.Second, false); got != pre {
 		t.Error("相同组合重复获取应复用同一 Client")
 	}
-	other := s.client("", 4*time.Second)
+	other := s.client("", 4*time.Second, false)
 	if other == nil || other == pre {
 		t.Error("不同 connect-timeout 应得到不同 Client")
 	}
@@ -277,7 +277,7 @@ func TestFetchViaCandidatesItemRetry(t *testing.T) {
 	s := newTimeoutTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/https://example.com/a", nil)
 	target := "https://example.com/a"
-	eff := effFor([]string{srv.URL + "/$1"}, func(o *config.Options) {
+	eff := effFor([]config.URLRedirectItem{{Template: srv.URL + "/$1"}}, func(o *config.Options) {
 		o.URLRedirectItemErrorRetry = 3 // 总尝试 = 4，第 3 次命中
 	})
 	e, err := s.fetchViaCandidates(req, target, eff)
@@ -318,7 +318,7 @@ func TestFetchViaCandidatesItemRetryCoversNetworkError(t *testing.T) {
 	s := newTimeoutTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/https://example.com/a", nil)
 	target := "https://example.com/a"
-	eff := effFor([]string{srv.URL + "/$1"}, func(o *config.Options) {
+	eff := effFor([]config.URLRedirectItem{{Template: srv.URL + "/$1"}}, func(o *config.Options) {
 		o.URLRedirectItemErrorRetry = 1
 	})
 	e, err := s.fetchViaCandidates(req, target, eff)
@@ -351,7 +351,7 @@ func TestFetchViaCandidatesAllRetryRounds(t *testing.T) {
 	s := newTimeoutTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/https://example.com/a", nil)
 	target := "https://example.com/a"
-	eff := effFor([]string{srv.URL + "/$1"}, func(o *config.Options) {
+	eff := effFor([]config.URLRedirectItem{{Template: srv.URL + "/$1"}}, func(o *config.Options) {
 		o.URLRedirectAllErrorRetry = 1
 	})
 	e, err := s.fetchViaCandidates(req, target, eff)
@@ -390,7 +390,7 @@ func TestFetchViaCandidatesRetryOrderAndExhaustion(t *testing.T) {
 	s := newTimeoutTestServer(t) // 全新 Server：rr 从 0 开始，start=0
 	req := httptest.NewRequest(http.MethodGet, "/https://example.com/a", nil)
 	target := "https://example.com/a"
-	eff := effFor([]string{srv.URL + "/c0/$1", srv.URL + "/c1/$1"}, func(o *config.Options) {
+	eff := effFor([]config.URLRedirectItem{{Template: srv.URL + "/c0/$1"}, {Template: srv.URL + "/c1/$1"}}, func(o *config.Options) {
 		o.URLRedirectItemErrorRetry = 1
 		o.URLRedirectAllErrorRetry = 1
 	})
@@ -470,7 +470,7 @@ func TestTokenDanceReadTimeoutMarked(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/https://example.com/library/a/manifests/latest", nil)
 	target := "https://example.com/library/a/manifests/latest"
-	eff := effFor([]string{mirror.URL + "/$1"}, func(o *config.Options) {
+	eff := effFor([]config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, func(o *config.Options) {
 		o.ReadTimeout = 200 * time.Millisecond
 	})
 	_, err = s.fetchViaCandidates(req, target, eff)
@@ -507,7 +507,7 @@ func TestTokenDanceSlowButSteadySucceeds(t *testing.T) {
 	s := newTimeoutTestServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/https://example.com/library/a/manifests/latest", nil)
 	target := "https://example.com/library/a/manifests/latest"
-	eff := effFor([]string{mirror.URL + "/$1"}, func(o *config.Options) {
+	eff := effFor([]config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, func(o *config.Options) {
 		o.ReadTimeout = 300 * time.Millisecond
 	})
 	e, err := s.fetchViaCandidates(req, target, eff)

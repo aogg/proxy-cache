@@ -147,6 +147,72 @@ type RuleCache struct {
 	CleanInterval *Duration `yaml:"clean-interval"`
 }
 
+// urlRedirectItemReservedFields 候选对象的「预留字段」清单（语义已规划、本期未实现）：
+// 配置它们会在解析期报错（绝不静默忽略），错误信息会提示暂未实现。
+const urlRedirectItemReservedFields = "enabled / http-proxy / weight / probe-timeout / hedge-delay"
+
+// URLRedirectItem 是 url-redirect 候选列表的对象形态（破坏性变更：不再支持旧版纯字符串写法，
+// 解析期报错并给出迁移示例，见 UnmarshalYAML）。本期实现的字段：
+//   - template（必填非空）：即旧版的模板字符串，占位符语义不变（$1 / ${1} 与
+//     $http.server.header.* 变量，见 RedirectPlaceholders）；
+//   - insecure-skip-verify（可选）：候选级「忽略 TLS 证书校验」。
+//
+// 预留字段（本期未实现，配置即报错）：enabled（临时下线候选）、http-proxy（候选级回源代理）、
+// weight（加权轮询）、probe-timeout / hedge-delay（候选级覆盖探测预算/竞速间隔）。
+type URLRedirectItem struct {
+	// Template 候选模板（必填，trim 后非空；Validate 阶段校验 http(s):// 前缀与占位符）。
+	Template string `yaml:"template"`
+	// InsecureSkipVerify 候选级「忽略 TLS 证书校验」（可选）：nil = 继承规则级
+	// insecure-skip-verify（仍为 nil 再继承全局），生效值经 Options.CandidateInsecureSkipVerify 解析。
+	// 显式 true 表示「信任该候选」：该候选路径上的所有上游连接——含 30x 重定向目标
+	//（如 1ms.run → cloudfront）与 token dance 的第二次请求——都跳过证书校验。
+	// 典型场景：单个镜像站证书链不全（如 docker.actima.top 的
+	// `tls: failed to verify certificate: x509: certificate signed by unknown authority`），
+	// 推荐在该候选上精确开启，而非打开规则级/全局开关。
+	InsecureSkipVerify *bool `yaml:"insecure-skip-verify"`
+}
+
+// UnmarshalYAML 自定义解析（yaml.Node 按 Kind 判别形态）：
+//   - 纯字符串（旧格式）→ 报错并给出迁移示例（破坏性变更，不做字符串兼容）；
+//   - 键值对象 → 校验字段名：未知字段（含预留未实现字段）报错并列出支持字段，
+//     避免配置拼写错误被静默忽略；
+//   - 其他形态（列表/别名异常等）→ 报错说明必须是对象。
+func (it *URLRedirectItem) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		// 旧格式（纯字符串模板）：给出迁移示例，配置错误启动快速失败
+		return fmt.Errorf(
+			"第 %d 行: url-redirect 候选必须是对象，不再支持纯字符串写法 %q（旧格式已移除），迁移示例:\n"+
+				"  url-redirect:\n"+
+				"    - template: %s\n"+
+				"    - template: %s\n"+
+				"      insecure-skip-verify: true   # 可选：仅该候选忽略 TLS 证书校验",
+			node.Line, node.Value, node.Value, node.Value)
+	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("第 %d 行: url-redirect 候选必须是键值对象（- template: ...），收到非法形态", node.Line)
+	}
+	// 未知字段检查（键名 trim + 小写归一化后比对，风格与 type / success-check 一致）
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i]
+		switch strings.ToLower(strings.TrimSpace(key.Value)) {
+		case "template", "insecure-skip-verify":
+			// 本期支持的合法字段
+		default:
+			return fmt.Errorf(
+				"第 %d 行: url-redirect 候选对象不支持字段 %q（支持字段: template / insecure-skip-verify；预留字段 %s 本期未实现，暂不可配置）",
+				key.Line, key.Value, urlRedirectItemReservedFields)
+		}
+	}
+	// 解码实体：经由别名类型避免递归触发本 UnmarshalYAML
+	type plain URLRedirectItem
+	var p plain
+	if err := node.Decode(&p); err != nil {
+		return err
+	}
+	*it = URLRedirectItem(p)
+	return nil
+}
+
 // DomainRule 单条域名/URL 规则。match 为正则表达式，对
 // 「http://<入站Host>/<目标URL>」整串做非锚定匹配（Host 归一化为小写并去除首尾空白）：
 //   - 按入站域名匹配：如 `http://github\.path\..+`（入站 Host 形如 github.path.xxx 时命中）；
@@ -181,8 +247,17 @@ type DomainRule struct {
 	Cache RuleCache `yaml:"cache"`
 	// HTTPProxy 该规则回源时使用的上游代理（覆盖全局 http-proxy；空串表示直连）。
 	HTTPProxy *string `yaml:"http-proxy"`
-	// URLRedirect 该规则专用的 url-redirect 模板列表（覆盖全局；设为 [] 表示该规则直连回源）。
-	URLRedirect *[]string `yaml:"url-redirect"`
+	// InsecureSkipVerify 规则级「忽略 TLS 证书校验」（可选）：nil = 继承全局
+	// insecure-skip-verify；显式 true/false 覆盖全局（url-redirect 候选对象内的显式值
+	// 优先级更高，三级优先级见 URLRedirectItem.InsecureSkipVerify 与
+	// Options.CandidateInsecureSkipVerify）。
+	// 开启后该规则回源路径上的所有上游连接（候选、fallback 直连、30x 重定向目标、
+	// token dance 的取 token 与带 token 重试）都跳过 TLS 证书校验：等于关闭该路径的
+	// 服务端身份验证与防窃听保护，仅建议在内网自签/镜像站证书链不全时开启；
+	// 更推荐用候选级（URLRedirectItem.InsecureSkipVerify）对个别镜像站精确开启。
+	InsecureSkipVerify *bool `yaml:"insecure-skip-verify"`
+	// URLRedirect 该规则专用的 url-redirect 候选对象列表（覆盖全局；设为 [] 表示该规则直连回源）。
+	URLRedirect *[]URLRedirectItem `yaml:"url-redirect"`
 	// SuccessCheck 该规则的成功判据（status / content）。
 	SuccessCheck *string `yaml:"success-check"`
 	// FallbackDirect 该规则下候选全部失败后是否回退直连。
@@ -326,8 +401,20 @@ type Config struct {
 	// FallbackDirect url-redirect 候选全部失败后是否回退直连原始 URL（默认 true）。
 	// 指针用于区分「未配置」与「显式配置 false」。
 	FallbackDirect *bool `yaml:"fallback-direct"`
-	// URLRedirect 全局 url-redirect 模板列表（如 https://gh-proxy.com/$1）。
-	URLRedirect []string `yaml:"url-redirect"`
+	// InsecureSkipVerify 全局「忽略 TLS 证书校验」（默认 false）：
+	// 三级优先级（高 → 低）：url-redirect 候选对象 insecure-skip-verify >
+	// 域名规则 insecure-skip-verify > 本全局值（解析链路见 ResolveOptions 与
+	// Options.CandidateInsecureSkipVerify）。
+	// 生效范围：该路径上的所有上游连接——url-redirect 候选、fallback 直连/直连透传、
+	// 30x 重定向目标（如 1ms.run → cloudfront）、token dance 的取 token 与带 token 重试。
+	// 安全代价：跳过证书校验等于放弃对上游的服务端身份验证与防中间人/窃听保护
+	//（连接仍加密，但无法确认对端身份）；典型场景是内网自签证书或镜像站证书链不全
+	//（如候选报 `tls: failed to verify certificate: x509: certificate signed by unknown authority`，
+	// 每轮候选探测全部烧在证书错误上）。建议默认关闭，仅对个别候选/规则精确开启。
+	InsecureSkipVerify bool `yaml:"insecure-skip-verify"`
+	// URLRedirect 全局 url-redirect 候选对象列表（如 {template: https://gh-proxy.com/$1}，
+	// 对象字段与三级 insecure 优先级见 URLRedirectItem）。
+	URLRedirect []URLRedirectItem `yaml:"url-redirect"`
 	// Cache 全局缓存配置。
 	Cache CacheConfig `yaml:"cache"`
 	// Log 日志配置（level / progress-interval）。
@@ -361,8 +448,12 @@ type Options struct {
 	CacheCleanInterval time.Duration
 	// HTTPProxy 该请求回源使用的上游代理（空串表示直连）。
 	HTTPProxy string
-	// URLRedirect 该请求生效的 url-redirect 模板列表。
-	URLRedirect []string
+	// InsecureSkipVerify 该请求生效的「忽略 TLS 证书校验」：规则显式值 ?? 全局值
+	//（ResolveOptions 解析）。作用于直连回退 / 完整 URL 直连透传路径；
+	// 候选路径按候选对象生效值另行解析（见 CandidateInsecureSkipVerify）。
+	InsecureSkipVerify bool
+	// URLRedirect 该请求生效的 url-redirect 候选对象列表。
+	URLRedirect []URLRedirectItem
 	// SuccessCheck 该请求生效的成功判据（status / content）。
 	SuccessCheck string
 	// FallbackDirect 候选全部失败后是否回退直连。
@@ -393,6 +484,17 @@ type Options struct {
 	// GET 路径目标流式回源期间每隔该间隔输出一条回源进度日志（已传字节数/百分比/速率等），
 	// 便于观测 docker pull 大 blob 这类长耗时流式传输的回源进度。
 	ProgressLogInterval time.Duration
+}
+
+// CandidateInsecureSkipVerify 返回候选对象的「忽略 TLS 证书校验」最终生效值——
+// 三级优先级的最后一步：候选显式值 ?? o.InsecureSkipVerify（后者已是
+// 规则显式 ?? 全局 的合并结果，见 ResolveOptions）。
+// 即：候选对象 insecure-skip-verify > 规则 insecure-skip-verify > 全局 insecure-skip-verify。
+func (o Options) CandidateInsecureSkipVerify(item URLRedirectItem) bool {
+	if item.InsecureSkipVerify != nil {
+		return *item.InsecureSkipVerify
+	}
+	return o.InsecureSkipVerify
 }
 
 // Default 返回内置默认配置（配置文件缺失时兜底，也是 Load 时叠加解析的底版：
@@ -781,6 +883,7 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		CacheCleanInterval:        c.Cache.CleanInterval.D(),
 		HTTPProxy:                 strings.TrimSpace(c.HTTPProxy),
 		URLRedirect:               c.URLRedirect,
+		InsecureSkipVerify:        c.InsecureSkipVerify,
 		SuccessCheck:              c.SuccessCheck,
 		FallbackDirect:            c.fallbackDirect(),
 		HTTPTimeout:               c.GlobalHTTPTimeout(),
@@ -846,6 +949,11 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		}
 		if r.URLRedirect != nil {
 			o.URLRedirect = *r.URLRedirect
+		}
+		// 规则级 insecure-skip-verify 显式覆盖全局（nil = 沿用全局；候选对象的显式值
+		// 优先级更高，在 proxy 层经 Options.CandidateInsecureSkipVerify 逐候选解析）
+		if r.InsecureSkipVerify != nil {
+			o.InsecureSkipVerify = *r.InsecureSkipVerify
 		}
 		if r.SuccessCheck != nil {
 			o.SuccessCheck = *r.SuccessCheck
@@ -976,23 +1084,24 @@ func validateProxyAddr(addr string) error {
 	return fmt.Errorf("%q 需为 http(s)/socks5 代理地址，例如 http://127.0.0.1:7890", addr)
 }
 
-// validateRedirectTemplates 校验 url-redirect 模板列表（就地去除首尾空白）：
-// 每个模板必须以 http(s):// 开头，且至少包含一个已知占位符——$1 / ${1}，
-// 或任一已知 $http.server.header.* 变量的 $ / ${} 形式（错误信息列出全部合法写法）。
-func validateRedirectTemplates(list []string, where string) error {
+// validateRedirectTemplates 校验 url-redirect 候选列表（就地去除模板首尾空白）：
+// 每个候选的 template 必须非空、以 http(s):// 开头，且至少包含一个已知占位符——
+// $1 / ${1}，或任一已知 $http.server.header.* 变量的 $ / ${} 形式（错误信息列出全部合法写法）。
+// 候选的 insecure-skip-verify 与规则级 insecure-skip-verify 均为指针可选项，无需在此校验。
+func validateRedirectTemplates(list []URLRedirectItem, where string) error {
 	for i := range list {
-		t := strings.TrimSpace(list[i])
+		t := strings.TrimSpace(list[i].Template)
 		if t == "" {
-			return fmt.Errorf("%s 第 %d 个模板为空", where, i)
+			return fmt.Errorf("%s 第 %d 个候选的 template 为空", where, i)
 		}
 		if !strings.HasPrefix(t, "http://") && !strings.HasPrefix(t, "https://") {
-			return fmt.Errorf("%s 第 %d 个模板 %q 必须以 http:// 或 https:// 开头", where, i, t)
+			return fmt.Errorf("%s 第 %d 个候选模板 %q 必须以 http:// 或 https:// 开头", where, i, t)
 		}
 		if !hasKnownPlaceholder(t) {
-			return fmt.Errorf("%s 第 %d 个模板 %q 缺少占位符（合法占位符: %s）",
+			return fmt.Errorf("%s 第 %d 个候选模板 %q 缺少占位符（合法占位符: %s）",
 				where, i, t, placeholderHelp())
 		}
-		list[i] = t
+		list[i].Template = t
 	}
 	return nil
 }

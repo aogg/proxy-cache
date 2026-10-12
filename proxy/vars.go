@@ -80,25 +80,40 @@ func (v RequestVars) pairs() []redirectVar {
 	return pairs
 }
 
-// ExpandCandidates 把 url-redirect 模板列表展开为候选 URL 列表：
-// 逐个模板替换占位符，每个变量支持 ${name} 与 $name 两种写法，按「变量名长度降序」
-// 顺序替换（见 pairs）；$1 兼容保留（完整 URL 请求 = 目标 URL，路径目标请求 = 路径目标）。
-// 长变量先替换也顺带规避了递归展开：后替换的 $1 值（目标串）里即使含变量名字面量也不会被二次替换。
-// 未知的 $ 序列原样保留为字面量。
+// candidate 是展开后的单个候选：模板经占位符替换后的最终 URL + 该候选生效的
+// insecure-skip-verify（三级配置的解析结果：候选显式 ?? 规则 ?? 全局，
+// 由 config.Options.CandidateInsecureSkipVerify 逐候选计算）。
+type candidate struct {
+	// url 候选最终 URL（占位符替换后；斜杠接缝去重等语义与旧版一致）。
+	url string
+	// insecureSkipVerify 该候选是否忽略上游 TLS 证书校验：
+	// true 时该候选走 insecure 专属 http.Client（TLSClientConfig.InsecureSkipVerify=true），
+	// 覆盖该候选路径上的所有上游连接（含 30x 重定向目标与 token dance 的后续请求）。
+	insecureSkipVerify bool
+}
+
+// ExpandCandidates 把 url-redirect 候选对象列表展开为候选列表：
+// 逐个候选替换 template 中的占位符，每个变量支持 ${name} 与 $name 两种写法，按「变量名
+// 长度降序」顺序替换（见 pairs）；$1 兼容保留（完整 URL 请求 = 目标 URL，路径目标请求 =
+// 路径目标）。长变量先替换也顺带规避了递归展开：后替换的 $1 值（目标串）里即使含变量名
+// 字面量也不会被二次替换。未知的 $ 序列原样保留为字面量。
 // 斜杠接缝去重：full_url_no_server 的值以 / 开头，若模板中占位符前紧邻 /（如
 // https://docker.1panel.live/$http.server.header.full_url_no_server），接缝处的两个 /
 // 合并为一个，保证展开结果为 https://docker.1panel.live/v2/... 而非 ...//v2/...（见 replaceVar）。
-func ExpandCandidates(templates []string, vars RequestVars) []string {
-	if len(templates) == 0 {
+// insecure-skip-verify 按「候选显式 ?? eff.InsecureSkipVerify（规则 ?? 全局）」解析，
+// 逐候选独立生效（见 config.Options.CandidateInsecureSkipVerify）。
+func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff config.Options) []candidate {
+	if len(items) == 0 {
 		return nil
 	}
 	pairs := vars.pairs()
-	out := make([]string, 0, len(templates))
-	for _, t := range templates {
+	out := make([]candidate, 0, len(items))
+	for _, item := range items {
+		t := item.Template
 		for _, v := range pairs {
 			t = replaceVar(t, v.name, v.value)
 		}
-		out = append(out, t)
+		out = append(out, candidate{url: t, insecureSkipVerify: eff.CandidateInsecureSkipVerify(item)})
 	}
 	return out
 }

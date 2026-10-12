@@ -74,7 +74,7 @@ func (s *Server) commitStreamingHeader(w http.ResponseWriter, res *probeResult, 
 // 缓存写入回调（nil = 不写缓存，BYPASS 场景）。返回值 committed=true 表示已向客户端
 // 写出响应头——此时调用方不得再 writeError（响应头已固化，写错误头只会污染日志）。
 func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Request, target string, eff config.Options, cacheStatus string, finalize func(*cache.Entry), start time.Time) (entry *cache.Entry, committed bool, err error) {
-	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target))
+	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target), eff)
 	if len(candidates) == 0 {
 		// 防御分支：handleProxy 已拦截「路径目标未配置 url-redirect」，流式路径绝不直连
 		return nil, false, errors.New("路径目标请求未配置 url-redirect，无法回源（路径目标必须由命中的域名规则提供 url-redirect）")

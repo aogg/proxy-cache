@@ -66,7 +66,7 @@ func dockerTypeRule(upstreamURL, cacheDir string) config.DomainRule {
 		Name:        "docker-registry",
 		Type:        config.RuleTypeDocker,
 		Match:       ruleTypeRegexRT,
-		URLRedirect: &[]string{tpl},
+		URLRedirect: &[]config.URLRedirectItem{{Template: tpl}},
 		Cache:       config.RuleCache{Enabled: rtBoolPtr(true), Path: rtStrPtr(cacheDir)},
 	}
 }
@@ -163,7 +163,7 @@ func TestServeHTTPRuleTypeDockerFullURLNotMatch(t *testing.T) {
 		dockerUp := newManifestUpstream(t, &dockerRec, "manifest-json")
 		webUp := newManifestUpstream(t, &webRec, "web-content")
 
-		webTemplates := []string{webUp.URL + "/$1"}
+		webTemplates := []config.URLRedirectItem{{Template: webUp.URL + "/$1"}}
 		webRule := config.DomainRule{
 			Name:        "web-rule",
 			Type:        config.RuleTypeWeb,
@@ -252,7 +252,7 @@ func TestServeHTTPRuleTypeEmptyLegacyBehavior(t *testing.T) {
 	var rec upstreamRecord
 	upstream := newManifestUpstream(t, &rec, "legacy-content")
 
-	templates := []string{upstream.URL + "/$http.server.header.full_url_no_server"}
+	templates := []config.URLRedirectItem{{Template: upstream.URL + "/$http.server.header.full_url_no_server"}}
 	legacyRule := config.DomainRule{
 		Name:        "legacy-rule", // 旧配置写法：不配置 type 字段
 		Match:       ruleTypeRegexRT,

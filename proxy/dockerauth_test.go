@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	"proxy-cache/cache"
+	"proxy-cache/config"
 )
 
 // danceClientAuthz / danceRetryAuthz 是 dance 测试里客户端透传与 token 端点签发的
@@ -196,7 +197,7 @@ func TestDockerAuthDanceCandidateSuccess(t *testing.T) {
 	tokenSrv := newTokenEndpoint(t, rec, http.StatusOK, `{"token":"`+danceToken+`","expires_in":300}`)
 	mirror := newDanceMirror(t, rec, tokenSrv, danceToken, false)
 
-	s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, false)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, false)
 
 	// 客户端自带 Authorization 与 Accept：前者应透传给上游首请求、但绝不带到 token 端点，
 	// 且 dance 重试时被替换为 Bearer <token>；后者作为白名单头全程透传
@@ -265,7 +266,7 @@ func TestDockerAuthDanceAccessTokenFallback(t *testing.T) {
 	tokenSrv := newTokenEndpoint(t, rec, http.StatusOK, `{"access_token":"`+danceTokenAlt+`"}`)
 	mirror := newDanceMirror(t, rec, tokenSrv, danceTokenAlt, false)
 
-	s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, false)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, false)
 	e, src, err := fetchVia(t, s, candidatesTargetURL)
 	if err != nil {
 		t.Fatalf("fetchViaCandidates() 意外报错: %v", err)
@@ -292,7 +293,7 @@ func TestDockerAuthDanceTokenCachedAcrossRequests(t *testing.T) {
 	tokenSrv := newTokenEndpoint(t, rec, http.StatusOK, `{"token":"`+danceToken+`","expires_in":300}`)
 	mirror := newDanceMirror(t, rec, tokenSrv, danceToken, false)
 
-	s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, false)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, false)
 
 	for i, wantBody := range []string{"blob-1", "blob-2"} {
 		e, src, err := fetchVia(t, s, candidatesTargetURL)
@@ -328,7 +329,7 @@ func TestDockerAuthDanceTokenEndpointFailure(t *testing.T) {
 		tokenSrv := newTokenEndpoint(t, rec, http.StatusInternalServerError, "boom")
 		mirror := newDanceMirror(t, rec, tokenSrv, danceToken, false)
 
-		s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, false)
+		s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, false)
 		_, _, err := fetchVia(t, s, candidatesTargetURL)
 		if err == nil {
 			t.Fatal("fetchViaCandidates() 期望报错（token 换取失败 → 原始 401 不过判据），实际为 nil")
@@ -351,7 +352,7 @@ func TestDockerAuthDanceTokenEndpointFailure(t *testing.T) {
 		good := contentUpstream(t)
 		defer good.Close()
 
-		s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, true)
+		s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, true)
 		// 目标 URL 指向本地必成功假上游：候选 401 拒绝后回退直连该上游（不碰真实外网）
 		target := good.URL + "/file.yaml"
 		e, src, err := fetchVia(t, s, target)
@@ -396,7 +397,7 @@ func TestDockerAuthDanceSkippedWithoutBearerChallenge(t *testing.T) {
 			}))
 			defer mirror.Close()
 
-			s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, false)
+			s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, false)
 			_, _, err := fetchVia(t, s, candidatesTargetURL)
 			if err == nil {
 				t.Fatal("fetchViaCandidates() 期望报错（401 不 dance 应照旧被拒），实际为 nil")
@@ -419,7 +420,7 @@ func TestDockerAuthDanceHeadProbeSuccess(t *testing.T) {
 	tokenSrv := newTokenEndpoint(t, rec, http.StatusOK, `{"token":"`+danceToken+`","expires_in":300}`)
 	mirror := newDanceMirror(t, rec, tokenSrv, danceToken, false)
 
-	s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, false)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, false)
 	e, src, err := fetchViaMethod(t, s, http.MethodHead, candidatesTargetURL)
 	if err != nil {
 		t.Fatalf("fetchViaCandidates() 意外报错: %v", err)
@@ -560,7 +561,7 @@ func TestDockerAuthDanceRetryStillUnauthorized(t *testing.T) {
 	tokenSrv := newTokenEndpoint(t, rec, http.StatusOK, `{"token":"`+danceToken+`","expires_in":300}`)
 	mirror := newDanceMirror(t, rec, tokenSrv, danceToken, true) // 带 token 也回 401
 
-	s := newCandidatesServer(t, []string{mirror.URL + "/$1"}, false)
+	s := newCandidatesServer(t, []config.URLRedirectItem{{Template: mirror.URL + "/$1"}}, false)
 	_, _, err := fetchVia(t, s, candidatesTargetURL)
 	if err == nil {
 		t.Fatal("fetchViaCandidates() 期望报错（重试仍 401 应按候选拒绝处理），实际为 nil")
