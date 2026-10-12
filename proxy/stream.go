@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"proxy-cache/cache"
@@ -92,9 +94,23 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	source := res.url
 	s.commitStreamingHeader(w, res, cacheStatus, source)
 	committed = true
+	// 进度日志的时间基线自 commit（写出响应头）起算：循环前的 writeFirst 已计入 total，
+	// 首条进度日志的速率为自 commit 起的平均速率
+	committedAt := time.Now()
 	s.log.Info("流式透传开始（已向客户端写出响应头）",
 		"rule", eff.Rule, "candidate", truncate(source, 300), "status", res.status,
 		"content_length", res.header.Get("Content-Length"), "check", eff.SuccessCheck)
+
+	// 流式透传进度日志开关与基线：eff.ProgressLogInterval <= 0 关闭；lastProgressBytes 为
+	// 上次进度日志时已传字节数（区间速率的分母基线），初始 0 = 首条按自 commit 起平均速率
+	progressInterval := eff.ProgressLogInterval
+	lastProgressAt := committedAt
+	lastProgressBytes := 0
+	// 上游声明的 Content-Length：可解析为正整数时进度日志附带该值与 0-100 百分比，否则不输出
+	contentLength := int64(0)
+	if v, err := strconv.ParseInt(strings.TrimSpace(res.header.Get("Content-Length")), 10, 64); err == nil && v > 0 {
+		contentLength = v
+	}
 
 	// //////////////////  边读上游边写客户端与累积缓冲  start  ///////////////////////////////////
 	clientOK := true // 客户端写失败（docker 已断开）后置 false：继续读完上游只填缓存
@@ -135,6 +151,39 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 							"target", truncate(r.URL.Path, 200), "err", werr)
 					}
 				}
+			}
+			// 流式透传进度日志：按 progress-interval 周期留痕回源进度（类似 docker pull 的
+			// xxMB/342.7MB 进度感），间隔内整条流已完成则一条都不出（最终日志已有成败留痕）。
+			// 用循环内时间检查而非定时器 goroutine 实现：上游停滞无新数据时读循环阻塞、
+			// 自然不输出进度（属预期，间隔内的沉默即「无进度」本身）
+			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
+				now := time.Now()
+				clientState := "ok"
+				if !clientOK {
+					clientState = "disconnected"
+				}
+				args := []any{
+					"rule", eff.Rule, "candidate", truncate(source, 300), "status", res.status,
+					"bytes", total,
+				}
+				if contentLength > 0 {
+					// 百分比取 0-100 整数（上游声明值异常偏小时截到 100，不输出越界值）
+					pct := int(float64(total) / float64(contentLength) * 100)
+					if pct < 0 {
+						pct = 0
+					} else if pct > 100 {
+						pct = 100
+					}
+					args = append(args, "content_length", contentLength, "percent", pct)
+				}
+				args = append(args,
+					"speed", humanBytesPerSec(int64(total-lastProgressBytes), now.Sub(lastProgressAt)),
+					"elapsed", fmt.Sprintf("%.1fs", now.Sub(committedAt).Seconds()),
+					"client", clientState,
+				)
+				s.log.Info("流式透传进度", args...)
+				lastProgressAt = now
+				lastProgressBytes = total
 			}
 			if rerr != nil {
 				if errors.Is(rerr, io.EOF) {
@@ -190,3 +239,38 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	// //////////////////  成功返回日志（字段与 serveEntry 兼容）  end  ///////////////////////////
 	return entry, true, nil
 }
+
+// //////////////////  进度日志的人类可读格式化  start  /////////////////////////////////////////
+
+// humanBytes 把字节数格式化为人类可读字符串：不足 1MB 原样输出字节数（如 8192B），
+// 1MB 起按 1024 进制换算、最多保留两位小数并去掉尾零：如 8.39MB / 342.7MB / 1.21GB，
+// 供进度日志的字节数与速率字段复用。
+func humanBytes(n int64) string {
+	if n < 1024*1024 {
+		return strconv.FormatInt(n, 10) + "B"
+	}
+	// 档位表从 B 起与 v 的当前单位对齐（v 初始即字节数），逐档 /1024 直到不足 1024 或到顶；
+	// 上方已把 <1MB 挡在 B 分支，走到这里至少落在 MB 档
+	units := [...]string{"B", "KB", "MB", "GB", "TB", "PB", "EB"}
+	v := float64(n)
+	i := 0
+	for v >= 1024 && i < len(units)-1 {
+		v /= 1024
+		i++
+	}
+	// 保留两位小数，再去掉末尾多余的 0 与孤立小数点（342.70 -> 342.7、8.00 -> 8）
+	s := strconv.FormatFloat(v, 'f', 2, 64)
+	s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	return s + units[i]
+}
+
+// humanBytesPerSec 把「d 时间内传输 bytes」折算为速率字符串（如 "13.2MB/s"），
+// 复用 humanBytes 的格式；d <= 0（时钟回拨等异常）时输出 0B/s 兜底。
+func humanBytesPerSec(bytes int64, d time.Duration) string {
+	if d <= 0 {
+		return "0B/s"
+	}
+	return humanBytes(int64(float64(bytes)/d.Seconds())) + "/s"
+}
+
+// //////////////////  进度日志的人类可读格式化  end  ///////////////////////////////////////////

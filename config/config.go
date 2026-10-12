@@ -34,6 +34,9 @@ const (
 // DefaultCacheTTL 全局 cache.ttl 未配置时的默认缓存时长。
 const DefaultCacheTTL = 30 * time.Minute
 
+// DefaultProgressLogInterval 全局 log.progress-interval 未配置时的默认流式透传进度日志间隔。
+const DefaultProgressLogInterval = 10 * time.Second
+
 // 候选探测提速（作用于 url-redirect 候选管线：流式 GET 与 HEAD 共用）的缺省值。
 const (
 	// DefaultURLRedirectProbeTimeout 单次候选尝试的探测预算缺省值：5s。
@@ -259,6 +262,10 @@ type LogConfig struct {
 	// Level 日志级别：debug / info / warn / error（大小写不敏感；留空默认 info；
 	// 非法值在 Validate 阶段报错，启动快速失败）。
 	Level string `yaml:"level"`
+	// ProgressInterval 流式透传进度日志的输出间隔（GET 路径目标流式回源期间每隔该
+	// 间隔输出一条回源进度日志）：nil（未配置）默认 10s（DefaultProgressLogInterval）；
+	// 显式 <=0 关闭进度日志（负数归一化为 0，Validate 不报错，风格同 cache.clean-interval）。
+	ProgressInterval *Duration `yaml:"progress-interval"`
 }
 
 // CacheConfig 全局缓存配置。
@@ -323,7 +330,7 @@ type Config struct {
 	URLRedirect []string `yaml:"url-redirect"`
 	// Cache 全局缓存配置。
 	Cache CacheConfig `yaml:"cache"`
-	// Log 日志配置（level）。
+	// Log 日志配置（level / progress-interval）。
 	Log LogConfig `yaml:"log"`
 	// DomainRules 域名/URL 规则列表（自上而下第一条命中生效）。
 	DomainRules []DomainRule `yaml:"domain-rules"`
@@ -382,6 +389,10 @@ type Options struct {
 	// 首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消），
 	// 第一个通过成功判据的候选胜出，其余全部取消。
 	URLRedirectHedgeDelay time.Duration
+	// ProgressLogInterval 流式透传进度日志的输出间隔（<=0 关闭进度日志；未配置默认 10s）：
+	// GET 路径目标流式回源期间每隔该间隔输出一条回源进度日志（已传字节数/百分比/速率等），
+	// 便于观测 docker pull 大 blob 这类长耗时流式传输的回源进度。
+	ProgressLogInterval time.Duration
 }
 
 // Default 返回内置默认配置（配置文件缺失时兜底，也是 Load 时叠加解析的底版：
@@ -446,6 +457,12 @@ func (c *Config) Validate() error {
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
+	}
+	// log.progress-interval：nil（未配置）默认 10s（生效值经 ProgressLogInterval() 读取）；
+	// 显式负数归一化为 0（关闭进度日志，与 cache.clean-interval 同风格，Validate 不报错）
+	if c.Log.ProgressInterval != nil && c.Log.ProgressInterval.D() < 0 {
+		v := Duration(0)
+		c.Log.ProgressInterval = &v
 	}
 	// //////////////////  默认值补全  end  ////////////////////////////////////////////////
 
@@ -701,6 +718,16 @@ func (c *Config) GlobalURLRedirectHedgeDelay() time.Duration {
 	return c.URLRedirectHedgeDelay.D()
 }
 
+// ProgressLogInterval 返回全局流式透传进度日志的输出间隔生效值：
+// nil（未配置）= 缺省 10s（DefaultProgressLogInterval）；显式 <=0 = 0（关闭进度日志）。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底，供 ResolveOptions 复用。
+func (c *Config) ProgressLogInterval() time.Duration {
+	if c.Log.ProgressInterval == nil {
+		return DefaultProgressLogInterval
+	}
+	return c.Log.ProgressInterval.D()
+}
+
 // LogLevel 返回 log.level 对应的 slog.Level。必须在 Validate 之后调用
 // （归一化结果存于私有字段 logLevel）；未经过 Validate 的构造场景兜底返回 Info。
 func (c *Config) LogLevel() slog.Level {
@@ -763,6 +790,7 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		URLRedirectAllErrorRetry:  c.GlobalURLRedirectAllErrorRetry(),
 		URLRedirectProbeTimeout:   c.GlobalURLRedirectProbeTimeout(),
 		URLRedirectHedgeDelay:     c.GlobalURLRedirectHedgeDelay(),
+		ProgressLogInterval:       c.ProgressLogInterval(),
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
