@@ -85,7 +85,8 @@ type Server struct {
 	dockerTokens map[string]dockerTokenEntry
 }
 
-// New 创建 Server：预编译全局与各域名规则用到的上游代理客户端。
+// New 创建 Server：预编译全局/各域名规则及其 url-redirect 候选对象用到的上游代理客户端
+// （候选级 (proxy, connect-timeout) 组合按候选显式 ?? 规则 ?? 全局 解析后一并纳入）。
 // caches 传 nil 表示禁用缓存；多目录场景由 Manager 按生效目录复用实例。
 func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
@@ -104,6 +105,19 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	if p := strings.TrimSpace(cfg.HTTPProxy); p != "" {
 		baseCombos[upstreamClientKey{proxy: p, connectTimeout: cfg.GlobalConnectTimeout()}] = struct{}{}
 	}
+	// 全局 url-redirect 候选列表：候选对象可显式配置 http-proxy / connect-timeout
+	//（三级优先级最高），按「item 显式 ?? 全局 eff」解析并纳入预构建；
+	// 未配置候选级字段时解析结果与全局组合相同（map 去重，不产生多余客户端）。
+	globalEff := config.Options{
+		HTTPProxy:      strings.TrimSpace(cfg.HTTPProxy),
+		ConnectTimeout: cfg.GlobalConnectTimeout(),
+	}
+	for _, item := range cfg.URLRedirect {
+		baseCombos[upstreamClientKey{
+			proxy:          globalEff.CandidateHTTPProxy(item),
+			connectTimeout: globalEff.CandidateConnectTimeout(item),
+		}] = struct{}{}
+	}
 	for i := range cfg.DomainRules {
 		r := &cfg.DomainRules[i]
 		proxy := strings.TrimSpace(cfg.HTTPProxy) // 规则未配 http-proxy 时沿用全局
@@ -115,6 +129,18 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 			ct = r.ConnectTimeout.D()
 		}
 		baseCombos[upstreamClientKey{proxy: proxy, connectTimeout: ct}] = struct{}{}
+		// 规则级候选列表：按「item 显式 ?? 该规则 eff」逐候选解析（与运行期
+		// ExpandCandidates 的解析同源），候选显式组合与规则组合不同时补建对应客户端；
+		// 未配置候选级字段时解析结果即上面的规则组合，map 去重不产生多余客户端
+		ruleEff := config.Options{HTTPProxy: proxy, ConnectTimeout: ct}
+		if r.URLRedirect != nil {
+			for _, item := range *r.URLRedirect {
+				baseCombos[upstreamClientKey{
+					proxy:          ruleEff.CandidateHTTPProxy(item),
+					connectTimeout: ruleEff.CandidateConnectTimeout(item),
+				}] = struct{}{}
+			}
+		}
 	}
 	comboSet := make(map[upstreamClientKey]struct{}, 2*len(baseCombos))
 	anyInsecure := configHasInsecureSkipVerify(cfg)
@@ -369,7 +395,7 @@ func targetKind(fullURL bool) string {
 
 // handleGet 处理 GET 请求：读缓存（HIT）或 单飞回源 + 写缓存（MISS）；不可缓存时直接回源（BYPASS）。
 // fullURL 区分两类目标的缓存 key 输入（见 cacheKeyInput）：完整 URL = target 原文
-//（兼容已有缓存文件）；路径目标 = 「http://<入站Host>/<路径目标>」（入站 Host 参与，
+// （兼容已有缓存文件）；路径目标 = 「http://<入站Host>/<路径目标>」（入站 Host 参与，
 // 避免不同入站域名的同路径缓存互相污染）。
 //
 // 路径目标请求（fullURL=false，docker registry 回源）的回源为流式透传：
@@ -553,7 +579,7 @@ func (s *Server) finalizeFetchEntry(key, target string, ent *cache.Entry, eff co
 // handleHead 处理 HEAD 请求（docker registry 用 HEAD 探测 manifest/blob 元信息）：
 // 与 GET 一致统一走候选轮询管线（完整 URL 与路径目标行为相同）——
 // 先查缓存（复用 GET 写下的条目回放响应头，无 body）；未命中按候选轮询回源
-//（请求方法保持 HEAD，让 HEAD 探测同样打到镜像站）；HEAD 响应无 body，一律不写缓存。
+// （请求方法保持 HEAD，让 HEAD 探测同样打到镜像站）；HEAD 响应无 body，一律不写缓存。
 // 未配置 url-redirect（候选为空）时由 fetchViaCandidates 回退 fetchDirect 直连，与旧版一致。
 func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target string, fullURL bool, eff config.Options, start time.Time) {
 	key := cache.Key(cacheKeyInput(r, target, fullURL))
@@ -624,7 +650,7 @@ func (s *Server) cacheFor(eff config.Options) (*cache.Cache, error) {
 // 完整 URL 目标（web）回放；GET 路径目标的流式透传见 fetchViaCandidatesStreaming）：
 //  1. 展开生效的 url-redirect 模板为候选 URL 列表（占位符见 RequestVars：$1 与请求级变量）；
 //     无模板且目标为完整 URL 时直接请求原始 URL，路径目标无模板直接报错
-//    （路径目标必须由规则模板拼出回源地址，没有可直连的原始 URL）；
+//     （路径目标必须由规则模板拼出回源地址，没有可直连的原始 URL）；
 //  2. 按 round-robin 轮换的起始下标在候选上执行「探测提速管线」（见 candidates.go）：
 //     probe-timeout 探测预算 + 硬失败快切（403 / token dance 后仍 401，跳过 item 重试）
 //     + 阶梯并发竞速（hedge，第一个通过 success-check 的候选胜出，其余取消）；
@@ -890,7 +916,7 @@ func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *ht
 // dockerAuthDanceRetry 是 token dance 的请求/响应阶段核心（缓冲与探测式尝试共用）：
 // 解析挑战 → 排干并关闭首个 401 响应 → 去 realm 匿名取 token（进程内缓存优先）→
 // 复制原上游请求删除 Authorization 后改为 Bearer 重试一次，重试响应头可用即返回
-//（body 未读，由调用方决定读完整（缓冲）还是只读首块（探测））。
+// （body 未读，由调用方决定读完整（缓冲）还是只读首块（探测））。
 // 返回值：
 //   - resp2：带 token 重试的响应（ok=true 时非 nil，由调用方负责关闭）；
 //   - consumed：首个 401 响应是否已被排干并关闭（挑战可解析即 true——此后原响应
@@ -1251,7 +1277,7 @@ func ExtractTarget(r *http.Request) (target string, fullURL bool, err error) {
 
 // isFullURLTarget 判断 target 是否为完整 http/https URL（url.Parse 后 scheme 合法且 host 非空），
 // 与 ExtractTarget 的完整 URL 判定保持同一语义，供回源链路区分两类目标
-//（直连回退 / 无模板直连仅对完整 URL 目标适用）。
+// （直连回退 / 无模板直连仅对完整 URL 目标适用）。
 func isFullURLTarget(target string) bool {
 	u, err := url.Parse(target)
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"proxy-cache/config"
 )
@@ -54,7 +55,7 @@ func NewRequestVars(r *http.Request, target string) RequestVars {
 }
 
 // inboundScheme 推断入站请求的 scheme：优先取请求头 X-Forwarded-Proto 的首个值
-//（同一头可逗号分隔多个值，取第 1 个；归一化小写），未提供时按 r.TLS 判定 https，否则 http。
+// （同一头可逗号分隔多个值，取第 1 个；归一化小写），未提供时按 r.TLS 判定 https，否则 http。
 func inboundScheme(r *http.Request) string {
 	if fp := r.Header.Get("X-Forwarded-Proto"); fp != "" {
 		if first := strings.ToLower(strings.TrimSpace(strings.SplitN(fp, ",", 2)[0])); first != "" {
@@ -69,7 +70,7 @@ func inboundScheme(r *http.Request) string {
 
 // pairs 返回全部占位符（变量名 -> 替换值），按变量名长度降序排序：
 // full_url_no_server 必须先于 full_url 展开，避免长变量名被同前缀的短变量名抢先遮蔽
-//（如 $http.server.header.full_url 抢先吃掉 $http.server.header.full_url_no_server 的前缀）。
+// （如 $http.server.header.full_url 抢先吃掉 $http.server.header.full_url_no_server 的前缀）。
 func (v RequestVars) pairs() []redirectVar {
 	pairs := []redirectVar{
 		{name: config.PlaceholderTarget, value: v.Target},
@@ -80,9 +81,11 @@ func (v RequestVars) pairs() []redirectVar {
 	return pairs
 }
 
-// candidate 是展开后的单个候选：模板经占位符替换后的最终 URL + 该候选生效的
-// insecure-skip-verify（三级配置的解析结果：候选显式 ?? 规则 ?? 全局，
-// 由 config.Options.CandidateInsecureSkipVerify 逐候选计算）。
+// candidate 是展开后的单个候选：模板经占位符替换后的最终 URL + 该候选逐项解析后的
+// 生效配置（三级优先级的最终结果：候选显式 ?? 规则 ?? 全局，由 config.Options 的
+// CandidateInsecureSkipVerify / CandidateHTTPProxy / CandidateConnectTimeout /
+// CandidateHTTPTimeout / CandidateReadTimeout / CandidateProbeTimeout 逐候选计算，
+// 见 ExpandCandidates）。
 type candidate struct {
 	// url 候选最终 URL（占位符替换后；斜杠接缝去重等语义与旧版一致）。
 	url string
@@ -90,6 +93,23 @@ type candidate struct {
 	// true 时该候选走 insecure 专属 http.Client（TLSClientConfig.InsecureSkipVerify=true），
 	// 覆盖该候选路径上的所有上游连接（含 30x 重定向目标与 token dance 的后续请求）。
 	insecureSkipVerify bool
+	// httpProxy 该候选回源走上游代理（候选显式 ?? 规则 ?? 全局的解析结果）：
+	// 空串 = 直连；候选显式空串是「强制直连」语义，覆盖上层已配置的代理。
+	httpProxy string
+	// connectTimeout 该候选的建连超时（TCP 拨号 + TLS 握手共用；0 = 不限制）：
+	// 与 httpProxy/insecureSkipVerify 共同决定候选使用的 (代理, connect-timeout, insecure)
+	// 客户端组合（见 Server.client）。
+	connectTimeout time.Duration
+	// httpTimeout 该候选单次尝试的总超时（0 = 不限制）：覆盖建连 + 响应头 + 完整读
+	// body + token dance 及其带 token 重试，按每次尝试独立计时。
+	httpTimeout time.Duration
+	// readTimeout 该候选的「无新增数据超时」看门狗预算（0 = 不限制）：
+	// 慢速但持续传输的候选不被误砍，窗口内无新数据才触发超时。
+	readTimeout time.Duration
+	// probeTimeout 该候选单次尝试的探测预算（0 = 不限制）：从发出请求到「响应头可用
+	//（含 token dance 的第二次响应）且成功判据可判定」的时限，到期硬失败快切下一候选；
+	// 仅约束探测阶段，探测通过后的 body 读取不受它约束。
+	probeTimeout time.Duration
 }
 
 // ExpandCandidates 把 url-redirect 候选对象列表展开为候选列表：
@@ -100,8 +120,11 @@ type candidate struct {
 // 斜杠接缝去重：full_url_no_server 的值以 / 开头，若模板中占位符前紧邻 /（如
 // https://docker.1panel.live/$http.server.header.full_url_no_server），接缝处的两个 /
 // 合并为一个，保证展开结果为 https://docker.1panel.live/v2/... 而非 ...//v2/...（见 replaceVar）。
-// insecure-skip-verify 按「候选显式 ?? eff.InsecureSkipVerify（规则 ?? 全局）」解析，
-// 逐候选独立生效（见 config.Options.CandidateInsecureSkipVerify）。
+// 候选级生效值按「item 显式 ?? eff 对应字段（规则 ?? 全局）」逐候选独立解析：
+// insecure-skip-verify（见 config.Options.CandidateInsecureSkipVerify）、http-proxy
+// （候选显式空串 = 强制直连，见 config.Options.CandidateHTTPProxy）与四个超时
+// （connect-timeout / http-timeout / read-timeout / probe-timeout，候选显式 0 = 不限制），
+// 使单个候选可单独走指定代理并放宽/收紧各类超时（慢代理场景），互不影响其他候选。
 func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff config.Options) []candidate {
 	if len(items) == 0 {
 		return nil
@@ -113,7 +136,15 @@ func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff conf
 		for _, v := range pairs {
 			t = replaceVar(t, v.name, v.value)
 		}
-		out = append(out, candidate{url: t, insecureSkipVerify: eff.CandidateInsecureSkipVerify(item)})
+		out = append(out, candidate{
+			url:                t,
+			insecureSkipVerify: eff.CandidateInsecureSkipVerify(item),
+			httpProxy:          eff.CandidateHTTPProxy(item),
+			connectTimeout:     eff.CandidateConnectTimeout(item),
+			httpTimeout:        eff.CandidateHTTPTimeout(item),
+			readTimeout:        eff.CandidateReadTimeout(item),
+			probeTimeout:       eff.CandidateProbeTimeout(item),
+		})
 	}
 	return out
 }
@@ -123,7 +154,7 @@ func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff conf
 //     使「https://mirror/$http.server.header.full_url_no_server」+「/v2/...」展开为
 //     https://mirror/v2/...（而非 //v2/...），与镜像站 base 以 / 结尾的常见写法天然拼接；
 //   - 仅向前扫描、不重扫已写入的替换值：value 内即使再出现占位符字面量也不会被二次替换
-//    （与 strings.ReplaceAll 的非递归语义一致，且避免死循环）。
+//     （与 strings.ReplaceAll 的非递归语义一致，且避免死循环）。
 func replaceVar(t, name, value string) string {
 	for _, pat := range []string{"${" + name + "}", "$" + name} {
 		var b strings.Builder

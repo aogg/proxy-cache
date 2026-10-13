@@ -66,7 +66,7 @@ const (
 )
 
 // url-redirect 模板占位符（变量名，不含 $ / ${} 包裹形式；每个变量均支持 $name 与 ${name} 写法）。
-// 占位符名统一定义在本包：模板校验（validateRedirectTemplates）与 proxy 包的模板展开
+// 占位符名统一定义在本包：模板校验（validateRedirectItems）与 proxy 包的模板展开
 // （ExpandCandidates）共用同一套常量，避免两处维护漂移。
 const (
 	// PlaceholderTarget 目标串（$1 / ${1}，兼容保留）：完整 URL 请求 = 目标 URL 原文；
@@ -253,16 +253,27 @@ type RuleCache struct {
 
 // urlRedirectItemReservedFields 候选对象的「预留字段」清单（语义已规划、本期未实现）：
 // 配置它们会在解析期报错（绝不静默忽略），错误信息会提示暂未实现。
-const urlRedirectItemReservedFields = "enabled / http-proxy / weight / probe-timeout / hedge-delay"
+// 历史预留的 http-proxy 与 probe-timeout 已实现（候选级 http-proxy 与候选级超时覆盖，
+// 见 URLRedirectItem 与 Options.CandidateHTTPProxy 等），故从预留清单移除；
+// hedge-delay 是候选阶梯竞速的放行间隔（作用于候选序列之间的调度，而非单个候选的
+// 独立属性），不适合按候选对象配置，继续保持预留报错。
+const urlRedirectItemReservedFields = "enabled / weight / hedge-delay"
 
 // URLRedirectItem 是 url-redirect 候选列表的对象形态（破坏性变更：不再支持旧版纯字符串写法，
 // 解析期报错并给出迁移示例，见 UnmarshalYAML）。本期实现的字段：
 //   - template（必填非空）：即旧版的模板字符串，占位符语义不变（$1 / ${1} 与
 //     $http.server.header.* 变量，见 RedirectPlaceholders）；
-//   - insecure-skip-verify（可选）：候选级「忽略 TLS 证书校验」。
+//   - insecure-skip-verify（可选）：候选级「忽略 TLS 证书校验」；
+//   - http-proxy（可选）：候选级回源代理（显式空串 = 该候选强制直连）；
+//   - connect-timeout / http-timeout / read-timeout / probe-timeout（可选）：
+//     候选级超时覆盖（probe-timeout 是规则/全局 url-redirect-probe-timeout 的候选级短名）。
 //
-// 预留字段（本期未实现，配置即报错）：enabled（临时下线候选）、http-proxy（候选级回源代理）、
-// weight（加权轮询）、probe-timeout / hedge-delay（候选级覆盖探测预算/竞速间隔）。
+// 除 template 外的全部字段均为三级优先级（高 → 低）：候选对象显式值 > 规则级 > 全局，
+// 生效值经 Options.CandidateHTTPProxy / CandidateConnectTimeout / CandidateHTTPTimeout /
+// CandidateReadTimeout / CandidateProbeTimeout / CandidateInsecureSkipVerify 逐候选解析。
+//
+// 预留字段（本期未实现，配置即报错）：enabled（临时下线候选）、weight（加权轮询）、
+// hedge-delay（候选竞速放行间隔，作用于候选序列调度、非单候选属性，见 urlRedirectItemReservedFields）。
 type URLRedirectItem struct {
 	// Template 候选模板（必填，trim 后非空；Validate 阶段校验 http(s):// 前缀与占位符）。
 	Template string `yaml:"template"`
@@ -274,6 +285,36 @@ type URLRedirectItem struct {
 	// `tls: failed to verify certificate: x509: certificate signed by unknown authority`），
 	// 推荐在该候选上精确开启，而非打开规则级/全局开关。
 	InsecureSkipVerify *bool `yaml:"insecure-skip-verify"`
+	// HTTPProxy 候选级回源代理（可选）：三级优先级候选 > 规则 > 全局，生效值经
+	// Options.CandidateHTTPProxy 解析。三种取值语义：
+	//   - nil（未配置）：继承规则级 http-proxy（仍为 nil 再继承全局）；
+	//   - 显式空串（trim 后为空）：该候选**强制直连**——显式覆盖上层已配置的代理
+	//    （「个别镜像站走代理、其余直连」或反过来都靠它精确表达）；
+	//   - 非空：该候选走指定代理（http/https/socks5 地址，Validate 阶段过 validateProxyAddr）。
+	HTTPProxy *string `yaml:"http-proxy"`
+	// ConnectTimeout 候选级建连超时（TCP 拨号 + TLS 握手共用；可选）：
+	// nil = 继承规则级 connect-timeout（仍为 nil 再继承全局），生效值经
+	// Options.CandidateConnectTimeout 解析；显式 0 = 不限制；负数为配置错误（Validate 拒绝）。
+	// 典型场景：走慢代理的候选放宽建连预算，不影响其他候选的快速失败节奏。
+	ConnectTimeout *Duration `yaml:"connect-timeout"`
+	// HTTPTimeout 候选级单次尝试总超时（可选）：覆盖该候选「建连 + 响应头 + 完整读 body +
+	// 401 后 token dance 及其带 token 重试」整段，按每次尝试独立计时。nil = 继承规则级
+	// http-timeout（仍为 nil 再继承全局），生效值经 Options.CandidateHTTPTimeout 解析；
+	// 显式 0 = 不限制；负数为配置错误（Validate 拒绝）。
+	HTTPTimeout *Duration `yaml:"http-timeout"`
+	// ReadTimeout 候选级「无新增数据超时」（idle，可选）：窗口内有进度就重置计时器，
+	// 无任何新数据才触发超时并取消该次尝试——慢速但持续传输的大文件不会被误砍。
+	// nil = 继承规则级 read-timeout 的最终回落结果（含旧 timeout 退化别名链，见
+	// Options.ReadTimeout），生效值经 Options.CandidateReadTimeout 解析；
+	// 显式 0 = 不限制；负数为配置错误（Validate 拒绝）。
+	ReadTimeout *Duration `yaml:"read-timeout"`
+	// ProbeTimeout 候选级探测预算（可选）：规则/全局 url-redirect-probe-timeout 的候选级短名
+	//（沿用原预留字段规划命名）——从发出请求到「响应头可用（含 401 token dance 的第二次响应）
+	// 且成功判据可判定」的时限，到期取消该次尝试并硬失败快切下一候选；仅约束探测阶段。
+	// nil = 继承规则级 url-redirect-probe-timeout（仍为 nil 再继承全局，全局未配置缺省 5s），
+	// 生效值经 Options.CandidateProbeTimeout 解析；显式 0 = 不限制；负数为配置错误（Validate 拒绝）。
+	// 典型场景：走慢代理的候选放宽探测预算（代理握手耗时长，全局 5s 会在代理上全部超时）。
+	ProbeTimeout *Duration `yaml:"probe-timeout"`
 }
 
 // UnmarshalYAML 自定义解析（yaml.Node 按 Kind 判别形态）：
@@ -299,11 +340,12 @@ func (it *URLRedirectItem) UnmarshalYAML(node *yaml.Node) error {
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		key := node.Content[i]
 		switch strings.ToLower(strings.TrimSpace(key.Value)) {
-		case "template", "insecure-skip-verify":
-			// 本期支持的合法字段
+		case "template", "insecure-skip-verify", "http-proxy",
+			"connect-timeout", "http-timeout", "read-timeout", "probe-timeout":
+			// 本期支持的合法字段（http-proxy 与四个超时为候选级三级覆盖，见 URLRedirectItem 字段注释）
 		default:
 			return fmt.Errorf(
-				"第 %d 行: url-redirect 候选对象不支持字段 %q（支持字段: template / insecure-skip-verify；预留字段 %s 本期未实现，暂不可配置）",
+				"第 %d 行: url-redirect 候选对象不支持字段 %q（支持字段: template / insecure-skip-verify / http-proxy / connect-timeout / http-timeout / read-timeout / probe-timeout；预留字段 %s 本期未实现，暂不可配置）",
 				key.Line, key.Value, urlRedirectItemReservedFields)
 		}
 	}
@@ -643,6 +685,61 @@ func (o Options) CandidateInsecureSkipVerify(item URLRedirectItem) bool {
 	return o.InsecureSkipVerify
 }
 
+// candidateDurationOverride 候选级时长三级优先级的公共实现：候选对象显式指针非 nil
+// 时取候选值（含显式 0 = 不限制），否则回落 o 内对应字段（已是规则显式 ?? 全局 的
+// 合并结果，见 ResolveOptions）。负数已在 Validate 拦截，这里不做重复校验。
+func candidateDurationOverride(item *Duration, eff time.Duration) time.Duration {
+	if item != nil {
+		return item.D()
+	}
+	return eff
+}
+
+// CandidateHTTPProxy 返回候选对象的回源代理最终生效值——三级优先级的最后一步：
+// 候选显式值（trim 后原样返回）?? o.HTTPProxy（后者已是规则显式 ?? 全局 的合并结果，
+// 见 ResolveOptions）。即：候选对象 http-proxy > 规则 http-proxy > 全局 http-proxy。
+// 特别的，候选显式空串（含仅空白）是「该候选强制直连」的显式语义：返回空串覆盖
+// 上层已配置的代理，实现「个别候选走代理、其余直连」或其反向的精确表达；
+// 非 nil 但含空白时 trim 后返回（与全局/规则级的 trim 语义一致）。
+func (o Options) CandidateHTTPProxy(item URLRedirectItem) string {
+	if item.HTTPProxy != nil {
+		return strings.TrimSpace(*item.HTTPProxy)
+	}
+	return o.HTTPProxy
+}
+
+// CandidateConnectTimeout 返回候选对象的建连超时最终生效值（TCP 拨号 + TLS 握手共用）——
+// 候选对象 connect-timeout > 规则 connect-timeout > 全局 connect-timeout；
+// 显式 0 = 不限制（覆盖上层已配置的预算），nil = 逐级继承。
+func (o Options) CandidateConnectTimeout(item URLRedirectItem) time.Duration {
+	return candidateDurationOverride(item.ConnectTimeout, o.ConnectTimeout)
+}
+
+// CandidateHTTPTimeout 返回候选对象单次尝试总超时最终生效值（覆盖建连 + 响应头 +
+// 完整读 body + token dance 及其带 token 重试，按每次尝试独立计时）——
+// 候选对象 http-timeout > 规则 http-timeout > 全局 http-timeout；
+// 显式 0 = 不限制，nil = 逐级继承。
+func (o Options) CandidateHTTPTimeout(item URLRedirectItem) time.Duration {
+	return candidateDurationOverride(item.HTTPTimeout, o.HTTPTimeout)
+}
+
+// CandidateReadTimeout 返回候选对象「无新增数据超时」最终生效值——
+// 候选对象 read-timeout > o.ReadTimeout（后者已是 rule.read-timeout > rule.timeout >
+// global.read-timeout > global.timeout 的最终回落结果，见 ResolveOptions）；
+// 显式 0 = 不限制，nil = 逐级继承。
+func (o Options) CandidateReadTimeout(item URLRedirectItem) time.Duration {
+	return candidateDurationOverride(item.ReadTimeout, o.ReadTimeout)
+}
+
+// CandidateProbeTimeout 返回候选对象单次探测预算最终生效值（URLRedirectItem.ProbeTimeout
+// 是规则/全局 url-redirect-probe-timeout 的候选级短名）——
+// 候选对象 probe-timeout > 规则 url-redirect-probe-timeout > 全局 url-redirect-probe-timeout。
+// 注意全局缺省语义：未逐级配置时 o.URLRedirectProbeTimeout 已兜底缺省 5s
+// （GlobalURLRedirectProbeTimeout），显式 0 = 不限制，nil = 逐级继承。
+func (o Options) CandidateProbeTimeout(item URLRedirectItem) time.Duration {
+	return candidateDurationOverride(item.ProbeTimeout, o.URLRedirectProbeTimeout)
+}
+
 // Default 返回内置默认配置（配置文件缺失时兜底，也是 Load 时叠加解析的底版：
 // YAML 中未出现的字段保持这里的默认值）。
 func Default() *Config {
@@ -771,7 +868,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("http-proxy 配置无效: %w", err)
 		}
 	}
-	if err := validateRedirectTemplates(c.URLRedirect, "url-redirect"); err != nil {
+	if err := validateRedirectItems(c.URLRedirect, "url-redirect"); err != nil {
 		return err
 	}
 	// //////////////////  全局取值校验  end  ////////////////////////////////////////////////
@@ -821,7 +918,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		if r.URLRedirect != nil {
-			if err := validateRedirectTemplates(*r.URLRedirect, fmt.Sprintf("domain-rules[%d] (%s) 的 url-redirect", i, r.Label())); err != nil {
+			if err := validateRedirectItems(*r.URLRedirect, fmt.Sprintf("domain-rules[%d] (%s) 的 url-redirect", i, r.Label())); err != nil {
 				return err
 			}
 		}
@@ -1338,11 +1435,18 @@ func validateProxyAddr(addr string) error {
 	return fmt.Errorf("%q 需为 http(s)/socks5 代理地址，例如 http://127.0.0.1:7890", addr)
 }
 
-// validateRedirectTemplates 校验 url-redirect 候选列表（就地去除模板首尾空白）：
-// 每个候选的 template 必须非空、以 http(s):// 开头，且至少包含一个已知占位符——
-// $1 / ${1}，或任一已知 $http.server.header.* 变量的 $ / ${} 形式（错误信息列出全部合法写法）。
-// 候选的 insecure-skip-verify 与规则级 insecure-skip-verify 均为指针可选项，无需在此校验。
-func validateRedirectTemplates(list []URLRedirectItem, where string) error {
+// validateRedirectItems 校验 url-redirect 候选列表（就地去除模板首尾空白）：
+//   - 每个候选的 template 必须非空、以 http(s):// 开头，且至少包含一个已知占位符——
+//     $1 / ${1}，或任一已知 $http.server.header.* 变量的 $ / ${} 形式（错误信息列出全部合法写法）；
+//   - 候选级 http-proxy：trim 后非空必须过 validateProxyAddr（nil = 继承上级、
+//     显式空串 = 该候选强制直连，两者均合法无需校验）；
+//   - 候选级四个超时（connect-timeout / http-timeout / read-timeout / probe-timeout）：
+//     负数为配置错误（显式 0 = 不限制，合法）；错误信息带候选序号定位；
+//   - 候选的 insecure-skip-verify 为指针 bool 可选项，无需在此校验。
+//
+// 全局与规则级候选列表共用本函数（where 提供定位前缀，如
+// 「domain-rules[0] (r) 的 url-redirect」）。
+func validateRedirectItems(list []URLRedirectItem, where string) error {
 	for i := range list {
 		t := strings.TrimSpace(list[i].Template)
 		if t == "" {
@@ -1354,6 +1458,27 @@ func validateRedirectTemplates(list []URLRedirectItem, where string) error {
 		if !hasKnownPlaceholder(t) {
 			return fmt.Errorf("%s 第 %d 个候选模板 %q 缺少占位符（合法占位符: %s）",
 				where, i, t, placeholderHelp())
+		}
+		// 候选级 http-proxy：trim 后非空才校验地址格式（与全局/规则级 http-proxy 同一套校验）
+		if list[i].HTTPProxy != nil && strings.TrimSpace(*list[i].HTTPProxy) != "" {
+			if err := validateProxyAddr(*list[i].HTTPProxy); err != nil {
+				return fmt.Errorf("%s 第 %d 个候选的 http-proxy 无效: %w", where, i, err)
+			}
+		}
+		// 候选级超时四键：负数为配置错误（复用 validateNonNegativeDuration 的错误文案，
+		// 外层补候选序号定位；显式 0 = 不限制，合法）
+		for _, f := range []struct {
+			name string
+			d    *Duration
+		}{
+			{"connect-timeout", list[i].ConnectTimeout},
+			{"http-timeout", list[i].HTTPTimeout},
+			{"read-timeout", list[i].ReadTimeout},
+			{"probe-timeout", list[i].ProbeTimeout},
+		} {
+			if err := validateNonNegativeDuration(f.d, f.name); err != nil {
+				return fmt.Errorf("%s 第 %d 个候选的 %w", where, i, err)
+			}
 		}
 		list[i].Template = t
 	}

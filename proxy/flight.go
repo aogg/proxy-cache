@@ -41,7 +41,7 @@ type flightCall struct {
 }
 
 // Do 执行或等待 key 对应的在途调用：首个调用方真正执行 fn，后续同 key 调用等待其完成
-//（无限期等待，与旧版行为一致；等价于 DoLimit(key, 0, fn)）。
+// （无限期等待，与旧版行为一致；等价于 DoLimit(key, 0, fn)）。
 func (g *flightGroup) Do(key string, fn func() (*cache.Entry, error)) (*cache.Entry, error) {
 	e, _, err := g.DoLimit(key, 0, fn)
 	return e, err

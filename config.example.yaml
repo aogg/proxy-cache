@@ -30,7 +30,9 @@ log:
 
 # ----------------------------------------------------------------------------
 # 回源超时（三个相互独立；全局与 domain-rules 规则级都可配，规则覆盖全局，
-# 同一字段规则没配就用全局，全局也没有 = 该项不限制）
+# 同一字段规则没配就用全局，全局也没有 = 该项不限制；
+# url-redirect 候选对象还可用 connect-timeout / http-timeout / read-timeout /
+# probe-timeout 按候选覆盖（三级优先级：候选 > 规则 > 全局），见下方 url-redirect 说明）
 # ----------------------------------------------------------------------------
 # http-timeout    单次上游尝试的总超时：覆盖「建连 + 响应头 + 完整读 body +
 #                 401 后 token dance 及其带 token 重试」整个尝试，按每次尝试
@@ -51,7 +53,8 @@ log:
 #timeout: 60s              # 旧字段：仅当 read-timeout 未配置时才作为 read-timeout 生效
 
 # 全局上游代理（http/https/socks5 地址），所有回源请求都会走它；留空表示直连
-# 域名规则里可用 http-proxy 单独覆盖
+# 三级覆盖（高→低）：url-redirect 候选对象 http-proxy（显式空串 = 该候选强制直连）>
+# 域名规则 http-proxy > 本全局值（候选级见下方 url-redirect 说明）
 http-proxy: ""
 # http-proxy: "http://127.0.0.1:7890"
 
@@ -200,6 +203,16 @@ url-redirect:
   # 仅某个候选证书不受信时精确开启（省略则继承规则级/全局配置）：
   # - template: https://docker.actima.top/$http.server.header.full_url_no_server
   #   insecure-skip-verify: true
+  # 候选级 http-proxy 与超时覆盖（三级优先级：候选 > 规则 > 全局；仅该候选生效）：
+  # 慢代理场景示例——某个候选必须走代理时单独指定，并按代理质量放宽该候选超时，
+  # 其余候选不受影响；候选 http-proxy 显式写 ""（空串）= 该候选强制直连（覆盖上层代理）
+  # - template: https://slow.via-proxy.example/$1
+  #   http-proxy: socks5://127.0.0.1:1080   # 该候选走 socks5/http/https 代理
+  #   connect-timeout: 30s                  # 该候选建连放宽（0 = 不限制；负数非法）
+  #   http-timeout: 20m                     # 该候选单次尝试总超时放宽
+  #   read-timeout: 120s                    # 该候选无新增数据超时
+  #   probe-timeout: 20s                    # 该候选探测预算（规则/全局
+  #                                         #   url-redirect-probe-timeout 的候选级短名）
 
 # 缓存配置
 # 注意：整块注释掉 cache: 并不等于关闭缓存！未配置时启用内置默认值
@@ -349,6 +362,14 @@ domain-rules:
   #     - template: https://docker.1ms.run/$http.server.header.full_url_no_server
   #     - template: https://docker.actima.top/$http.server.header.full_url_no_server
   #       insecure-skip-verify: true   # 仅这个镜像站证书不受信，候选级精确开启
+  #     # 候选级 http-proxy 与超时（三级优先级：候选 > 规则 > 全局；仅该候选生效）：
+  #     # 慢代理候选单独走 socks5 并放宽超时（直连候选保持规则级 5s 探测预算快速失败）；
+  #     # 候选 http-proxy 显式写 ""（空串）= 该候选强制直连（覆盖规则/全局代理）
+  #     - template: https://slow.via-proxy.example/$http.server.header.full_url_no_server
+  #       http-proxy: socks5://127.0.0.1:1080
+  #       connect-timeout: 30s
+  #       http-timeout: 20m
+  #       probe-timeout: 20s
 
 # 允许/拒绝列表（正则，优先级高于缓存与回源）：完整 URL 请求对目标 URL 匹配；
 # 路径目标请求对「http://<入站Host>/<路径目标>」整串匹配（保持拦截能力）

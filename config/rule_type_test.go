@@ -20,9 +20,9 @@ import (
 // 同一条 match 正则可同时命中两类请求的匹配串（「http://<Host>/<目标>」），
 // 从而保证「命中与否只由 type 过滤决定」，与 match 正则无关。
 const (
-	hostRuleType   = "registry-proxy-cache.example.com:5480"          // 入站 Host（docker registry 场景）
-	fullTargetType = "https://example.com/some/file.yaml"             // 完整 URL 请求的目标串（fullURL=true）
-	pathTargetType = "v2/adockero/proxy-cache/manifests/latest"       // 路径目标请求的目标串（fullURL=false，无前导斜杠）
+	hostRuleType   = "registry-proxy-cache.example.com:5480"           // 入站 Host（docker registry 场景）
+	fullTargetType = "https://example.com/some/file.yaml"              // 完整 URL 请求的目标串（fullURL=true）
+	pathTargetType = "v2/adockero/proxy-cache/manifests/latest"        // 路径目标请求的目标串（fullURL=false，无前导斜杠）
 	ruleTypeMatch  = `http://registry-proxy-cache\.example\.com:5480/` // 同时覆盖两类请求串的 match 前缀
 )
 
@@ -89,12 +89,12 @@ func TestValidateRuleType(t *testing.T) {
 
 // TestResolveOptionsRuleTypeFilter 表驱动验证 ResolveOptions 的请求类型过滤语义：
 // type: docker 仅承接路径目标请求（fullURL=false）；type: web 仅承接完整 URL 请求
-//（fullURL=true）；留空不过滤、两类请求都命中（旧配置兼容回归）。
+// （fullURL=true）；留空不过滤、两类请求都命中（旧配置兼容回归）。
 // 类型不符时落全局默认（Rule 为空串、ttl 沿用全局），而非报错。
 func TestResolveOptionsRuleTypeFilter(t *testing.T) {
 	const (
 		ruleName = "type-rule"
-		ruleTTL  = 6 * time.Hour   // 命中规则的 ttl 标记
+		ruleTTL  = 6 * time.Hour // 命中规则的 ttl 标记
 	)
 
 	tests := []struct {

@@ -1,6 +1,6 @@
 package config
 
-// redirect_templates_test.go —— validateRedirectTemplates 的单测（c470a9c 语义）：
+// redirect_templates_test.go —— validateRedirectItems 的单测（c470a9c 语义）：
 // 校验规则从「必须含 $1」放宽为「至少含一个已知占位符」（$1 / ${1} 兼容保留，
 // 以及 $http.server.header.full_url / full_url_no_server 的 $ 与 ${} 两种写法），
 // 新错误文案需列出全部合法占位符写法；模板仍必须以 http(s):// 开头。

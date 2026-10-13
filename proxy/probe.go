@@ -143,9 +143,14 @@ func probeHardFailReason(res *probeResult) string {
 }
 
 // startUpstream 单次上游尝试的公共底层（候选探测管线与慢速升级多源并发续传共用）：
-// 覆盖「建请求头（白名单透传 + 可选 Range 覆盖）→ per-candidate insecure 客户端 →
+// 覆盖「建请求头（白名单透传 + 可选 Range 覆盖）→ per-candidate 客户端 →
 // 响应头 → 探测首块 → 401 匿名 token dance」整段，探测预算（probe-timeout）不在其中
 // （仅探测管线需要，probeCandidateAttempt 在外层经 onWatchdog 联动自行包装）。
+//
+// 尝试级超时与客户端均取候选级生效值（cand 内字段，ExpandCandidates 已按
+// 「候选显式 ?? 规则 ?? 全局」逐候选解析）：http-timeout 整次尝试总预算、
+// read-timeout 无新增数据看门狗、(httpProxy, connectTimeout, insecureSkipVerify)
+// 决定复用的上游 Client；单个候选可单独走指定代理/放宽预算，互不影响其他候选。
 //
 // 资源与超时所有权：
 //   - parent 为尝试父 ctx（调用方负责与客户端断开解耦，WithoutCancel）；
@@ -156,18 +161,21 @@ func probeHardFailReason(res *probeResult) string {
 //   - 成功时 cancelTimeout 与 wd.Stop 注册进返回结果的 onClose 链（流结束/放弃时统一
 //     释放）；失败时立即回收，防计时器泄漏。
 //
-// 返回 (结果, 错误)：res 非 nil 时资源所有权移交调用方。
+// 返回 (结果, 错误)：res 非 nil 时资源所有权移交调用方。eff 为该请求「规则 ?? 全局」
+// 合并生效配置，保留在签名中维持调用方语义（尝试级取值已全部随 cand 传入）。
 func (s *Server) startUpstream(parent context.Context, r *http.Request, cand candidate, eff config.Options, rangeHeader string, onWatchdog func(*progressWatchdog)) (res *probeResult, err error) {
 	urlStr := cand.url // 候选最终 URL（占位符展开后）
 	// //////////////////  http-timeout（整次尝试总预算）  start  //////////////////////////////
 	// 与客户端连接解耦由上层 ctx（WithoutCancel）保证；这里的总预算不能 defer cancel——
 	// 活体 body 在本函数返回后仍需存活，预算取消链注册进 probeResult 由 Close 统一触发。
+	// 预算取候选级生效值 cand.httpTimeout（候选显式 ?? 规则 ?? 全局，ExpandCandidates
+	// 解析），单个候选可放宽/收紧总预算而不影响其他候选。
 	attemptParent := parent
 	var cancelTimeout context.CancelFunc
-	if eff.HTTPTimeout > 0 {
-		attemptParent, cancelTimeout = context.WithTimeout(parent, eff.HTTPTimeout)
+	if cand.httpTimeout > 0 {
+		attemptParent, cancelTimeout = context.WithTimeout(parent, cand.httpTimeout)
 	}
-	wd := newProgressWatchdog(attemptParent, eff.ReadTimeout)
+	wd := newProgressWatchdog(attemptParent, cand.readTimeout)
 	if onWatchdog != nil {
 		onWatchdog(wd)
 	}
@@ -199,9 +207,14 @@ func (s *Server) startUpstream(parent context.Context, r *http.Request, cand can
 		req.Header.Set("Range", rangeHeader)
 	}
 
-	// 按该候选生效的 insecure-skip-verify 选择客户端（true = 跳过上游证书校验，
-	// 同一 (代理, connect-timeout, insecure) 组合复用同一 Client，连接复用不受影响）
-	cl := s.client(eff.HTTPProxy, eff.ConnectTimeout, cand.insecureSkipVerify)
+	// 按该候选生效的 (代理, connect-timeout, insecure) 三元组选择客户端：
+	// 三维均为候选级生效值（候选显式 ?? 规则 ?? 全局，ExpandCandidates 解析）——
+	// 候选显式 http-proxy（含显式空串 = 强制直连）与 connect-timeout 使单个候选可走
+	// 指定代理并单独放宽建连预算；true 的 insecure = 跳过上游证书校验。
+	// 同一 (代理, connect-timeout, insecure) 组合复用同一 Client，连接复用不受影响；
+	// 30x 重定向跟随与 token dance 的第二次请求沿用本 cl，天然继承候选级三维配置
+	//（fetchViaCandidates 的直连/fallback 路径不受影响，仍按 eff 走全局/规则值）
+	cl := s.client(cand.httpProxy, cand.connectTimeout, cand.insecureSkipVerify)
 	resp, err := cl.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求上游失败（%s）: %w", urlStr, wd.wrapErr(err))
@@ -264,17 +277,17 @@ func (s *Server) startUpstream(parent context.Context, r *http.Request, cand can
 // url-redirect-item-error-retry 原地重试直接切换下一候选；其余失败（网络错误、
 // 超时、判据不过）为软失败，按既有 item 重试语义原地重试。
 //
-// 尝试本体（请求头/token dance/看门狗/read-timeout/http-timeout/候选级 insecure）
-// 全部复用 startUpstream 公共底层；本函数只负责探测预算（probe-timeout）的包装：
+// 尝试本体（请求头/token dance/看门狗/read-timeout/http-timeout/候选级 (代理,
+// connect-timeout, insecure) 客户端）全部复用 startUpstream 公共底层；本函数只负责
+// 探测预算（probe-timeout）的包装，预算同样取候选级生效值 cand.probeTimeout
+// （候选显式 ?? 规则 ?? 全局，ExpandCandidates 解析——走慢代理的候选可单独放宽
+// 探测预算，其他候选保持快速失败节奏）：
 //   - probe-timeout：从发出请求到「响应头可用（含 token dance 的第二次响应）且成功
 //     判据可判定（首块读出或 EOF）」的时限，覆盖建连后的等待与 token dance 全程；
 //     到期经 AfterFunc 联动取消看门狗 ctx 使在途请求立即失败，硬失败快切下一候选；
 //     探测结束（成败皆然）即拆链停表——探测通过后预算解除，绝不影响后续 body 读取；
 //     0 = 不限制。预算 ctx 与 http-timeout 分支平级（联动只取消看门狗），
 //     成功路径拆除联动并回收预算 ctx 后，活体 body 的读取不受任何影响。
-//
-// connect-timeout 建连落在 (代理, connect-timeout) 组合的 Transport 上（与既有 client()
-// 复用逻辑一致）；insecure-skip-verify 候选级三级生效值随 cand 传入。
 func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, cand candidate, eff config.Options) (res *probeResult, err error, hard bool, hardReason string) {
 	// //////////////////  probe-timeout（探测预算，到期硬失败快切）  start  /////////////////////
 	var (
@@ -284,9 +297,9 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 		stopLink    func() bool
 		probeFired  atomic.Bool // 定时器是否已触发（区分探测预算到期与 http-timeout 到期）
 	)
-	if eff.URLRedirectProbeTimeout > 0 {
+	if cand.probeTimeout > 0 {
 		probeCtx, cancelProbe = context.WithCancel(parent)
-		probeTimer = time.AfterFunc(eff.URLRedirectProbeTimeout, func() {
+		probeTimer = time.AfterFunc(cand.probeTimeout, func() {
 			probeFired.Store(true)
 			cancelProbe()
 		})
@@ -303,7 +316,7 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 	// onWatchdog 在 startUpstream 创建看门狗后（请求发出前）被回调：
 	// 预算到期 → 取消看门狗 ctx（本次尝试的所有在途读写随之失败）
 	onWatchdog := func(wd *progressWatchdog) {
-		if eff.URLRedirectProbeTimeout > 0 {
+		if cand.probeTimeout > 0 {
 			stopLink = context.AfterFunc(probeCtx, wd.cancel)
 		}
 	}
@@ -313,8 +326,8 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 	if err != nil {
 		if probeExpired() {
 			// 探测预算到期：硬失败快切下一候选（跳过 item 原地重试）
-			return nil, fmt.Errorf("probe-timeout（探测预算 %s 内响应头/首块未就绪）: %w",
-				eff.URLRedirectProbeTimeout, err), true, "probe-timeout"
+			return nil, fmt.Errorf("probe-timeout（候选探测预算 %s 内响应头/首块未就绪）: %w",
+				cand.probeTimeout, err), true, "probe-timeout"
 		}
 		return nil, err, false, ""
 	}
@@ -324,8 +337,8 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 		// 首次读 body 就会失败，产生半截响应）
 		res.Close()
 		res = nil // 已放弃该结果：置 nil 让出口的释放链立即回收看门狗/超时预算
-		return nil, fmt.Errorf("probe-timeout（探测预算 %s 内响应头/判据未就绪）",
-			eff.URLRedirectProbeTimeout), true, "probe-timeout"
+		return nil, fmt.Errorf("probe-timeout（候选探测预算 %s 内响应头/判据未就绪）",
+			cand.probeTimeout), true, "probe-timeout"
 	}
 	return res, nil, false, ""
 }
