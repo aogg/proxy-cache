@@ -542,8 +542,12 @@ func TestPrefetchHubFailureBroadcast(t *testing.T) {
 		if w.Body.String() != string(content) {
 			t.Errorf("降级 body 与上游原文不一致（got %d 字节, want %d 字节）", w.Body.Len(), len(content))
 		}
-		if n := fx.reg.rec.calls(digest); n != 2 {
-			t.Errorf("上游应共 2 路回源（首路失败 + 客户端降级成功）, got %d", n)
+		// 3 路 = 首路预取失败（半截已保留）+ 客户端 GET 先按断点续传尝试（本假上游不支持
+		// Range、对 bytes=<n>- 回 200 → 判定明确拒绝续传、丢弃半截）+ 降级既有全量回源。
+		// （docker-partial-resume-enabled 默认开启后，预取失败保留半截使客户端 GET 多出
+		// 一路续传探测；客户端拿到的 body / 缓存语义与旧版一致，见 partial_resume.go）
+		if n := fx.reg.rec.calls(digest); n != 3 {
+			t.Errorf("上游应共 3 路回源（首路预取失败 + 续传探测被 200 拒绝 + 降级全量成功）, got %d", n)
 		}
 		if _, ok := fx.disk.Get(key); !ok {
 			t.Error("客户端降级回源成功后应写入缓存")

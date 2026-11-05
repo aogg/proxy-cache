@@ -181,3 +181,86 @@ func TestEncodeEntryTTLRounding(t *testing.T) {
 		})
 	}
 }
+
+// TestPartPathSizeRemove 验证 blob 半截文件 API（PartPath / PartSize / RemovePart，
+// 配套 proxy 包 partial_resume.go 的半截保留与无感续传）：路径定位、大小读取、幂等删除。
+func TestPartPathSizeRemove(t *testing.T) {
+	dir := t.TempDir()
+	c, err := New(dir)
+	if err != nil {
+		t.Fatalf("New() 意外报错: %v", err)
+	}
+	key := Key("https://registry.example.com/v2/app/blobs/sha256:aa")
+
+	// PartPath 定位到缓存目录内的 .part-<key>
+	wantPath := filepath.Join(dir, ".part-"+key)
+	if got := c.PartPath(key); got != wantPath {
+		t.Errorf("PartPath = %q, want %q", got, wantPath)
+	}
+
+	// 不存在：ok=false
+	if _, ok := c.PartSize(key); ok {
+		t.Error("半截文件不存在时 PartSize 应返回 ok=false")
+	}
+
+	// 写入后：大小与内容一致
+	if err := os.WriteFile(c.PartPath(key), []byte("12345"), 0o644); err != nil {
+		t.Fatalf("写半截文件失败: %v", err)
+	}
+	if n, ok := c.PartSize(key); !ok || n != 5 {
+		t.Errorf("PartSize = (%d, %v), want (5, true)", n, ok)
+	}
+
+	// 删除幂等：删除后 ok=false，再次删除静默成功不 panic
+	c.RemovePart(key)
+	if _, ok := c.PartSize(key); ok {
+		t.Error("RemovePart 后半截应不存在")
+	}
+	c.RemovePart(key) // 幂等
+}
+
+// TestCleanPartialFiles 表驱动验证 Clean 的半截清理规则（对 .part- 前缀文件不按条目
+// 解析）：新鲜非空半截（活跃下载/续传中，mtime 新鲜）保留；空半截（下载刚起步残留）
+// 与 mtime 早于 partMaxAge（24h）的孤儿半截删除。
+func TestCleanPartialFiles(t *testing.T) {
+	dir := t.TempDir()
+	c, err := New(dir)
+	if err != nil {
+		t.Fatalf("New() 意外报错: %v", err)
+	}
+
+	freshKey := Key("https://registry.example.com/v2/app/blobs/sha256:01")  // 活跃下载中的半截
+	emptyKey := Key("https://registry.example.com/v2/app/blobs/sha256:02")  // 刚起步就中断的空残留
+	orphanKey := Key("https://registry.example.com/v2/app/blobs/sha256:03") // 早已结束的孤儿残留
+
+	if err := os.WriteFile(c.PartPath(freshKey), []byte("alive"), 0o644); err != nil {
+		t.Fatalf("写新鲜半截失败: %v", err)
+	}
+	if err := os.WriteFile(c.PartPath(emptyKey), nil, 0o644); err != nil {
+		t.Fatalf("写空半截失败: %v", err)
+	}
+	if err := os.WriteFile(c.PartPath(orphanKey), []byte("stale"), 0o644); err != nil {
+		t.Fatalf("写孤儿半截失败: %v", err)
+	}
+	stale := time.Now().Add(-partMaxAge - time.Hour) // 早于 24h 孤儿判定年龄
+	if err := os.Chtimes(c.PartPath(orphanKey), stale, stale); err != nil {
+		t.Fatalf("改孤儿半截 mtime 失败: %v", err)
+	}
+
+	removed := c.Clean()
+	if removed != 2 {
+		t.Errorf("Clean 删除数量 = %d, want 2（空半截 + 孤儿半截）", removed)
+	}
+
+	// 新鲜非空半截（持续被追加写入、mtime 新鲜）不被清理
+	if n, ok := c.PartSize(freshKey); !ok || n != 5 {
+		t.Errorf("活跃半截应保留, PartSize = (%d, %v), want (5, true)", n, ok)
+	}
+	// 空半截与孤儿半截已删除
+	if _, ok := c.PartSize(emptyKey); ok {
+		t.Error("空半截应被 Clean 删除（无续传价值）")
+	}
+	if _, ok := c.PartSize(orphanKey); ok {
+		t.Error("超过 partMaxAge 的孤儿半截应被 Clean 删除")
+	}
+}
