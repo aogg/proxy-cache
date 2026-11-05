@@ -1325,7 +1325,7 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 }
 
 // writeUpstreamStatus 把「候选全败且最后失败为上游明确 4xx」的上游响应透传给客户端
-//（见 upstream_status.go）：透传状态码与响应头（沿用 skipResponseHeader 过滤逐跳头与
+// （见 upstream_status.go）：透传状态码与响应头（沿用 skipResponseHeader 过滤逐跳头与
 // 自管头）、X-Proxy-Upstream 观测头标明产生该响应的候选、body 为探测量级（探测首块，
 // ≤probeFirstChunkLimit）。HEAD 请求只回状态码与响应头（无 body），Content-Length 沿用
 // 上游声明值（描述 GET 语义的完整长度）。Warn 级留痕（透传是刻意的语义而非故障，

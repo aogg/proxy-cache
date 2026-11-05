@@ -71,7 +71,7 @@ const resumeCacheStatus = "RESUME"
 
 // resumeScanBudget 续传候选扫描的整体预算（全部候选轮询完的上限，到期按超时类失败
 // 收场并降级既有全量回源；半截保留不受影响）。取值沿用既有 candidateScanBudget
-//（20s，与 docker 客户端约 30s 响应头超时的匹配依据一致，见 candidates.go）。
+// （20s，与 docker 客户端约 30s 响应头超时的匹配依据一致，见 candidates.go）。
 const resumeScanBudget = candidateScanBudget
 
 // parseDockerBlobTarget 判断路径目标是否为 docker blob 请求并拆出 digest：形如
@@ -255,9 +255,13 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 	rangeHeader := fmt.Sprintf("bytes=%d-", partSize) // 开区间：从断点到对象末尾
 
 	// 整体扫描预算：与客户端断开解耦（WithoutCancel，与既有候选管线一致），
-	// 到期按超时类失败收场（半截保留、降级全量回源）
+	// 到期按超时类失败收场（半截保留、降级全量回源）。cancel 不走 defer：defer
+	// 会在本函数返回时立即取消 ctx，杀掉命中候选的在途 body 读取——206 响应是
+	// 活体流，续传收到首块即 context canceled。取消权随结果移交（与 selectCandidate
+	// 的 onClose(cancelBase) 同款）：命中 206 的出口把 cancel 挂 upRes.onClose，
+	// 随调用方流结束/放弃的 Close 统一释放；416 / 扫描全败 / 预算耗尽等不返回
+	// 活体 body 的出口显式 cancel()，绝不泄漏。
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), resumeScanBudget)
-	defer cancel()
 
 	var lastErr error
 	for i := 0; i < n; i++ {
@@ -282,6 +286,7 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 				t416 = -1
 			}
 			upRes.Close()
+			cancel() // 416 出口不返回活体 body：ctx 就地回收（重复取消幂等无害）
 			s.log.Info("blob 半截续传发现半截已完整（上游 416 证实起点已达总长）",
 				"candidate", truncate(cand.url, 300), "part_bytes", partSize, "total", t416)
 			return nil, t416, true, false, nil
@@ -304,11 +309,13 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 		s.log.Info("blob 半截续传候选命中",
 			"index", idx, "candidate", truncate(cand.url, 300), "status", upRes.status,
 			"part_bytes", partSize, "total", t)
+		upRes.onClose(cancel) // 命中出口返回活体 body：扫描 ctx 取消权随流移交调用方（Close 时释放）
 		return upRes, t, false, false, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("全部续传候选均未产生结果")
 	}
+	cancel() // 扫描收场（全败/预算耗尽/不合规轮完）：本出口无活体 body，ctx 就地回收
 	return nil, -1, false, invalid, lastErr
 }
 
@@ -336,7 +343,7 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 //
 // 返回值语义与 fetchViaCandidatesStreaming 一致：committed=true 表示已向客户端写出
 // 响应头（调用方不得再 writeError）。不叠加 slowdownload 慢速升级多源并发续传
-//（取舍见文件头边界说明）。
+// （取舍见文件头边界说明）。
 func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key, target, digest string, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry)) (*cache.Entry, bool, error) {
 	// 重查半截前缀：前置检查与成为执行方之间可能被并发流程消费（前一个执行方完成
 	// 写缓存并删半截等），竞态按既有全量回源兜底（行为与旧版一致）
@@ -454,7 +461,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 进度日志开关与基线（与客户端流式路径同一节拍；区间速率按自上次输出起算）
 	progressInterval := eff.ProgressLogInterval
 	lastProgressAt := time.Now()
-	lastProgressBytes := n
+	lastProgressBytes := int(n) // int64→int 对齐 accum.Len()（int）的差值/赋值运算；语义不变——速率按前缀回放之后的新增量计算
 	emitProgress := func(now time.Time) {
 		args := []any{"rule", eff.Rule, "digest", digest, "bytes", accum.Len()}
 		if total > 0 {

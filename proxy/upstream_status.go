@@ -28,7 +28,7 @@ import (
 )
 
 // upstreamStatusError 携带「上游明确 4xx 响应」的候选失败错误：err 为原始失败描述
-//（判据不过 / 硬失败包装），status/header/body 为可透传给客户端的上游响应三元组。
+// （判据不过 / 硬失败包装），status/header/body 为可透传给客户端的上游响应三元组。
 type upstreamStatusError struct {
 	// status 上游响应状态码（∈ [400,500) 且 ≠ 401）。
 	status int

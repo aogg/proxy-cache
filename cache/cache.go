@@ -127,7 +127,7 @@ func (c *Cache) path(key string) string { return filepath.Join(c.dir, key) }
 func (c *Cache) PartPath(key string) string { return filepath.Join(c.dir, partPrefix+key) }
 
 // PartSize 返回半截文件当前大小（字节）；文件不存在返回 ok=false。并发语义：调用方
-//（proxy 包）以按 key 的写锁串行化半截文件的写侧操作，本读取仅作快照观测。
+// （proxy 包）以按 key 的写锁串行化半截文件的写侧操作，本读取仅作快照观测。
 func (c *Cache) PartSize(key string) (int64, bool) {
 	st, err := os.Stat(c.PartPath(key))
 	if err != nil {
@@ -138,7 +138,7 @@ func (c *Cache) PartSize(key string) (int64, bool) {
 
 // RemovePart 删除半截文件（幂等；不存在静默成功，删除失败仅 Warn 留痕——残留由
 // Clean 的孤儿清理规则兜底，不影响主流程）。调用时机：对应 blob 正式缓存条目落盘后
-//（半截使命完成）或半截判定不可续传需丢弃时。
+// （半截使命完成）或半截判定不可续传需丢弃时。
 func (c *Cache) RemovePart(key string) {
 	if err := os.Remove(c.PartPath(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Warn("删除 blob 半截文件失败", "file", c.PartPath(key), "err", err)

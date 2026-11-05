@@ -84,9 +84,9 @@ func (s *Server) commitStreamingHeader(w http.ResponseWriter, res *probeResult, 
 //
 // partial 为可选的 blob 半截保留上下文（partial_resume.go，variadic 注入使既有调用方
 // 与既有测试的 7 参调用不受影响）：仅「缓存可读的客户端主路径」注入——注入后，blob
-//（/v2/<name>/blobs/<digest>）流式下载中断/失败时把已下载前缀保留为半截文件（进度不
+// （/v2/<name>/blobs/<digest>）流式下载中断/失败时把已下载前缀保留为半截文件（进度不
 // 回退，见 captureStreamPartial）；BYPASS（Range / no-cache / 关缓存）不注入，维持既有
-//「失败即丢弃」行为完全不变。
+// 「失败即丢弃」行为完全不变。
 func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Request, target string, eff config.Options, cacheStatus string, finalize func(*cache.Entry), start time.Time, partial ...partialSink) (entry *cache.Entry, committed bool, err error) {
 	sink := partialSinkOf(partial)
 	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target), eff)
