@@ -37,6 +37,11 @@ const DefaultCacheTTL = 30 * time.Minute
 // DefaultProgressLogInterval 全局 log.progress-interval 未配置时的默认流式透传进度日志间隔。
 const DefaultProgressLogInterval = 10 * time.Second
 
+// DefaultDockerPrefetchConcurrency docker 层预取并发数未配置时的缺省值：
+// docker daemon 默认 max-concurrent-downloads=3，预取并发略高于它即可在客户端逐层
+// 请求前把 layer 备好，同时不与客户端请求争抢过多上游带宽。
+const DefaultDockerPrefetchConcurrency = 4
+
 // 慢速升级多源并发续传（slow-download escalation，仅 type=docker 规则的 GET 路径目标
 // 流式回源生效）的缺省值。
 const (
@@ -570,6 +575,19 @@ type Config struct {
 	// 即被关闭移除（收敛「每个源都拉满剩余区间自己的流」的带宽放大）。默认 8MB；
 	// 启用时（生效 speed>0）必须 >0，Validate 拒绝。
 	SlowDownloadMaxBehind *Bytes `yaml:"slow-download-max-behind"`
+	// DockerPrefetchEnabled docker 镜像 layer 异步预取开关（manifest 驱动，实现见 proxy
+	// 包 prefetch.go）：识别出「路径目标 GET /v2/<name>/manifests/<ref> 回源成功（HTTP 200
+	// 已写入缓存）且响应为单平台 image manifest」后，异步预取该镜像其余 layer blob 写入
+	// 缓存——docker daemon 默认 max-concurrent-downloads=3 逐层下载慢，预取后客户端后续
+	// blob 请求直接命中。HEAD / 206(Range) / 多平台 manifest list 与 OCI index 不触发；
+	// 预取失败只记日志、绝不影响客户端请求。nil（未配置）= 开启（默认开）；显式 false 关闭。
+	// 全局配置，无规则级覆盖。
+	DockerPrefetchEnabled *bool `yaml:"docker-prefetch-enabled"`
+	// DockerPrefetchConcurrency docker 层预取的 Server 级并发数上限（全部预取共享一个
+	// 信号量）：nil（未配置）= 4（DefaultDockerPrefetchConcurrency）；显式 <=0 为配置错误
+	//（Validate 拒绝——关闭预取请配置 docker-prefetch-enabled: false，两者语义分离）。
+	// 全局配置，无规则级覆盖。
+	DockerPrefetchConcurrency *int `yaml:"docker-prefetch-concurrency"`
 	// HTTPProxy 全局上游代理（http/https/socks5 地址，如 http://127.0.0.1:7890），空串表示直连。
 	HTTPProxy string `yaml:"http-proxy"`
 	// SuccessCheck url-redirect 候选成功判据：status 或 content（默认 content）。
@@ -845,6 +863,11 @@ func (c *Config) Validate() error {
 	// 要求 max-behind>0（min-remaining 允许 0；speed<=0 = 关闭特性，不做启用性校验）
 	if err := validateSlowDownload("", c.SlowDownloadSpeed, c.SlowDownloadWindow, c.SlowDownloadMinRemaining, c.SlowDownloadMaxBehind, c.GlobalSlowDownloadSpeed()); err != nil {
 		return err
+	}
+	// docker 层预取并发数：必须为正整数（<=0 没有并发可用；关闭预取用
+	// docker-prefetch-enabled: false 而非并发数，两者语义分离避免歧义）
+	if c.DockerPrefetchConcurrency != nil && *c.DockerPrefetchConcurrency <= 0 {
+		return fmt.Errorf("docker-prefetch-concurrency 必须为正整数（关闭预取请配置 docker-prefetch-enabled: false），当前为 %d", *c.DockerPrefetchConcurrency)
 	}
 	// log.level 仅允许四级，非法值启动快速失败；合法值转成 slog.Level 存私有字段供 LogLevel() 使用
 	switch c.Log.Level {
@@ -1150,6 +1173,26 @@ func (c *Config) GlobalSlowDownloadMaxBehind() int64 {
 		return DefaultSlowDownloadMaxBehind
 	}
 	return c.SlowDownloadMaxBehind.Int64()
+}
+
+// GlobalDockerPrefetchEnabled 返回 docker 镜像 layer 异步预取开关生效值：
+// nil（未配置）= 开启（默认开）；显式 false 关闭。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底。
+func (c *Config) GlobalDockerPrefetchEnabled() bool {
+	if c.DockerPrefetchEnabled == nil {
+		return true
+	}
+	return *c.DockerPrefetchEnabled
+}
+
+// GlobalDockerPrefetchConcurrency 返回 docker 层预取并发数生效值：
+// nil（未配置）= 缺省 4（DefaultDockerPrefetchConcurrency）；
+// 显式值已经 Validate 保证 >0。
+func (c *Config) GlobalDockerPrefetchConcurrency() int {
+	if c.DockerPrefetchConcurrency == nil {
+		return DefaultDockerPrefetchConcurrency
+	}
+	return *c.DockerPrefetchConcurrency
 }
 
 // ProgressLogInterval 返回全局流式透传进度日志的输出间隔生效值：

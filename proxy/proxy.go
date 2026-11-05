@@ -83,6 +83,18 @@ type Server struct {
 	// value = token 与过期时间点。镜像 blob 分层很多，进程内缓存避免每层都打一次
 	// auth 端点（auth.docker.io 对国内很慢且有频控）。
 	dockerTokens map[string]dockerTokenEntry
+	// prefetchMu 保护 docker 预取在途集合与信号量的并发访问/惰性补建（见 prefetch.go）。
+	prefetchMu sync.Mutex
+	// prefetchInflight docker 预取在途集合：blob 缓存键 -> struct{}，
+	// 同一 blob 的预取只排队一次（防重复排队，见 prefetch.go）。
+	prefetchInflight map[string]struct{}
+	// prefetchSlots docker 预取的 Server 级并发信号量（容量 = docker-prefetch-concurrency
+	// 生效值，默认 4；New 预构建，防御性惰性补建见 prefetch.go）。
+	prefetchSlots chan struct{}
+	// prefetchWG docker 预取任务 WaitGroup：预取 goroutine 在此登记，仅供测试/诊断观察
+	//（waitPrefetchIdle）；进程退出不等待——预取任务不使用请求 context 且自带超时兜底，
+	// 随进程消亡即可，绝不悬挂退出（见 prefetch.go 生命周期说明）。
+	prefetchWG sync.WaitGroup
 }
 
 // New 创建 Server：预编译全局/各域名规则及其 url-redirect 候选对象用到的上游代理客户端
@@ -93,6 +105,10 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 		logger = slog.Default()
 	}
 	s := &Server{cfg: cfg, caches: caches, log: logger, dockerTokens: make(map[string]dockerTokenEntry)}
+	// docker 预取的 Server 级并发额度与在途集合：启动期按配置固化容量（默认 4），
+	// 运行期防御性惰性补建见 prefetch.go
+	s.prefetchSlots = make(chan struct{}, cfg.GlobalDockerPrefetchConcurrency())
+	s.prefetchInflight = make(map[string]struct{})
 
 	// 预构建全局与各域名规则可能用到的 (上游代理, connect-timeout) 组合客户端：
 	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建。
@@ -440,7 +456,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	// finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 200 且过判据写缓存，
 	// 304 / 未过判据分别留痕说明原因；条件与日志字段与旧版一致）
 	finalize := func(ent *cache.Entry) {
-		s.finalizeFetchEntry(key, target, ent, eff, disk)
+		s.finalizeFetchEntry(r, key, target, ent, eff, disk)
 	}
 	// streamingError 流式回源错误的一致出口：commit 前失败 502；commit 后失败响应已
 	// 固化（头已写出），只能终止连接，绝不能再 writeError 污染响应
@@ -543,8 +559,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 
 // finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 GET，条件与日志字段与旧版一致）：
 // 仅缓存满足成功判据的 200 响应（TTL 在写入时固化）；304 与「回源成功但未过判据」
-// 分别留痕说明为什么这次没写缓存文件。
-func (s *Server) finalizeFetchEntry(key, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache) {
+// 分别留痕说明为什么这次没写缓存文件。写盘成功后按条件尝试 docker 镜像 layer 异步
+// 预取（manifest 驱动，触发条件与失败降级语义见 prefetch.go；条件不满足静默返回）。
+func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache) {
 	if ent == nil {
 		return
 	}
@@ -558,6 +575,10 @@ func (s *Server) finalizeFetchEntry(key, target string, ent *cache.Entry, eff co
 				s.log.Info("写入缓存成功",
 					"rule", eff.Rule, "target", truncate(target, 300), "key", key,
 					"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))
+				// docker 镜像 layer 异步预取：manifest GET 回源成功且已写入缓存时触发
+				//（触发条件在内部逐项判定，不满足静默返回；预取只写缓存，异步执行，
+				// 绝不影响本次客户端响应）
+				s.maybePrefetchImageLayers(r, target, ent, eff, disk)
 			}
 		}
 		return

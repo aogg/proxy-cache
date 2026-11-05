@@ -165,6 +165,27 @@ fallback-direct: true
 #slow-download-min-remaining: 64MB
 #slow-download-max-behind: 8MB
 
+# ----------------------------------------------------------------------------
+# docker 镜像 layer 异步预取（manifest 驱动，全局配置，无规则级覆盖）
+# ----------------------------------------------------------------------------
+# 识别出「GET /v2/<name>/manifests/<ref> 路径目标回源成功（HTTP 200 已写入缓存）且
+# 响应为单平台 image manifest（docker schema2 / OCI image manifest，容忍 ;charset=...
+# 参数后缀）」后，异步预取该镜像其余 layer blob 写入缓存：docker daemon 默认
+# max-concurrent-downloads=3 逐层下载慢，预取后客户端后续 blob 请求直接命中（X-Cache: HIT）。
+# HEAD / 206(Range) 断点续传 / 多平台 manifest list 与 OCI index（客户端拿到 index 后会
+# 立刻再请求具体平台的 child manifest，届时自然触发）/ 关闭缓存（BYPASS）均不触发。
+# 预取复用与客户端完全相同的回源路径（候选轮询、超时覆盖、http-proxy、insecure TLS、
+# 401 token dance、缓存写入），只写缓存不产生客户端响应；同一 blob 预取有在途集合去重
+#（防重复排队），与客户端并发请求同一 blob 时经 singleflight 合并（在途则不另起第二路
+# 下载）；失败只记日志不重试、绝不影响客户端。blob 按 digest 寻址内容不可变，不存在
+# 刷新问题（过期由 cache.ttl / clean-interval 管）；预取不改变 manifest 本身的
+# TTL/ETag/缓存行为，tag(:latest) 更新后新 manifest 引用相同 digest 的 layer 直接命中。
+# docker-prefetch-enabled       预取开关（默认 true 开启；显式 false 关闭）
+# docker-prefetch-concurrency   预取并发数上限（默认 4；必须为正整数，
+#                               显式 <=0 启动报错——关闭预取用上方开关）
+#docker-prefetch-enabled: true
+#docker-prefetch-concurrency: 4
+
 # url-redirect：回源镜像/上游代理候选列表（对象数组，破坏性变更：不再支持旧版纯字符串写法，
 # 解析期报错并给出迁移示例；候选对象支持字段见下方示例与 README「url-redirect 候选对象」小节）
 # 候选对象字段：
