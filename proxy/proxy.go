@@ -464,10 +464,18 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	finalize := func(ent *cache.Entry) {
 		s.finalizeFetchEntry(r, key, target, ent, eff, disk)
 	}
-	// streamingError 流式回源错误的一致出口：commit 前失败 502；commit 后失败响应已
+	// streamingError 流式回源错误的一致出口：commit 前失败 502（候选全败且最后失败为
+	// 上游明确 4xx 时透传上游状态码与响应，见 upstream_status.go）；commit 后失败响应已
 	// 固化（头已写出），只能终止连接，绝不能再 writeError 污染响应
 	streamingError := func(err error, committed bool) {
 		if err != nil && !committed {
+			if use, ok := asUpstreamStatusError(err); ok {
+				// 候选全败且最后失败为上游明确 4xx（如镜像站对 referrers 端点回 404）：
+				// 透传上游状态码 + 响应头 + body（探测量级），docker 客户端对这类 registry
+				// 语义错误自带容错，透传后 pull 可正常完成；网络/超时类失败仍走 502
+				s.writeUpstreamStatus(w, r, use)
+				return
+			}
 			s.writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
@@ -566,6 +574,14 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		// 本调用是流式执行方且 commit 后失败：底层原因已留痕（Error），响应头已写出，
 		// 终止本次响应即可，绝不能再 writeError
 	case err != nil:
+		// 流式执行方/等待方共享到候选全败错误：最后失败为上游明确 4xx 时透传（仅流式
+		// 路径目标，docker registry 语义；完整 URL（web）目标保持既有 502 行为不变）
+		if streaming {
+			if use, ok := asUpstreamStatusError(err); ok {
+				s.writeUpstreamStatus(w, r, use)
+				return
+			}
+		}
 		s.writeError(w, http.StatusBadGateway, err.Error())
 	case streaming && executed:
 		// 本调用是流式执行方：响应头已 commit、body 已边读边写、完成日志已输出，
@@ -645,6 +661,12 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 	// //////////////////  未命中：候选轮询回源（HEAD 不写缓存）  start  ////////////////////////////////////////////////
 	e, err := s.fetchViaCandidates(r, target, eff)
 	if err != nil {
+		// 候选全败且最后失败为上游明确 4xx：透传上游状态码与响应（docker 对 HEAD 探测的
+		// registry 语义错误同样能理解，如 blob 不存在 404）；网络/超时类失败仍 502
+		if use, ok := asUpstreamStatusError(err); ok {
+			s.writeUpstreamStatus(w, r, use)
+			return
+		}
 		s.writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -1271,6 +1293,45 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 		"bytes", len(e.Body),
 		"cost", time.Since(start).Round(time.Millisecond).String(),
 	)
+}
+
+// writeUpstreamStatus 把「候选全败且最后失败为上游明确 4xx」的上游响应透传给客户端
+//（见 upstream_status.go）：透传状态码与响应头（沿用 skipResponseHeader 过滤逐跳头与
+// 自管头）、X-Proxy-Upstream 观测头标明产生该响应的候选、body 为探测量级（探测首块，
+// ≤probeFirstChunkLimit）。HEAD 请求只回状态码与响应头（无 body），Content-Length 沿用
+// 上游声明值（描述 GET 语义的完整长度）。Warn 级留痕（透传是刻意的语义而非故障，
+// 与 502 的 Error 级区分）。
+func (s *Server) writeUpstreamStatus(w http.ResponseWriter, r *http.Request, use *upstreamStatusError) {
+	h := w.Header()
+	for k, vv := range use.header {
+		if skipResponseHeader(k) {
+			continue
+		}
+		for _, v := range vv {
+			h.Add(k, v)
+		}
+	}
+	if use.url != "" {
+		h.Set("X-Proxy-Upstream", use.url) // 观测产生该 4xx 的候选 URL
+	}
+	if r.Method == http.MethodHead {
+		// HEAD：无 body，Content-Length 用上游声明值（缺失则不设，Go 按 HEAD 语义回放）
+		if cl := use.header.Get("Content-Length"); cl != "" {
+			h.Set("Content-Length", cl)
+		}
+		w.WriteHeader(use.status)
+	} else {
+		h.Set("Content-Length", strconv.Itoa(len(use.body)))
+		w.WriteHeader(use.status)
+		if len(use.body) > 0 {
+			if _, err := w.Write(use.body); err != nil {
+				s.log.Warn("写上游 4xx 透传响应体失败", "status", use.status, "err", err)
+			}
+		}
+	}
+	s.log.Warn("候选全败且最后失败为上游明确 4xx，已透传上游状态码与响应",
+		"status", use.status, "upstream", truncate(use.url, 300),
+		"body_bytes", len(use.body), "target", truncate(r.URL.Path, 300))
 }
 
 // writeError 输出 JSON 格式错误响应并记录日志（502 回源彻底失败升级为 Error，其余保持 Warn）。

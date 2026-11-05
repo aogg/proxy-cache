@@ -303,6 +303,7 @@ curl "http://127.0.0.1:8080/healthz"
 - **命中即返回**：胜出候选的响应即最终返回（并按条件写缓存），响应头 `X-Proxy-Upstream` 标明来源
 - **硬失败快切**：token dance 后仍 401、上游 403、探测预算（`url-redirect-probe-timeout`）耗尽这三类失败，跳过 `url-redirect-item-error-retry` 原地重试直接切下一候选（这类失败重试无意义却各烧数秒，日志会注明 `hard_fail` 原因）
 - **失败切换**：其余候选失败（请求报错、非 200、或 content 模式下 GET 的 body 为空；HEAD 天然无 body 自动按 status 语义）都视为失败并尝试/放行下一个候选，同时记录 warn 日志；HTTP 304（内容未变更）视为成功候选——条件请求头不透传，上游对无条件请求仍回 304 属异常/缓存副本有效语义，此时 304 原样透传给客户端（不写缓存），不再判为失败；带 Range 的请求上游回 206 视为成功（流式透传、不写缓存）
+- **上游明确 4xx 透传**：全部候选失败且最后失败是「拿到了明确上游 4xx 响应」（401 除外——由既有 token dance 语义处理）时，把该 4xx 状态码 + 响应头 + body（探测量级）原样透传给客户端，不再一律 502——典型如镜像站对 OCI referrers 端点（`/v2/<name>/referrers/<digest>`）回 404：docker 客户端对该端点语义自带 fallback，透传 404 后 pull 正常完成，而一律 502 会让 docker 判整层失败中断 pull；同理适用于未知端点 405 等客户端能理解的 registry 语义错误。换下一候选重试的既有语义不变（透传只在全部候选失败后发生）；网络/超时类失败（含候选扫描总预算耗尽）不透传，仍返回 502
 - **全部失败**：`fallback-direct: true`（默认）回退直连原始 URL，直连结果原样透传（404/5xx 也如实返回）；`fallback-direct: false` 则直接返回 502 JSON 错误
 - 轮询计数器为全局原子计数，命中不同域名规则使用各自候选列表时同样共享该计数（起始下标依旧逐请求轮换）
 - 未配置 `url-redirect`（或规则覆盖为 `[]`）时，所有请求直接回源原始 URL，不套用成功判据
@@ -648,7 +649,7 @@ log:
 | POST / PUT 等其他方法（完整 URL 目标） | 直接透传到原始 URL（不走缓存、不走 url-redirect 轮询），`X-Cache: BYPASS`（现状不变） |
 | POST / PUT 等其他方法（路径目标） | 400：路径目标仅支持 GET/HEAD（JSON 错误体） |
 | 路径目标未命中任何规则，或命中规则但生效 url-redirect 为空 | 400：路径目标必须有命中的域名规则提供 url-redirect 才能回源（全局默认配置不承接路径目标；错误信息保留「目标 URL 必须是完整的 http/https 地址」语义） |
-| 路径目标 url-redirect 候选全部失败 | 502：无直连回退（没有完整原始 URL 可直连，fallback-direct 不适用） |
+| 路径目标 url-redirect 候选全部失败 | 502：无直连回退（没有完整原始 URL 可直连，fallback-direct 不适用）；**例外**：最后失败为上游明确 4xx（401 除外）时透传该 4xx 状态码与响应，如 referrers 端点 404 / 未知端点 405——docker 对 registry 语义错误自带容错；网络/超时类失败（含扫描总预算耗尽）仍 502 |
 | 目标 URL 非 http/https（如 `/not-an-url`） | 识别为路径目标：未命中规则 / 非 GET/HEAD 时 400（JSON 错误体）；ACL 对「`http://<Host>/<路径>`」整串匹配 |
 | 缓存未启用 / Range / no-cache | 直接回源（仍走 url-redirect 候选竞速），`X-Cache: BYPASS`；路径目标 GET 同样流式透传 |
 | 带 Range 的请求，上游回 206 | 视为成功并流式透传、**不写缓存**（docker 断点续传必需；旧版 206 会被成功判据拒掉导致续传全挂） |

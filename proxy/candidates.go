@@ -12,7 +12,10 @@
 //   - url-redirect-all-error-retry 整轮重试语义保持（同一 start 下标）；整轮全败的
 //     判定不变：一轮 = 所有候选（含各自 item 重试）都出结果且无胜出；
 //   - 扫描总预算：从首个候选发出到全部候选出结果的整体上限（candidateScanBudget），
-//     到期取消全部在途尝试并按失败返回，调用方尽早 502（docker 客户端会自行重试该层）。
+//     到期取消全部在途尝试并按失败返回，调用方尽早 502（docker 客户端会自行重试该层）；
+//   - 上游明确 4xx 载荷（见 upstream_status.go）：候选判据不过且状态码为 4xx（401 除外）
+//     时把「状态码+响应头+body（探测量级）」装进该候选失败错误；全部候选失败后随最终
+//     错误上浮，由客户端出口透传给 docker（网络/超时类失败与扫描预算耗尽不带载荷，仍 502）。
 
 package proxy
 
@@ -159,6 +162,15 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 					cand.url, eff.SuccessCheck, res.status, len(res.first))
 				if hard {
 					candLast = fmt.Errorf("%w（hard-fail: %s）", candLast, hardReason)
+				}
+				// 上游明确 4xx（401 除外——由既有匿名 token dance 语义处理）：把「状态码 +
+				// 可透传响应头 + body（探测量级）」装进 candLast（upstreamStatusError 包住
+				// 原始失败描述，Error() 文案与日志格式不变）。候选全败后它随最终错误上浮，
+				// 由客户端出口判定透传（如镜像站对 referrers 端点回 404：docker 客户端对该
+				// 语义自带 fallback，透传 404 即可正常完成 pull）；网络/超时类失败不产生
+				// 载荷，维持既有 502。换下一候选重试的既有语义不变（载荷只在全败后上浮）。
+				if use := newUpstreamStatusError(res, cand.url, candLast); use != nil {
+					candLast = use
 				}
 				s.log.Warn("url-redirect 候选未通过成功判据",
 					"round", roundNo, "round_total", totalRounds,
@@ -321,6 +333,9 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 	schedMu.Unlock()
 	cancelBase()
 	if budgetExhausted {
+		// 扫描总预算耗尽按超时语义：剥离可能存在的 4xx 透传载荷（载荷只允许在
+		// 「拿到了明确上游响应」的失败上浮；预算到期属超时类失败，维持 502）
+		lastErr = stripUpstreamStatus(lastErr)
 		s.log.Error("url-redirect 候选扫描总预算耗尽，提前终止候选扫描",
 			"budget", candidateScanBudget.String(), "round", round,
 			"round_total", totalRounds, "last_error", lastErr)
