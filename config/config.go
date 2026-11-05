@@ -1438,6 +1438,14 @@ func validateProxyAddr(addr string) error {
 // validateRedirectItems 校验 url-redirect 候选列表（就地去除模板首尾空白）：
 //   - 每个候选的 template 必须非空、以 http(s):// 开头，且至少包含一个已知占位符——
 //     $1 / ${1}，或任一已知 $http.server.header.* 变量的 $ / ${} 形式（错误信息列出全部合法写法）；
+//   - 例外放行：template trim 后恰为 $1 / ${1} 视为合法「原始 URL 独立候选」，跳过
+//     http(s):// 前缀检查（占位符检查天然满足）——原始目标 URL 显式参与候选轮询，
+//     配合候选级 http-proxy 可走代理回源。适用范围：仅完整 URL 目标规则；路径目标
+//     请求（docker 规则）下 $1 展开为不带 scheme 的路径串，该候选运行期会失败。
+//     与 fallback-direct 的关系：原 URL 候选是显式参与轮询的普通候选，fallback-direct
+//     是候选全败后的兜底直连；若不想全败后再多一次直连，可配 fallback-direct: false；
+//   - 独立写 full_url / full_url_no_server 占位符的模板仍报错（展开分别含入站 Host /
+//     仅为 /path?query，都不是合法上游），错误信息说明展开语义并指引改用 $1 表示原始 URL；
 //   - 候选级 http-proxy：trim 后非空必须过 validateProxyAddr（nil = 继承上级、
 //     显式空串 = 该候选强制直连，两者均合法无需校验）；
 //   - 候选级四个超时（connect-timeout / http-timeout / read-timeout / probe-timeout）：
@@ -1452,8 +1460,28 @@ func validateRedirectItems(list []URLRedirectItem, where string) error {
 		if t == "" {
 			return fmt.Errorf("%s 第 %d 个候选的 template 为空", where, i)
 		}
+		// 原始 URL 独立候选放行：模板恰为 $1 / ${1}（写法由占位符常量拼接，避免魔法字符串漂移）
+		// 视为合法，原始目标 URL 显式参与候选轮询，可配合候选级 http-proxy 走代理回源；
+		// 跳过 http(s):// 前缀检查，占位符检查天然满足、无需重复
+		if t == "$" + PlaceholderTarget || t == "${" + PlaceholderTarget + "}" {
+			list[i].Template = t
+			continue
+		}
 		if !strings.HasPrefix(t, "http://") && !strings.HasPrefix(t, "https://") {
-			return fmt.Errorf("%s 第 %d 个候选模板 %q 必须以 http:// 或 https:// 开头", where, i, t)
+			// 独立 full_url / full_url_no_server 占位符不是合法上游：错误信息说明其展开语义
+			// 并指引用 $1 表示原始 URL；其余非 http(s):// 模板补充原始 URL 候选写法指引
+			switch t {
+			case "$" + PlaceholderFullURL, "${" + PlaceholderFullURL + "}":
+				return fmt.Errorf("%s 第 %d 个候选模板 %q 必须以 http:// 或 https:// 开头"+
+					"（该占位符独立展开为含入站 Host 的完整 URL，不是合法上游地址；"+
+					"表示原始目标 URL 请写 template: $1 或 ${1}）", where, i, t)
+			case "$" + PlaceholderFullURLNoServer, "${" + PlaceholderFullURLNoServer + "}":
+				return fmt.Errorf("%s 第 %d 个候选模板 %q 必须以 http:// 或 https:// 开头"+
+					"（该占位符独立展开仅为 /path?query 路径串，不是合法上游地址；"+
+					"表示原始目标 URL 请写 template: $1 或 ${1}）", where, i, t)
+			}
+			return fmt.Errorf("%s 第 %d 个候选模板 %q 必须以 http:// 或 https:// 开头"+
+				"（原始目标 URL 直接参与候选可写 template: $1 或 ${1}）", where, i, t)
 		}
 		if !hasKnownPlaceholder(t) {
 			return fmt.Errorf("%s 第 %d 个候选模板 %q 缺少占位符（合法占位符: %s）",

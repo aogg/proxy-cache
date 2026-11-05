@@ -213,6 +213,11 @@ url-redirect:
   #   read-timeout: 120s                    # 该候选无新增数据超时
   #   probe-timeout: 20s                    # 该候选探测预算（规则/全局
   #                                         #   url-redirect-probe-timeout 的候选级短名）
+  # 原始 URL 独立候选：template 恰为 $1（或 ${1}）= 原始目标 URL 原文也参与候选轮询，
+  # 配合候选级 http-proxy 可走代理回源（仅完整 URL 目标规则适用，路径目标/docker 规则下
+  # $1 不带 scheme 该候选运行期会失败；不想候选全败后再兜底直连可配 fallback-direct: false）
+  # - template: $1
+  #   http-proxy: http://127.0.0.1:7890
 
 # 缓存配置
 # 注意：整块注释掉 cache: 并不等于关闭缓存！未配置时启用内置默认值
@@ -291,6 +296,8 @@ domain-rules:
     # slow-download-max-behind: 8MB          # 该规则多源合并的剪枝阈值（启用时必须 >0）
     # url-redirect:                          # 该规则专用候选列表（设为 [] 表示该规则直连回源）
     #   - template: https://gh-proxy.com/$1
+    #   - template: $1                        # 原始 URL 也参与候选（$1 = 原始目标 URL，配合候选级 http-proxy 可走代理回源）
+    #     http-proxy: http://127.0.0.1:7890
 
   - name: github-release
     match: 'github\.com/[^/]+/[^/]+/releases/download/'

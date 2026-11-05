@@ -125,7 +125,7 @@ docker run -d --name proxy-cache \
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
 | `insecure-skip-verify` | bool | `false` | 全局「忽略 TLS 证书校验」：开启后该路径所有上游连接（候选 / fallback 直连 / 30x 重定向目标 / token dance 两次请求）都跳过证书校验。三级优先级（高→低）：**候选对象 > 域名规则 > 全局**，未配置逐级继承，详见下文「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」；安全代价：等于关闭该路径的身份与窃听防护，仅建议对证书链不全的镜像站按候选级精确开启 |
-| `url-redirect` | object[] | 空 | 回源候选**对象列表**（破坏性变更：不再支持旧版纯字符串写法，解析期报错并给出迁移示例）。每个对象：`template`（必填非空，原模板字符串，占位符 `$1`/`${1}` 或 `$http.server.header.full_url(_no_server)`，见下文「url-redirect 模板变量」）+ 可选 `insecure-skip-verify` / `http-proxy` / `connect-timeout` / `http-timeout` / `read-timeout` / `probe-timeout`（候选级三级覆盖，见「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」）；空列表 = 全部直连回源；其余字段（含预留字段 `enabled`/`weight`/`hedge-delay`）一律解析报错，详见下文「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」 |
+| `url-redirect` | object[] | 空 | 回源候选**对象列表**（破坏性变更：不再支持旧版纯字符串写法，解析期报错并给出迁移示例）。每个对象：`template`（必填非空，原模板字符串，占位符 `$1`/`${1}` 或 `$http.server.header.full_url(_no_server)`，恰为 `$1`/`${1}` 时 = 原始 URL 独立候选，见下文「url-redirect 模板变量」）+ 可选 `insecure-skip-verify` / `http-proxy` / `connect-timeout` / `http-timeout` / `read-timeout` / `probe-timeout`（候选级三级覆盖，见「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」）；空列表 = 全部直连回源；其余字段（含预留字段 `enabled`/`weight`/`hedge-delay`）一律解析报错，详见下文「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」 |
 | `cache.*` | object | 见下 | 全局缓存配置 |
 | `log.level` | string | `info` | 日志级别：`debug` / `info` / `warn` / `error`（大小写不敏感，非法值启动时直接报错），详见下文「日志」 |
 | `log.progress-interval` | duration | `10s` | 流式透传进度日志的输出间隔：GET 路径目标流式回源（docker pull 大 blob）期间每隔该间隔输出一条「流式透传进度」日志（已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收），上游停滞无新数据期间自然不输出；整条流在该间隔内完成则一条进度日志都不出（最终日志已有）。`<=0` 关闭进度日志 |
@@ -382,7 +382,9 @@ $http.server.header.full_url_no_server = /https://raw.githubusercontent.com/dong
 展开: https://hk.gh-proxy.org/https://raw.githubusercontent.com/dongchengjie/airport/main/subs/merged/tested_within_vless.yaml
 ```
 
-模板在启动时校验（`config.Validate`）：候选必须是键值对象（旧版纯字符串写法解析期报错并给出迁移示例），`template` 必须以 `http://` 或 `https://` 开头且至少包含一个已知占位符（`$1`/`${1}`，或任一已知 `$http.server.header.*` 变量的 `$` / `${}` 形式），否则启动报错并列出全部合法占位符写法；候选对象内的未知字段（含预留未实现字段）同样解析期报错。
+**原始 URL 独立候选**：候选的 `template` 写成**恰好** `$1`（或 `${1}`）——即模板只有这一个占位符、不拼任何前缀——表示原始目标 URL 本身也作为一条独立候选参与候选轮询，配合候选级 `http-proxy` 可让原始 URL 走代理回源（见下文「[候选级 http-proxy 与超时覆盖（慢代理场景）](#候选级-http-proxy-与超时覆盖慢代理场景)」）。适用范围：**仅完整 URL 目标规则**（web 场景）；路径目标请求（docker 规则）下 `$1` 展开为不带 scheme 的路径串，该候选运行期会失败，不要在 docker 规则这样配。与 `fallback-direct` 的关系：原 URL 候选是**显式参与轮询**的普通候选（可按候选配 `http-proxy`/超时），`fallback-direct` 是候选全败后的兜底直连——不想候选全败后再多一次直连，可配 `fallback-direct: false`。
+
+模板在启动时校验（`config.Validate`）：候选必须是键值对象（旧版纯字符串写法解析期报错并给出迁移示例），`template` 必须以 `http://` 或 `https://` 开头且至少包含一个已知占位符（`$1`/`${1}`，或任一已知 `$http.server.header.*` 变量的 `$` / `${}` 形式），否则启动报错并列出全部合法占位符写法；唯一例外：`template` trim 后**恰好**为 `$1`/`${1}` 视为合法的「原始 URL 独立候选」（见上文），跳过前缀检查。独立写 `template: $http.server.header.full_url`（展开含入站 Host）或 `template: $http.server.header.full_url_no_server`（展开仅为 `/path?query`）不是合法上游地址，仍会启动报错——错误信息会说明各自的展开语义，并指引原始 URL 请写 `template: $1`；候选对象内的未知字段（含预留未实现字段）同样解析期报错。
 
 ## url-redirect 候选对象与候选级覆盖
 
@@ -404,7 +406,7 @@ url-redirect:
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `template` | string | **必填**（trim 后非空）：即旧版的模板字符串，占位符语义不变（见上文「[url-redirect 模板变量](#url-redirect-模板变量)」）；启动时校验 http(s):// 前缀与至少一个占位符 |
+| `template` | string | **必填**（trim 后非空）：即旧版的模板字符串，占位符语义不变（见上文「[url-redirect 模板变量](#url-redirect-模板变量)」）；启动时校验 http(s):// 前缀与至少一个占位符；例外：恰好为 `$1`/`${1}` = 原始 URL 独立候选（原始目标 URL 显式参与轮询，仅完整 URL 目标规则适用），跳过前缀检查 |
 | `insecure-skip-verify` | bool | 可选：候选级「忽略 TLS 证书校验」。省略（nil）= 继承规则级，再继承全局 |
 | `http-proxy` | string | 可选：候选级回源代理（`http://`/`https://`/`socks5://`）。省略（nil）= 继承规则级 `http-proxy`，再继承全局；**显式空串（或仅空白）= 该候选强制直连**（覆盖上层已配置的代理）；非空值启动时校验地址格式 |
 | `connect-timeout` | duration | 可选：候选级建连超时（TCP 拨号 + TLS 握手共用）。nil = 逐级继承；显式 `0` = 不限制；负数为配置错误 |
@@ -468,6 +470,19 @@ domain-rules:
 ```
 
 反向同样成立：全局/规则已配代理时，对个别可达候选写 `http-proxy: ""` 强制直连、`probe-timeout: 0` 不限预算等，按候选精确覆盖上层值。
+
+**典型场景：原 URL 也作为候选走代理回源**——`template` 恰为 `$1` 即原始目标 URL 本身参与候选轮询（与镜像站候选按 round-robin 一起轮），配候选级 `http-proxy` 让它走代理回源；它是显式参与轮询的普通候选，与 `fallback-direct`（全败后的兜底直连）语义不同，若不想候选全败后再多一次直连，配 `fallback-direct: false`。注意仅完整 URL 目标规则适用（路径目标/docker 规则下 `$1` 不带 scheme，该候选运行期会失败）：
+
+```yaml
+domain-rules:
+  - name: github-raw
+    match: '.*https://raw\.githubusercontent\.com.*'
+    fallback-direct: false               # 原 URL 已显式参与轮询，全败后不再兜底直连
+    url-redirect:
+      - template: https://hk.gh-proxy.org/$http.server.header.full_url_no_server
+      - template: $1                           # 原始 URL 也参与候选
+        http-proxy: http://127.0.0.1:7890      # 仅该候选（原 URL）走代理回源
+```
 
 ## Docker Registry 镜像加速
 
