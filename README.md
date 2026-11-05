@@ -17,13 +17,13 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **url-redirect 模板变量**：除 `$1`（目标串，兼容保留）外支持请求级预定义变量 `$http.server.header.full_url`（入站请求完整 URL）与 `$http.server.header.full_url_no_server`（入站请求去掉 `scheme://host` 的 `/path?query`），均支持 `${...}` 大括号写法；按变量名长度降序替换（避免前缀遮蔽），未知 `$` 序列原样保留，详见下文「[url-redirect 模板变量](#url-redirect-模板变量)」
 - **url-redirect 候选对象与候选级覆盖**：`url-redirect` 为**对象数组**（破坏性变更：旧版纯字符串写法解析期报错并给出迁移示例），候选 = `template`（原模板字符串，占位符语义不变）+ 可选 `insecure-skip-verify` / `http-proxy` / `connect-timeout` / `http-timeout` / `read-timeout` / `probe-timeout`；这些可选项均为三级优先级**候选 > 规则 > 全局**（未配置逐级继承；候选显式空串 `http-proxy` = 强制直连、显式 `0` 超时 = 不限制），适合「个别镜像站证书链不全」「单个候选必须走慢代理并放宽超时」的场景，详见下文「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」
 - **HEAD 走候选轮询管线**：HEAD 与 GET 一致先查缓存（命中回放响应头，无 body），未命中按候选轮询回源（方法保持 HEAD，docker registry 的 HEAD 探测同样打到镜像站）；HEAD 响应无 body 不写缓存；未配置 url-redirect 时回退直连（与旧版一致）
-- **docker 镜像 layer 异步预取（manifest 驱动）**：识别出 `GET /v2/<name>/manifests/<ref>` 路径目标回源成功且响应为单平台 image manifest 后，异步预取该镜像其余 layer blob 写入缓存（`docker-prefetch-enabled` 默认开，并发 `docker-prefetch-concurrency` 默认 4）——docker daemon 默认 `max-concurrent-downloads=3` 逐层下载慢，预取后客户端后续 blob 请求直接 `X-Cache: HIT`；预取复用与客户端完全相同的回源路径（候选轮询/超时覆盖/http-proxy/insecure TLS/token dance/缓存写入），只写缓存不产生客户端响应；同一 blob 在途集合去重 + singleflight 与客户端并发请求合并；失败只记日志绝不影响客户端；blob 按 digest 不可变、不存在刷新问题，详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」
+- **docker 镜像 layer 异步预取（manifest 驱动）**：识别出 `GET /v2/<name>/manifests/<ref>` 路径目标回源成功且响应为单平台 image manifest 后，异步预取该镜像其余 layer blob 写入缓存（`docker-prefetch-enabled` 默认开，并发 `docker-prefetch-concurrency` 默认 4）——docker daemon 默认 `max-concurrent-downloads=3` 逐层下载慢，预取后客户端后续 blob 请求直接 `X-Cache: HIT`；预取复用与客户端完全相同的回源路径（候选轮询/超时覆盖/http-proxy/insecure TLS/token dance/缓存写入），只写缓存不产生客户端响应；同一 blob 在途集合去重 + singleflight 与客户端并发请求合并；**预取在途中的层被客户端请求时直接搭车**（拼接已落盘前缀与实时增量，`X-Cache: PREFETCH`，上游仅预取一路下载、已下载部分直接复用，详见下文「[在途预取层搭车](#在途预取层搭车)」）；失败只记日志绝不影响客户端；blob 按 digest 不可变、不存在刷新问题，详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）；HEAD 响应天然无 body，content 判据对 HEAD 自动按 status 语义；HTTP 304（内容未变更）在两种模式下均视为成功候选，304 原样透传给客户端、不写缓存
 - **条件请求头不透传**：回源（候选与直连）按请求头白名单透传（含 `Range`），但 `If-Match` / `If-Modified-Since` / `If-None-Match` / `If-Range` / `If-Unmodified-Since` 不透传——回源始终为无条件 GET/HEAD，保证上游返回 200 + 完整 body 以过判据、写缓存；客户端的 304 语义由代理自身缓存 ETag 逻辑（HIT 命中时返回 304）负责
 - **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`insecure-skip-verify`、`timeout`（read-timeout 退化别名）、`http-timeout`、`read-timeout`、`connect-timeout`、`url-redirect-item-error-retry`、`url-redirect-all-error-retry` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
 - **上游代理支持**：全局与规则级 `http-proxy`（http/https/socks5），所有回源请求（含 url-redirect 候选请求）均可走代理
 - **allow-list / deny-list**：正则白/黑名单访问控制（deny 优先，allow 非空即白名单模式）
-- **可观测性**：`X-Cache`（HIT/MISS/BYPASS）与 `X-Proxy-Upstream`（本次内容来源）响应头、结构化日志、`/healthz` 健康检查
+- **可观测性**：`X-Cache`（HIT/MISS/BYPASS/PREFETCH）与 `X-Proxy-Upstream`（本次内容来源）响应头、结构化日志、`/healthz` 健康检查
 - **工程化**：YAML 配置（`-c` 参数或 `PROXY_CACHE_CONFIG` 环境变量指定路径）、Docker 严格二阶段构建、优雅退出
 
 ## 目录结构
@@ -122,7 +122,7 @@ docker run -d --name proxy-cache \
 | `slow-download-window` | duration | `10s` | 判速滑动窗口时长：窗口满按窗口平均速率判慢（启用时 Validate 钳制最小 `1s`，过短窗口会把网络抖动误判为持续过慢）；不满足触发条件零开销（除窗口计时本身） |
 | `slow-download-min-remaining` | bytes | `64MB` | 触发升级所需最小剩余字节数：剩余（已知总长 - 已传）不足不升级（尾巴太小没必要并发拉满）；`0` = 不设门槛；上游总长不可知（无 `Content-Length`/`Content-Range`）则永不触发 |
 | `slow-download-max-behind` | bytes | `8MB` | 多源合并的剪枝阈值：合并中某源落后领先源超过该字节数即被关闭移除（收敛多源并发的带宽放大）；启用时（`slow-download-speed > 0`）必须 `>0`，Validate 拒绝 |
-| `docker-prefetch-enabled` | bool | `true` | **docker 镜像 layer 异步预取开关**：`GET /v2/<name>/manifests/<ref>` 路径目标回源成功（HTTP 200 已写入缓存）且响应为单平台 image manifest 时，异步预取该镜像其余 layer blob 写入缓存，客户端后续 blob 请求直接命中；HEAD / 206(Range) / 多平台 manifest list 与 OCI index 不触发；预取失败只记日志、绝不影响客户端请求。详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」 |
+| `docker-prefetch-enabled` | bool | `true` | **docker 镜像 layer 异步预取开关**：`GET /v2/<name>/manifests/<ref>` 路径目标回源成功（HTTP 200 已写入缓存）且响应为单平台 image manifest 时，异步预取该镜像其余 layer blob 写入缓存，客户端后续 blob 请求直接命中；**预取在途中的层被客户端请求时直接搭车**（`X-Cache: PREFETCH`，上游仅预取一路下载）；HEAD / 206(Range) / 多平台 manifest list 与 OCI index 不触发；预取失败只记日志、绝不影响客户端请求。详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」与「[在途预取层搭车](#在途预取层搭车)」 |
 | `docker-prefetch-concurrency` | int | `4` | docker 层预取的并发数上限（全部预取共享一个 Server 级信号量）；必须为正整数（显式 `<=0` 启动报错——关闭预取请用 `docker-prefetch-enabled: false`，两者语义分离） |
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://`。三级覆盖（高→低）：**url-redirect 候选对象 `http-proxy`（显式空串 = 该候选强制直连）> 域名规则 > 本全局值**，详见「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」 |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
@@ -554,13 +554,25 @@ docker 客户端并发下载 layer 受限（daemon 默认 `max-concurrent-downlo
 - **Server 级有界并发**：全部预取共享一个信号量（`docker-prefetch-concurrency`，默认 4），预取在异步 goroutine 中执行、绝不阻塞 manifest 响应
 - **未过期缓存命中 → 跳过**：已有缓存的 blob 不重复下载
 - **预取在途集合去重**：同一 blob 的预取只排队一次（多个客户端同时拉同一镜像 / 预取被重复触发时防重复排队）
-- **singleflight 合并**：预取下载与客户端 blob 请求共用同一缓存键的 singleflight——客户端正在下载某 blob 时预取不另起第二路下载（等待并共享其结果）；反之客户端请求撞上预取在途同样合并（客户端等待 10s 上限后自行回源的既有语义不变）
+- **singleflight 合并**：预取下载与客户端 blob 请求共用同一缓存键的 singleflight——客户端正在下载某 blob 时预取不另起第二路下载（等待并共享其结果）；客户端在预取登记在途流共享（hub）之前的极小窗口期撞上预取，同样经 singleflight 合并
+- **在途流共享（hub）**：预取执行方为流式下载——边读上游边写缓存临时文件并逐块广播增量；客户端请求撞上还在下载中的层时直接**搭车**（见下节「[在途预取层搭车](#在途预取层搭车)」），上游对该 blob 始终只有一路下载
 
-**回源路径复用**：预取 blob 的下载与客户端请求**完全相同的回源链路**——候选轮询（round-robin 起始下标共用）、候选级超时覆盖、`http-proxy`、insecure TLS、docker 401 匿名 token dance、成功判据与缓存写入全复用；**只写缓存、不产生客户端响应**。
+**回源路径复用**：预取 blob 的下载与客户端请求**完全相同的回源链路**——候选轮询（round-robin 起始下标共用）、候选级超时覆盖、`http-proxy`、insecure TLS、docker 401 匿名 token dance、成功判据与缓存写入全复用；**只写缓存、不产生客户端响应**。预取那一路不叠加 slowdownload 慢速升级多源并发续传（上游速率由预取一路决定，过慢时靠搭车订阅超时降级 + 客户端 Range 重试兜底）。
 
-**失败降级**：预取失败只记日志（Warn/Debug），不重试（候选管线自身已有单候选/整轮重试），绝不影响客户端主请求；客户端后续请求照走原路径。
+**失败降级**：预取失败只记日志（Warn/Debug），不重试（候选管线自身已有单候选/整轮重试），绝不影响客户端主请求；正在搭车的客户端按 failed 广播降级（未 commit 改走原回源路径 / 已 commit 终止本次响应，docker 以 Range 续传重试），未搭车的客户端后续请求照走原路径。
 
 **刷新语义**：blob 按 digest 寻址、**内容不可变，不存在刷新问题**，过期由现有 `cache.ttl` / `clean-interval` 与后台 Janitor 管理；预取**不改变 manifest 的 TTL/ETag/缓存行为**；tag（如 `:latest`）更新后新 manifest 引用相同 digest 的 layer 直接命中缓存，digest 变了才回源下载。预取任务自带独立超时兜底（5 分钟/任务，不使用请求 context），进程退出不等待预取任务（绝不悬挂）。
+
+### 在途预取层搭车
+
+上一节预取解决了「客户端没请求的层提前下载」，但有个缺口：某层（blob）**还在预取下载中**时客户端请求到它，旧版要进 singleflight 等待——等待上限只有 10s（大 layer 下载几十秒到几分钟），超限后客户端**自行回源 = 第二路完整下载**，既重复下载、又从 0 开始。**在途流共享（hub）+ 磁盘前缀拼接搭车**补上这个缺口：
+
+- **搭车机制**：预取开始流式下载时在 Server 级注册表登记（blob 缓存键 → 在途条目）；客户端 blob GET 缓存 MISS 后、进 singleflight 等待之前先查该注册表——命中在途条目即搭车：响应头照抄预取那一路的快照（`Content-Length` / `Docker-Content-Digest` / `Content-Type` / `X-Proxy-Upstream`），`X-Cache: PREFETCH`，body = 已落盘磁盘前缀（从 0 读临时文件）+ 订阅增量 channel 的实时后续。已下载的部分直接复用，客户端不从 0 重新发起网络下载，上游对该 blob 始终**只有预取一路下载**。
+- **多客户端同时搭车**：各自独立订阅（独立增量 channel、逐订阅者独立拷贝广播块），互不阻塞；客户端读速快于预取下载速度时 reader 天然阻塞等增量（背压）。
+- **边界**：仅无 Range 的完整 GET 搭车——HEAD 走原路径；带 Range（206 断点续传）/ `no-cache` / 关缓存等 BYPASS 请求不搭车。docker 客户端搭车被断后重试会用 Range 断点续传，既有「206 透传不写缓存」机制自然兜底「不从 0 下载」（重试命中已写盘的前缀缓存则直接 HIT）。
+- **活性与降级**：订阅等待响应头快照 / 下一段增量均有 30s 超时（与 docker 客户端等响应头的约 30s 超时同量级）——尚未向客户端 commit 响应头时放弃搭车改走既有原回源路径（singleflight、流式透传、慢速升级等特性全保留）；已 commit 则终止本次响应并记日志（docker 对该层以 Range 续传重试）。搭车路径不叠加 slowdownload 慢速升级多源并发续传：上游速率由预取那一路决定，过慢时靠订阅超时降级 + 客户端 Range 重试兜底。
+- **预取任务超时兜底**：预取任务 5 分钟独立超时到期（经候选 `http-timeout` 预算传导）时该路下载失败，广播 failed 给全部搭车订阅者后移除条目（订阅者同上降级/终止）。
+- **开关**：随 `docker-prefetch-enabled` 一同生效——关闭预取即无在途条目，搭车自然不生效，无新增配置项。
 
 ### 用法
 

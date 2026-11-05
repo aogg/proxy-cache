@@ -95,6 +95,10 @@ type Server struct {
 	//（waitPrefetchIdle）；进程退出不等待——预取任务不使用请求 context 且自带超时兜底，
 	// 随进程消亡即可，绝不悬挂退出（见 prefetch.go 生命周期说明）。
 	prefetchWG sync.WaitGroup
+	// prefetchHub docker 预取 blob 在途流共享注册表（搭车）：blob 缓存键 -> 在途下载
+	// 条目，客户端请求撞上在途预取时拼接已落盘前缀与实时增量回放，上游仅预取一路下载
+	//（见 prefetch_hub.go；New 预构建，防御性惰性补建见 prefetchHubOrInit）。
+	prefetchHub *prefetchStreamHub
 }
 
 // New 创建 Server：预编译全局/各域名规则及其 url-redirect 候选对象用到的上游代理客户端
@@ -109,6 +113,8 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	// 运行期防御性惰性补建见 prefetch.go
 	s.prefetchSlots = make(chan struct{}, cfg.GlobalDockerPrefetchConcurrency())
 	s.prefetchInflight = make(map[string]struct{})
+	// docker 预取 blob 在途流共享注册表（搭车，见 prefetch_hub.go）
+	s.prefetchHub = newPrefetchStreamHub()
 
 	// 预构建全局与各域名规则可能用到的 (上游代理, connect-timeout) 组合客户端：
 	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建。
@@ -506,6 +512,19 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	}
 	s.log.Debug("缓存查询结果", "result", "MISS", "key", key, "dir", eff.CachePath)
 	// //////////////////  查缓存：命中直接回放  end  ////////////////////////////////////////////////
+
+	// //////////////////  在途预取层搭车检查  start  //////////////////////////////////////////////
+	// 该 blob 正被预取流式下载时直接搭车（拼接已落盘前缀 + 实时增量回放，X-Cache: PREFETCH），
+	// 不进下方 flight 等待——flightWaitLimit（10s）撑不住大 layer 的完整下载窗口，超限即
+	// 自行回源 = 第二路完整下载且从 0 开始（见 prefetch_hub.go）；已 commit 后的订阅超时/
+	// 失败在内部终止本次响应（docker 对该层以 Range 断点续传重试，206 透传不写缓存兜底
+	// 「不从 0 重新下载」）。未命中 hub（无预取 / 条目不存在）则行为与旧版完全一致。
+	// 进入本检查的请求必然是缓存可读（非 BYPASS）的无 Range 完整 GET——HEAD / 206 续传 /
+	// no-cache 已被上方分支分流，天然不搭车。
+	if streaming && s.tryServeFromPrefetchHub(w, r, key, target, eff, disk, start) {
+		return
+	}
+	// //////////////////  在途预取层搭车检查  end  ////////////////////////////////////////////////
 
 	// //////////////////  未命中：单飞回源并写缓存  start  ////////////////////////////////////////////////
 	// 单飞 key 仍为缓存 key 输入串的 sha256：同一入站域名下同一目标必然命中同一规则/目录，

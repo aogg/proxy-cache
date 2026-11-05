@@ -18,15 +18,22 @@
 //   - 已有未过期缓存的 blob 直接跳过（不重复下载）；
 //   - 预取在途集合（blob 缓存键）防重复排队：多个客户端同时拉同一镜像 / 同一 manifest
 //     的预取被重复触发时，同一 blob 只排队一次；
-//   - 预取下载复用现有 flightGroup（缓存键为 key）：与客户端并发请求同一 blob 时合并
-//    为同一次回源（在途则不另起第二路下载），谁先到谁执行、其余等待共享结果；
+//   - 预取下载复用现有 flightGroup（缓存键为 key）：客户端在 hub 登记前撞上预取的
+//    极小窗口期仍经 flight 合并（谁先到谁执行、其余等待共享结果；等待方语义不变）；
 //   - Server 级有界并发：全部预取共享一个信号量（docker-prefetch-concurrency，默认 4），
 //     预取绝不阻塞 manifest 响应（异步 goroutine）。
+//
+// 在途流共享（hub，见 prefetch_hub.go）：预取执行方不再走「缓冲排干为完整 Entry」的
+// 路径，改为流式下载写缓存临时文件 + 逐块广播增量给订阅者——客户端 blob GET 缓存
+// MISS 撞上还在下载中的层时直接搭车（拼接已落盘前缀与实时增量回放，X-Cache: PREFETCH），
+// 上游只有预取一路下载、已下载部分直接复用，不再受 flightWaitLimit（10s）限制后回退
+// 成第二路完整下载。
 //
 // 回源路径复用：预取 blob 的下载与客户端请求走完全相同的回源链路——候选轮询
 //（round-robin 起始下标共用 s.rr）、候选级超时覆盖、http-proxy、insecure TLS、
 // docker 401 匿名 token dance、成功判据与缓存写入（finalizeFetchEntry）全复用；
-// 只写缓存、不产生客户端响应。
+// 只写缓存、不产生客户端响应。预取那一路不叠加 slowdownload 慢速升级多源并发续传：
+// 上游速率由预取那一路决定，过慢时靠搭车订阅超时降级 + 客户端 Range 重试兜底。
 //
 // 失败降级：预取失败只记日志（Warn/Debug），不重试（候选管线自身已有 item/round
 // 重试语义），绝不影响客户端主请求；客户端后续请求照走原路径——flight 等待
@@ -181,13 +188,16 @@ func (s *Server) prefetchImageLayers(r *http.Request, name, ref string, digests 
 
 // prefetchOneBlob 预取单个 blob（/v2/<name>/blobs/<digest>）：
 //  1. 已有未过期缓存命中 → 跳过；
-//  2. 该 blob 已在预取在途集合 → 跳过（防止重复排队）；
-//  3. 占 Server 级并发信号量（等待受任务 ctx 约束）后回源下载：与客户端请求同一回源
-//     路径（候选轮询、超时覆盖、http-proxy、insecure TLS、docker 401 token dance、
-//     缓存写入全复用），只写缓存、不产生客户端响应；与客户端并发请求同一 blob 时经
+//  2. 该 blob 已在预取在途集合 → 跳过（防止重复排队；排队阶段尚无 hub 条目，
+//     客户端此窗口内查 hub 不可见、照走既有路径，属低概率退化而非错误）；
+//  3. 占 Server 级并发信号量（等待受任务 ctx 约束）后流式回源下载：与客户端请求同一
+//     回源路径（候选轮询、超时覆盖、http-proxy、insecure TLS、docker 401 token dance、
+//     缓存写入全复用），边下载边广播增量（hub 在途流共享，客户端可搭车，见
+//     prefetch_hub.go），只写缓存、不产生客户端响应；与客户端并发请求同一 blob 时经
 //     现有 flightGroup 合并（在途则不另起第二路下载，见 flight.go）。
 //
-// 失败降级：仅留痕（Warn/Debug），不重试，绝不影响客户端主请求。
+// 失败降级：仅留痕（Warn/Debug），不重试，绝不影响客户端主请求（hub 订阅者按
+// failed 广播降级/终止，见 prefetch_hub.go）。
 func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, digest string, eff config.Options, disk *cache.Cache) {
 	blobTarget := "v2/" + name + "/blobs/" + digest
 	// 缓存键与客户端 blob 请求同构（cacheKeyInput 对路径目标的输入：http://<Host>/<目标>），
@@ -232,18 +242,14 @@ func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, dig
 		}
 	}
 
-	// 回源下载（经现有 flightGroup）：本调用为执行方时走「与客户端 blob 请求完全相同的
-	// 缓冲回源路径（候选竞速 + 排干为完整 Entry）+ 既有缓存写入语义」；为等待方时
-	// 共享客户端在途回源的结果（缓存由客户端执行方写入，本调用不再重复写）。
+	// 回源下载（经现有 flightGroup）：本调用为执行方时走「流式下载写缓存临时文件 +
+	// 逐块广播增量给订阅者 + EOF 原子写缓存」（hub 在途条目登记后客户端 blob GET 即可
+	// 搭车，上游仅此一路下载，见 prefetch_hub.go）；为等待方时共享客户端在途回源的结果
+	//（缓存由客户端执行方写入，本调用不再重复写；等待方语义不变——hub 登记前撞上
+	// 预取的窗口期客户端仍经 flight 合并）。
 	blobReq := prefetchBlobRequest(r, blobTarget)
 	e, executed, err := s.flight.DoLimit(blobKey, waitLimit, func() (*cache.Entry, error) {
-		ent, ferr := s.fetchViaCandidates(blobReq, blobTarget, effTry)
-		if ferr != nil {
-			return nil, ferr
-		}
-		// 既有缓存写入语义复用（仅 200 且过判据写缓存；成功时留「写入缓存成功」日志）
-		s.finalizeFetchEntry(blobReq, blobKey, blobTarget, ent, effTry, disk)
-		return ent, nil
+		return s.prefetchBlobStreaming(blobReq, blobKey, blobTarget, digest, effTry, disk)
 	})
 	switch {
 	case errors.Is(err, errFlightWaitTimeout):

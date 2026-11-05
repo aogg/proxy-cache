@@ -180,6 +180,13 @@ fallback-direct: true
 # 下载）；失败只记日志不重试、绝不影响客户端。blob 按 digest 寻址内容不可变，不存在
 # 刷新问题（过期由 cache.ttl / clean-interval 管）；预取不改变 manifest 本身的
 # TTL/ETag/缓存行为，tag(:latest) 更新后新 manifest 引用相同 digest 的 layer 直接命中。
+# 在途层搭车：还在预取下载中的层被客户端请求时直接搭上预取那一路——响应头照抄预取
+# 快照（X-Cache: PREFETCH），body = 已落盘磁盘前缀 + 实时增量拼接回放，上游对该 blob
+# 只有预取一路下载、已下载部分直接复用（客户端不从 0 重新下载）。仅无 Range 的完整
+# GET 搭车（HEAD / 206 续传 / no-cache 走原路径；搭车被断后 docker 以 Range 断点续传
+# 重试，206 透传不写缓存兜底「不从 0 下载」）；搭车不叠加慢速升级多源续传（上游速率
+# 由预取一路决定，过慢靠 30s 订阅超时降级 + 客户端 Range 重试兜底）；随本开关一同
+# 生效（关闭预取即无搭车），无新增配置项。
 # docker-prefetch-enabled       预取开关（默认 true 开启；显式 false 关闭）
 # docker-prefetch-concurrency   预取并发数上限（默认 4；必须为正整数，
 #                               显式 <=0 启动报错——关闭预取用上方开关）
