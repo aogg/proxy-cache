@@ -1506,7 +1506,7 @@ func validateRedirectItems(list []URLRedirectItem, where string) error {
 		// 原始 URL 独立候选放行：模板恰为 $1 / ${1}（写法由占位符常量拼接，避免魔法字符串漂移）
 		// 视为合法，原始目标 URL 显式参与候选轮询，可配合候选级 http-proxy 走代理回源；
 		// 跳过 http(s):// 前缀检查，占位符检查天然满足、无需重复
-		if t == "$" + PlaceholderTarget || t == "${" + PlaceholderTarget + "}" {
+		if t == "$"+PlaceholderTarget || t == "${"+PlaceholderTarget+"}" {
 			list[i].Template = t
 			continue
 		}

@@ -57,7 +57,7 @@ import (
 )
 
 // prefetchTaskTimeout 单个预取任务的独立超时兜底：预取 goroutine 不使用请求的 context
-//（请求结束会被取消），用独立 context 计时——任务整体（含排队等待并发额度与逐个
+// （请求结束会被取消），用独立 context 计时——任务整体（含排队等待并发额度与逐个
 // blob 回源）超过该时长即放弃剩余 layer，已写入缓存的 layer 保留。
 const prefetchTaskTimeout = 5 * time.Minute
 
@@ -271,7 +271,7 @@ func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, dig
 }
 
 // prefetchBlobRequest 构造 blob 预取用的请求对象：以触发预取的 manifest 请求为模板克隆
-//（复用其请求头与入站 Host——候选模板变量展开与上游请求头白名单都基于它），仅把 URL
+// （复用其请求头与入站 Host——候选模板变量展开与上游请求头白名单都基于它），仅把 URL
 // 路径改写为 blob 路径并清掉查询串——保证模板里 $1 与 $http.server.header.full_url /
 // full_url_no_server 都按 blob 请求展开（与客户端真实 blob 请求同构），而非残留在
 // manifest 路径上。Accept 等请求头沿用 manifest 请求（registry 对 blob 无内容协商语义）。
