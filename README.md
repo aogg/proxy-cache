@@ -18,6 +18,7 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **url-redirect 候选对象与候选级覆盖**：`url-redirect` 为**对象数组**（破坏性变更：旧版纯字符串写法解析期报错并给出迁移示例），候选 = `template`（原模板字符串，占位符语义不变）+ 可选 `insecure-skip-verify` / `http-proxy` / `connect-timeout` / `http-timeout` / `read-timeout` / `probe-timeout`；这些可选项均为三级优先级**候选 > 规则 > 全局**（未配置逐级继承；候选显式空串 `http-proxy` = 强制直连、显式 `0` 超时 = 不限制），适合「个别镜像站证书链不全」「单个候选必须走慢代理并放宽超时」的场景，详见下文「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」
 - **HEAD 走候选轮询管线**：HEAD 与 GET 一致先查缓存（命中回放响应头，无 body），未命中按候选轮询回源（方法保持 HEAD，docker registry 的 HEAD 探测同样打到镜像站）；HEAD 响应无 body 不写缓存；未配置 url-redirect 时回退直连（与旧版一致）
 - **docker 镜像 layer 异步预取（manifest 驱动）**：识别出 `GET /v2/<name>/manifests/<ref>` 路径目标回源成功且响应为单平台 image manifest 后，异步预取该镜像其余 layer blob 写入缓存（`docker-prefetch-enabled` 默认开，并发 `docker-prefetch-concurrency` 默认 4）——docker daemon 默认 `max-concurrent-downloads=3` 逐层下载慢，预取后客户端后续 blob 请求直接 `X-Cache: HIT`；预取复用与客户端完全相同的回源路径（候选轮询/超时覆盖/http-proxy/insecure TLS/token dance/缓存写入），只写缓存不产生客户端响应；同一 blob 在途集合去重 + singleflight 与客户端并发请求合并；**预取在途中的层被客户端请求时直接搭车**（拼接已落盘前缀与实时增量，`X-Cache: PREFETCH`，上游仅预取一路下载、已下载部分直接复用，详见下文「[在途预取层搭车](#在途预取层搭车)」）；失败只记日志绝不影响客户端；blob 按 digest 不可变、不存在刷新问题，详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」
+- **docker blob 半截保留与无感续传**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时，把已下载前缀保留为缓存目录内的半截文件（`.part-<缓存key>`，大小即已下载字节数，`docker-partial-resume-enabled` 默认开）——重 pull 时 docker 客户端是无 Range 的完整 GET（从 0 开始），proxy 撞上「缓存 MISS + 半截文件」时从断点 Range 续传并对客户端回**一次完整 200**（本地前缀回放 + 上游剩余实时拼接，docker 无需支持 Range、完全无感知，`X-Cache: RESUME`）；并发请求经既有搭车机制共享同一路续传流，上游只一路下载；续传中途失败保留更新后的半截（进度不回退）；manifest 仅 blob 启用、带 Range 维持 206 透传、上游不回 206 时安全降级，详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）；HEAD 响应天然无 body，content 判据对 HEAD 自动按 status 语义；HTTP 304（内容未变更）在两种模式下均视为成功候选，304 原样透传给客户端、不写缓存
 - **条件请求头不透传**：回源（候选与直连）按请求头白名单透传（含 `Range`），但 `If-Match` / `If-Modified-Since` / `If-None-Match` / `If-Range` / `If-Unmodified-Since` 不透传——回源始终为无条件 GET/HEAD，保证上游返回 200 + 完整 body 以过判据、写缓存；客户端的 304 语义由代理自身缓存 ETag 逻辑（HIT 命中时返回 304）负责
 - **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`insecure-skip-verify`、`timeout`（read-timeout 退化别名）、`http-timeout`、`read-timeout`、`connect-timeout`、`url-redirect-item-error-retry`、`url-redirect-all-error-retry` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
@@ -124,6 +125,7 @@ docker run -d --name proxy-cache \
 | `slow-download-max-behind` | bytes | `8MB` | 多源合并的剪枝阈值：合并中某源落后领先源超过该字节数即被关闭移除（收敛多源并发的带宽放大）；启用时（`slow-download-speed > 0`）必须 `>0`，Validate 拒绝 |
 | `docker-prefetch-enabled` | bool | `true` | **docker 镜像 layer 异步预取开关**：`GET /v2/<name>/manifests/<ref>` 路径目标回源成功（HTTP 200 已写入缓存）且响应为单平台 image manifest 时，异步预取该镜像其余 layer blob 写入缓存，客户端后续 blob 请求直接命中；**预取在途中的层被客户端请求时直接搭车**（`X-Cache: PREFETCH`，上游仅预取一路下载）；HEAD / 206(Range) / 多平台 manifest list 与 OCI index 不触发；预取失败只记日志、绝不影响客户端请求。详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」与「[在途预取层搭车](#在途预取层搭车)」 |
 | `docker-prefetch-concurrency` | int | `4` | docker 层预取的并发数上限（全部预取共享一个 Server 级信号量）；必须为正整数（显式 `<=0` 启动报错——关闭预取请用 `docker-prefetch-enabled: false`，两者语义分离） |
+| `docker-partial-resume-enabled` | bool | `true` | **docker blob 半截保留与无感续传开关**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时把已下载前缀保留为缓存目录半截文件（`.part-<缓存key>`）；客户端无 Range 完整 GET 撞上「缓存 MISS + 半截文件」时从断点 Range 续传，对客户端回一次完整 200（前缀回放 + 剩余实时拼接，docker 无需支持 Range，`X-Cache: RESUME`）；manifest 会变仅 blob 启用；带 Range 维持既有 206 透传；上游不回 206 安全降级全量回源。详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」 |
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://`。三级覆盖（高→低）：**url-redirect 候选对象 `http-proxy`（显式空串 = 该候选强制直连）> 域名规则 > 本全局值**，详见「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」 |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
@@ -575,6 +577,17 @@ docker 客户端并发下载 layer 受限（daemon 默认 `max-concurrent-downlo
 - **预取任务超时兜底**：预取任务 5 分钟独立超时到期（经候选 `http-timeout` 预算传导）时该路下载失败，广播 failed 给全部搭车订阅者后移除条目（订阅者同上降级/终止）。
 - **开关**：随 `docker-prefetch-enabled` 一同生效——关闭预取即无在途条目，搭车自然不生效，无新增配置项。
 
+### blob 半截保留与无感续传
+
+用户场景：镜像层的 digest（唯一值）不变，之前下载到一部分（如 248.9MB/773.3MB）时中断，**重 pull 时 docker 客户端是无 Range 的完整 GET（从 0 开始）**，但 proxy 这边已经下载过的一部分应该保留——客户端再请求该层时把已下载部分直接给客户端，proxy 同时从断掉的地方继续向远端下载。
+
+- **半截保留**：blob（`/v2/<name>/blobs/<digest>`）的流式下载（客户端主路径与预取路径都算）中断/失败时，把已下载前缀保留为缓存目录内的半截文件 `.part-<缓存key>`（文件大小即已下载字节数，内容为 blob 原文前缀、无缓存文件头）。任何保留动作仅在「新前缀比现有半截更长」时落盘——**进度绝不回退**；进程崩溃残留由 `cache.Clean` 后台清理兜底（空半截立即清理；`mtime` 超过 24h——量级同缓存条目过期 TTL——的孤儿残留一并清理，活跃下载/续传中的半截持续追加、`mtime` 新鲜不受影响）。
+- **无感续传（主场景）**：客户端无 Range 完整 GET 撞上「正式缓存 MISS + 半截文件存在」时走**续传执行方**——按既有候选轮询（round-robin 起始下标共用）逐候选发 `Range: bytes=<已存字节>-`（既有候选级超时 / `http-proxy` / insecure TLS / 401 匿名 token dance 全复用，整体 20s 扫描预算兜底），从上游 `206` 响应的 `Content-Range` 取总长，对客户端回**一次完整 200**：`Content-Length=总长`（可得时，拿不到则流式不设），body = 本地半截前缀回放 + 上游剩余区间实时拼接——**docker 客户端无需支持 Range、完全无感知**（`X-Cache: RESUME`）。拼接期间上游剩余数据**边转发边追加写半截文件**；EOF 后半截内容 = 完整 blob，按既有 `cache.Set` 语义原子转为正式缓存条目并立即删除半截文件。
+- **并发合并**：续传执行方登记与预取同一套在途流共享注册表（resume 条目），其余客户端请求/等待超限的重试请求经既有搭车机制订阅「半截前缀 + 实时增量」（`X-Cache: PREFETCH`，上游只一路下载）；同 blob 的预取任务经既有 singleflight（同缓存键）合并到同一路续传流。半截文件的全部写侧操作按缓存键互斥（逐块追加 / 整体保存 / 预取改名），且续传执行方逐块追加前校验文件大小——半截被并发保存方更新为更长前缀时本流立即收尾（更长前缀已保留，进度不回退），绝不产生错位拼接。
+- **安全依据**：blob 按 digest 寻址、**内容不可变**——任意候选源的同 digest 内容一致，半截可从任意候选发 `Range` 续传拼接（续传可跨候选）；客户端/上游侧 `Docker-Content-Digest` 不做本地全量校验（GB 级 blob 成本过高），信任 digest 寻址语义。**commit 前必须先确认上游是 206 且 `Content-Range` 起点匹配半截长度**，确认前绝不向客户端写任何字节——若上游对 Range 回 200 全量响应，回放本地前缀再拼全量会数据错位，因此绝不允许。
+- **边界与降级**：manifest 会变，**仅 blob 启用**；客户端带 Range 的请求维持现状（206 透传不做本地拼接、不写半截——docker 重试时既有 206 机制已兜底）；半截为 0 字节直接丢弃；上游对 Range 回非 206（不支持 / 200 全量回）→ 丢弃半截走既有全量回源路径（安全降级，绝不给客户端错误数据）；纯网络/超时类失败保留半截继续全量回源（全量再失败时失败捕获会把更长前缀存回半截，进度不回退）；上游 416（Range 起点 ≥ 总长，而半截是合法前缀）证明**半截已完整**，直接读回写缓存回放，不再全量下载；续传中途读上游失败 / 长度不符 → 保留更新后的半截、本次响应被截断（docker 重试接着更长前缀续传——进度不回退）；EOF 但累积长度 ≠ 总长 → 不写缓存（绝不缓存短 body）。续传路径不叠加 slowdownload 慢速升级多源并发续传（与预取一路同一取舍）。
+- **开关**：`docker-partial-resume-enabled`（全局，默认开启；显式 `false` 关闭后全部路径行为与旧版完全一致——无半截文件的产生、保留与续传）。
+
 ### 用法
 
 ```bash
@@ -635,7 +648,7 @@ log:
 - **并发安全**：写入先落同目录临时文件再 `rename` 原子替换；读取要么看到旧条目、要么看到完整新条目
 - **防击穿**：同一 URL 并发未命中时通过 singleflight 只回源一次，其余请求共享结果
 - **TTL 生效**：按「全局默认或域名规则覆盖」的 TTL 在**写入时固化**到条目；修改配置中的 TTL 只影响新写入条目（旧条目仍按写入时的 TTL 过期，或清空 cache 目录立即生效）。`cache.ttl: 0` 表示**永不过期**（条目内 `ttl_seconds=0` 标记，读取与后台清理均按此判定）。**注意**：永不过期条目后台清理不会删除，缓存目录会持续增长；仅 `Cache-Control: no-cache` 强制刷新可更新该条目内容，手动清空缓存目录可移除
-- **过期清理**：读取命中过期条目时惰性删除 + 按生效目录每 `clean-interval`（全局默认或规则覆盖）后台全量扫描；TTL<=0 的**永不过期条目会被跳过**（仍清理损坏文件与残留临时文件）
+- **过期清理**：读取命中过期条目时惰性删除 + 按生效目录每 `clean-interval`（全局默认或规则覆盖）后台全量扫描；TTL<=0 的**永不过期条目会被跳过**（仍清理损坏文件与残留临时文件）；blob 半截文件（`.part-<缓存key>`，见「[blob 半截保留与无感续传](#blob-半截保留与无感续传)）不按条目解析——空文件（无续传价值）或 `mtime` 超过 24h 的孤儿残留一并清理，活跃下载/续传中的半截持续追加、`mtime` 新鲜不受影响
 - **规则级独立目录**：按目录复用缓存实例（同目录同一实例、同一后台清理协程，首次出现的 `clean-interval` 生效）；启动时按配置预热创建全部可能被写入的缓存目录，运行期按需获取实例失败时该请求降级为直接回源（BYPASS），不中断请求
 - **缓存条件**：仅 GET 且响应 200（content 模式还要求 body 非空）才写缓存；HEAD 只读缓存不写（无 body）；上游 304（内容未变更）视为成功但不写缓存，304 原样透传给客户端；`Range` 请求、`Cache-Control: no-cache` 请求绕过缓存读取（no-cache 仍会刷新缓存）
 
@@ -654,7 +667,8 @@ log:
 | 缓存未启用 / Range / no-cache | 直接回源（仍走 url-redirect 候选竞速），`X-Cache: BYPASS`；路径目标 GET 同样流式透传 |
 | 带 Range 的请求，上游回 206 | 视为成功并流式透传、**不写缓存**（docker 断点续传必需；旧版 206 会被成功判据拒掉导致续传全挂） |
 | 流式回源 commit 后客户端断开 | 保持既有行为：继续读完上游只填缓存（日志「写缓存成功」），docker 重试该层即可 HIT |
-| 流式回源 commit 后上游读取失败 | 记日志、终止本次响应、**不写缓存**（半截数据绝不入库）；单飞等待方得到 502 |
+| 流式回源 commit 后上游读取失败 | 记日志、终止本次响应、**不写缓存**（半截数据绝不入库）；**blob 例外**：开启 `docker-partial-resume-enabled`（默认开）时已下载前缀保留为半截文件（`.part-<缓存key>`，进度不回退），单飞等待方得到 502 |
+| blob 请求缓存 MISS 且半截文件存在（无 Range 完整 GET） | 走续传执行方：候选轮询从断点 `Range: bytes=<已存字节>-` 续传，对客户端回一次完整 200（前缀回放 + 剩余实时拼接，`X-Cache: RESUME`，docker 无需支持 Range）；并发请求经搭车机制共享同一路续传流；EOF 后写缓存并删半截；上游不回 206 → 丢弃半截安全降级全量回源；上游 416 → 半截已完整，整体回放写缓存；续传中途失败保留更新后的半截（详见「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」） |
 | 同 key 单飞回源等待超过 10s | 等待方自行走候选回源（不排队），`cache.Set` 原子替换保证并发写缓存互不污染 |
 | 缓存命中且 `If-None-Match` 匹配 ETag（或上游对无条件请求回 304） | 返回 304（不带 `Content-Length` 实体头），客户端使用本地缓存副本，日志记为成功（`内容未变更（304）`） |
 | 客户端条件请求头（`If-Match` 等 5 个） | 不透传给上游：回源始终为无条件 GET/HEAD（其余请求头按白名单透传，含 `Range`） |

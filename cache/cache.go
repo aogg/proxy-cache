@@ -36,6 +36,15 @@ const (
 	metaMaxLen = 1 << 20
 	// tmpPrefix 写入时的临时文件名前缀。
 	tmpPrefix = ".tmp-"
+	// partPrefix blob 半截文件的文件名前缀（.part-<缓存key>）：blob（/v2/<name>/blobs/
+	// <digest>）流式下载中断/失败时已下载前缀保留为该文件（文件大小即已下载字节数），
+	// 供下次无 Range 完整 GET 从断点拼接续传（见 proxy 包 partial_resume.go）。
+	partPrefix = ".part-"
+	// partMaxAge 半截文件的孤儿残留判定年龄：最后修改时间早于该年龄的半截文件视为
+	// 孤儿（对应下载早已结束、再无续传请求），由 Clean 一并清理——量级与缓存条目的
+	// 过期 TTL 相当。活跃续传/下载中的半截文件持续被追加写入（mtime 不断刷新），
+	// 不会被该规则误删。
+	partMaxAge = 24 * time.Hour
 )
 
 // meta 是缓存文件中 JSON 序列化的元信息。
@@ -112,6 +121,29 @@ func Key(target string) string {
 
 // path 返回缓存键对应的磁盘文件路径。
 func (c *Cache) path(key string) string { return filepath.Join(c.dir, key) }
+
+// PartPath 返回缓存键对应 blob 半截文件的完整路径（dir/.part-<key>）。
+// 半截文件内容 = 该 blob 已下载前缀的原文（无缓存文件头），文件大小即已下载字节数。
+func (c *Cache) PartPath(key string) string { return filepath.Join(c.dir, partPrefix+key) }
+
+// PartSize 返回半截文件当前大小（字节）；文件不存在返回 ok=false。并发语义：调用方
+//（proxy 包）以按 key 的写锁串行化半截文件的写侧操作，本读取仅作快照观测。
+func (c *Cache) PartSize(key string) (int64, bool) {
+	st, err := os.Stat(c.PartPath(key))
+	if err != nil {
+		return 0, false
+	}
+	return st.Size(), true
+}
+
+// RemovePart 删除半截文件（幂等；不存在静默成功，删除失败仅 Warn 留痕——残留由
+// Clean 的孤儿清理规则兜底，不影响主流程）。调用时机：对应 blob 正式缓存条目落盘后
+//（半截使命完成）或半截判定不可续传需丢弃时。
+func (c *Cache) RemovePart(key string) {
+	if err := os.Remove(c.PartPath(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("删除 blob 半截文件失败", "file", c.PartPath(key), "err", err)
+	}
+}
 
 // Get 读取缓存；未命中、已过期或损坏时返回 (nil, false)。
 // 过期条目会被惰性删除（删除失败不影响本次按未命中处理的结果）。
@@ -272,6 +304,8 @@ func (c *Cache) StartJanitor(ctx context.Context, interval time.Duration) {
 
 // Clean 扫描缓存目录，删除过期/损坏条目与残留临时文件，返回删除数量。
 // TTL<=0 的永久条目按未过期处理不会被删除（仍会清理损坏文件与临时文件）。
+// blob 半截文件（.part-<key>，见 PartPath）不按条目解析：空文件或 mtime 早于
+// partMaxAge 的孤儿残留即删除（规则见 Clean 内注释）。
 func (c *Cache) Clean() int {
 	des, err := os.ReadDir(c.dir)
 	if err != nil {
@@ -290,6 +324,21 @@ func (c *Cache) Clean() int {
 		if strings.HasPrefix(name, tmpPrefix) {
 			if rmErr := os.Remove(full); rmErr == nil {
 				removed++
+			}
+			continue
+		}
+		// blob 半截文件清理（.part-<key>）：空文件（下载刚起步就中断的残留，无续传
+		// 价值）或孤儿残留（mtime 早于 partMaxAge，对应下载早已结束、再无续传请求）
+		// 即删除；活跃下载/续传中的半截文件持续追加写入、mtime 新鲜，不受影响。
+		// 内容为前缀原文（无缓存文件头），不走下方条目解析分支。
+		if strings.HasPrefix(name, partPrefix) {
+			info, ierr := de.Info()
+			if ierr == nil && (info.Size() == 0 || now.Sub(info.ModTime()) >= partMaxAge) {
+				if rmErr := os.Remove(full); rmErr == nil {
+					removed++
+				} else if !errors.Is(rmErr, fs.ErrNotExist) {
+					slog.Warn("清理 blob 半截文件失败", "file", full, "err", rmErr)
+				}
 			}
 			continue
 		}

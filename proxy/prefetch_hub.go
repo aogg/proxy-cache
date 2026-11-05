@@ -143,6 +143,10 @@ type prefetchStreamEntry struct {
 	changedOnce sync.Once
 	// cleanupOnce 临时文件删除只执行一次（幂等）。
 	cleanupOnce sync.Once
+	// resume 是否为「blob 半截续传」条目（见 partial_resume.go）：true 时 tmpPath 指向
+	// 半截文件本体（written 预置为半截前缀长度，订阅者据此读半截前缀），hub 的临时文件
+	// 清理必须跳过——半截文件的保留/删除归续传逻辑与 cache.Clean 管理，绝不由 hub 删除。
+	resume bool
 }
 
 // prefetchStreamSub 一个搭车订阅者：独立增量 channel + 消费过慢摘除标记。
@@ -182,6 +186,31 @@ func (h *prefetchStreamHub) register(key, rule, digest string, log *slog.Logger)
 		log:     log,
 		subs:    make(map[*prefetchStreamSub]struct{}),
 		changed: make(chan struct{}),
+	}
+	h.mu.Lock()
+	h.m[key] = ent
+	h.mu.Unlock()
+	return ent
+}
+
+// registerResume 登记续传在途条目（blob 半截续传执行方在扫描候选前调用，见
+// partial_resume.go）：与预取条目同一注册表/同一搭车机制（lookup / subscribe /
+// writeBroadcast / setSnapshot / finishDone / finishFailed 全复用），差异仅两点——
+// written 预置为半截前缀长度（订阅者据此前缀读半截文件，执行方此后按
+// 「先追加磁盘、后推进 written」的既有契约推进）；resume=true（hub 绝不清理半截文件，
+// 客户端等待超限重试时按续传条目优先搭车）。条目字段在发布（写入注册表）前一次性
+// 填好，保证并发搭车者查到的条目自带正确前缀，无「先注册后补写」的竞态窗口。
+func (h *prefetchStreamHub) registerResume(key, rule, digest string, prefix int64, log *slog.Logger) *prefetchStreamEntry {
+	ent := &prefetchStreamEntry{
+		key:     key,
+		rule:    rule,
+		digest:  digest,
+		hub:     h,
+		log:     log,
+		subs:    make(map[*prefetchStreamSub]struct{}),
+		changed: make(chan struct{}),
+		resume:  true,
+		written: prefix,
 	}
 	h.mu.Lock()
 	h.m[key] = ent
@@ -410,9 +439,14 @@ func (e *prefetchStreamEntry) finishFailed(err error) {
 }
 
 // cleanupFile 删除预取临时文件（幂等；删除失败留 Debug 痕——残留 .tmp- 前缀文件由
-// cache.Clean 后台清理兜底）。
+// cache.Clean 后台清理兜底）。续传条目（resume=true）直接跳过：其 tmpPath 即半截文件
+// 本体，保留与删除归续传逻辑（partial_resume.go）与 cache.Clean 孤儿清理管理，hub 的
+// failed/done/linger 收尾绝不删除半截文件。
 func (e *prefetchStreamEntry) cleanupFile() {
 	e.cleanupOnce.Do(func() {
+		if e.resume {
+			return
+		}
 		path := e.tmpPathOf()
 		if path == "" {
 			return
@@ -618,8 +652,10 @@ func (s *Server) commitPrefetchHubHeader(w http.ResponseWriter, status int, head
 //  5. EOF：读回临时文件构造完整 Entry，复用 finalizeFetchEntry 原子写缓存（成功判据 /
 //     TTL 固化 / 日志全复用），hub 置 done 关闭订阅——磁盘前缀 + 增量恰好拼出完整
 //     body，搭车方与最终缓存条目逐字节一致；
-//  6. 任何失败：广播 failed 给全部订阅者后移除条目并清理临时文件（订阅方未 commit 的
-//     降级走原回源路径、已 commit 的终止本次响应，docker 以 Range 续传重试）。
+//  6. 任何失败：读上游失败时先把已下载前缀保留为半截文件（blob 半截保留与无感续传，
+//     见 partial_resume.go；仅全局开关开启），广播 failed 给全部订阅者后移除条目并清理
+//     临时文件（订阅方未 commit 的降级走原回源路径、已 commit 的终止本次响应，docker
+//     以 Range 续传重试）。
 //
 // 返回完整 Entry 供 flight 等待方（在 hub 登记前撞上本预取的窗口期客户端）共享回放；
 // EOF 时一次性读回，内存峰值 = 单个 blob 全量（与既有缓冲回源路径一致量级）。
@@ -704,6 +740,13 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 			if rerr != nil {
 				if errors.Is(rerr, io.EOF) {
 					break // 完整读完：磁盘前缀即完整 body，半截数据不存在，可以入库
+				}
+				// blob 半截保留：读上游失败时把已下载前缀（临时文件内容）保留为半截文件
+				//（仅全局开关开启；同目录 rename 零拷贝、进度不回退，见 partial_resume.go）。
+				// 须在 fail（finishFailed 清理临时文件）之前改名——改名后旧临时文件名已
+				// 不存在，finishFailed 的清理按 ErrNotExist 静默跳过，无副作用
+				if s.cfg != nil && s.cfg.GlobalDockerPartialResumeEnabled() {
+					s.keepPrefetchPartial(disk, key, tmp.Name(), ent.writtenOf())
 				}
 				// 读上游失败：广播 failed（半截数据绝不入库），Error 留痕
 				s.log.Error("预取流式回源读上游失败（已广播搭车订阅者终止/降级，半截数据不入库）",

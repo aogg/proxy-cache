@@ -99,6 +99,13 @@ type Server struct {
 	// 条目，客户端请求撞上在途预取时拼接已落盘前缀与实时增量回放，上游仅预取一路下载
 	//（见 prefetch_hub.go；New 预构建，防御性惰性补建见 prefetchHubOrInit）。
 	prefetchHub *prefetchStreamHub
+	// partialMu 保护 partialWriters 的并发访问/惰性补建。
+	partialMu sync.Mutex
+	// partialWriters blob 半截文件的按 key 写锁注册表：串行化同一 blob 半截文件的全部
+	// 写侧操作（续传执行方逐块追加 / 失败前缀整体保存 / 预取半截改名），杜绝并发写
+	// 交错产生「非前缀」内容（半截必须是 blob 原文前缀，续传拼接正确性的前提）。
+	// 见 partial_resume.go（New 预构建，防御性惰性补建见 partWriter）。
+	partialWriters map[string]*sync.Mutex
 }
 
 // New 创建 Server：预编译全局/各域名规则及其 url-redirect 候选对象用到的上游代理客户端
@@ -115,6 +122,8 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	s.prefetchInflight = make(map[string]struct{})
 	// docker 预取 blob 在途流共享注册表（搭车，见 prefetch_hub.go）
 	s.prefetchHub = newPrefetchStreamHub()
+	// blob 半截文件的按 key 写锁注册表（半截保留与无感续传，见 partial_resume.go）
+	s.partialWriters = make(map[string]*sync.Mutex)
 
 	// 预构建全局与各域名规则可能用到的 (上游代理, connect-timeout) 组合客户端：
 	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建。
@@ -534,6 +543,19 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	}
 	// //////////////////  在途预取层搭车检查  end  ////////////////////////////////////////////////
 
+	// //////////////////  blob 半截续传检查  start  ////////////////////////////////////////////////
+	// 正式缓存 MISS 且半截文件存在时走「续传执行方」：按候选轮询从断点 Range 续传，
+	// 对客户端回一次完整 200（本地半截前缀回放 + 上游剩余实时拼接，docker 无需支持
+	// Range、完全无感知；见 partial_resume.go）。并发合并：其余同 key 请求经既有
+	// flightGroup / 搭车注册表共享同一路续传流，上游只一路下载。进入本检查的请求与
+	// 搭车检查同约束：缓存可读、无 Range / no-cache 的完整 GET。开关关闭 / 非 blob /
+	// 无半截文件时行为与旧版完全一致。注：带 Range 的请求维持既有 206 透传不写缓存
+	//（不做本地拼接——docker 重试时既有 206 机制已兜底）。
+	if streaming && s.tryServeBlobResume(w, r, key, target, eff, disk, start, finalize, streamingError) {
+		return
+	}
+	// //////////////////  blob 半截续传检查  end  ////////////////////////////////////////////////
+
 	// //////////////////  未命中：单飞回源并写缓存  start  ////////////////////////////////////////////////
 	// 单飞 key 仍为缓存 key 输入串的 sha256：同一入站域名下同一目标必然命中同一规则/目录，
 	// 必然落同一缓存实例（路径目标的 key 输入含入站 Host，跨入站域名天然不共享单飞）。
@@ -549,8 +571,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		if streaming {
 			// 流式执行方：响应已在本次调用内 commit 并边读边写给客户端，
 			// EOF 后 finalize 写缓存，完整 Entry 返回给等待方；
-			// commit 后失败用 errStreamingCommitted 标记（响应头已固化，不得再 502）
-			ent, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start)
+			// commit 后失败用 errStreamingCommitted 标记（响应头已固化，不得再 502）；
+			// partial sink：blob 流式下载中断/失败时保留半截前缀（partial_resume.go）
+			ent, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 			if ferr != nil && committed {
 				return nil, fmt.Errorf("%w: %v", errStreamingCommitted, ferr)
 			}
@@ -565,10 +588,11 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	})
 	switch {
 	case errors.Is(err, errFlightWaitTimeout):
-		// 等待同 key 单飞回源超限：自行走候选回源（不注册单飞，流式透传 + EOF 写缓存）
+		// 等待同 key 单飞回源超限：自行走候选回源（不注册单飞，流式透传 + EOF 写缓存；
+		// partial sink：blob 半截保留同执行方路径）
 		s.log.Warn("等待同 key 单飞回源超限，自行走候选回源",
 			"rule", eff.Rule, "key", key, "wait", waitLimit.String(), "target", truncate(target, 300))
-		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start)
+		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 		streamingError(ferr, committed)
 	case errors.Is(err, errStreamingCommitted):
 		// 本调用是流式执行方且 commit 后失败：底层原因已留痕（Error），响应头已写出，
@@ -610,6 +634,11 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 				s.log.Info("写入缓存成功",
 					"rule", eff.Rule, "target", truncate(target, 300), "key", key,
 					"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))
+				// blob 正式缓存条目已落盘：立即删除对应半截文件（其内容已完整入库，
+				// 使命完成；非 blob 目标静默跳过，见 partial_resume.go）
+				if _, isBlob := parseDockerBlobTarget(target); isBlob {
+					disk.RemovePart(key)
+				}
 				// docker 镜像 layer 异步预取：manifest GET 回源成功且已写入缓存时触发
 				//（触发条件在内部逐项判定，不满足静默返回；预取只写缓存，异步执行，
 				// 绝不影响本次客户端响应）

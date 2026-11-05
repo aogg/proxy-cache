@@ -193,6 +193,21 @@ fallback-direct: true
 #docker-prefetch-enabled: true
 #docker-prefetch-concurrency: 4
 
+# blob 半截保留与无感续传：blob（/v2/<name>/blobs/<digest>）流式下载（客户端主路径与
+# 预取路径）中断/失败时，把已下载前缀保留为缓存目录内的半截文件（.part-<缓存key>，
+# 文件大小即已下载字节数，内容为 blob 原文前缀）——重 pull 时 docker 客户端是无 Range
+# 的完整 GET（从 0 开始），proxy 撞上「缓存 MISS + 半截文件」时按候选轮询从断点发
+# Range: bytes=<已存字节>- 续传（blob 按 digest 寻址内容不可变，任意候选同 digest 内容
+# 一致），对客户端回一次完整 200：body = 本地半截前缀回放 + 上游剩余实时拼接，docker
+# 无需支持 Range、完全无感知（X-Cache: RESUME；并发请求经既有搭车机制共享同一路续传
+# 流，上游只一路下载）。续传中途失败保留更新后的半截（进度不回退），docker 重试接着
+# 更长前缀续传。manifest 会变仅 blob 启用；带 Range 的请求维持既有 206 透传；上游对
+# Range 不回 206（不支持/200 全量回）时安全降级走既有全量回源、绝不给客户端错误数据。
+# 半截在对应 blob 正式缓存条目落盘后立即删除；空半截与超过 24h 的孤儿残留由缓存后台
+# 清理（Clean/Janitor）兜底。
+# docker-partial-resume-enabled blob 半截保留与无感续传开关（默认 true 开启；显式 false 关闭）
+#docker-partial-resume-enabled: true
+
 # url-redirect：回源镜像/上游代理候选列表（对象数组，破坏性变更：不再支持旧版纯字符串写法，
 # 解析期报错并给出迁移示例；候选对象支持字段见下方示例与 README「url-redirect 候选对象」小节）
 # 候选对象字段：

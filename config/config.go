@@ -588,6 +588,17 @@ type Config struct {
 	//（Validate 拒绝——关闭预取请配置 docker-prefetch-enabled: false，两者语义分离）。
 	// 全局配置，无规则级覆盖。
 	DockerPrefetchConcurrency *int `yaml:"docker-prefetch-concurrency"`
+	// DockerPartialResumeEnabled docker blob 半截保留与无感续传开关（实现见 proxy 包
+	// partial_resume.go）：blob（/v2/<name>/blobs/<digest>）流式下载（客户端主路径与预取
+	// 路径）中断/失败时，把已下载前缀保留为缓存目录内的半截文件（.part-<缓存key>，文件
+	// 大小即已下载字节数）；客户端无 Range 完整 GET 撞上「正式缓存 MISS + 半截文件存在」
+	// 时，续传执行方按候选轮询向任一候选发 `Range: bytes=<已存字节>-`（blob 按 digest
+	// 寻址内容不可变，任意候选同 digest 内容一致，续传可从任意候选续），对客户端回一次
+	// 完整 200（本地前缀回放 + 上游剩余实时拼接），docker 客户端无需支持 Range、完全
+	// 无感知。manifest 会变不适用（仅 blob 启用）；带 Range 的请求维持既有 206 透传不写
+	// 缓存；上游对 Range 不回 206 时安全降级走既有全量回源。nil（未配置）= 开启（默认
+	// 开）；显式 false 关闭。全局配置，无规则级覆盖。
+	DockerPartialResumeEnabled *bool `yaml:"docker-partial-resume-enabled"`
 	// HTTPProxy 全局上游代理（http/https/socks5 地址，如 http://127.0.0.1:7890），空串表示直连。
 	HTTPProxy string `yaml:"http-proxy"`
 	// SuccessCheck url-redirect 候选成功判据：status 或 content（默认 content）。
@@ -1193,6 +1204,16 @@ func (c *Config) GlobalDockerPrefetchConcurrency() int {
 		return DefaultDockerPrefetchConcurrency
 	}
 	return *c.DockerPrefetchConcurrency
+}
+
+// GlobalDockerPartialResumeEnabled 返回 docker blob 半截保留与无感续传开关生效值：
+// nil（未配置）= 开启（默认开）；显式 false 关闭。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底（布尔键无额外校验约束）。
+func (c *Config) GlobalDockerPartialResumeEnabled() bool {
+	if c.DockerPartialResumeEnabled == nil {
+		return true
+	}
+	return *c.DockerPartialResumeEnabled
 }
 
 // ProgressLogInterval 返回全局流式透传进度日志的输出间隔生效值：

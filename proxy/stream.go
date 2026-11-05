@@ -2,7 +2,8 @@
 // 候选竞速（selectCandidate）选定候选后立即向客户端 WriteHeader 并透传响应头
 //（commit），把已缓冲首块写给客户端，再边读上游边同时写客户端与内存累积缓冲；
 // EOF 后按既有条件（仅 200 且过判据）用 cache.Set 原子写缓存，并把完整 Entry
-// 返回给单飞等待方。
+// 返回给单飞等待方。blob 的流式下载中断/失败时把已下载前缀保留为半截文件供下次
+// 无感续传（partial_resume.go，仅注入 partial 上下文的缓存可读主路径启用）。
 //
 // 慢速升级多源并发续传（slow-download escalation，见 slowdownload.go）：type=docker
 // 规则的流式回源在 commit 后的读循环里按 slow-download-window 滑动窗口判速，窗口平均
@@ -73,13 +74,21 @@ func (s *Server) commitStreamingHeader(w http.ResponseWriter, res *probeResult, 
 //     继续读完上游只填缓存（broken pipe 后仍「写缓存成功」，docker 重试该层时可 HIT）；
 //  4. EOF：按 finalize 回调（既有条件：仅 200 且过判据）用 cache.Set 原子写缓存，
 //     并把完整 Entry 返回给单飞等待方；
-//  5. commit 后上游读取失败：记日志、终止本次响应、不写缓存（半截数据绝不入库），
+//  5. commit 后上游读取失败：blob 半截保留（仅 blob + 开关开启 + 无 Range 的缓存可读
+//     主路径，进度不回退）、记日志、终止本次响应、不写缓存（半截数据绝不入库），
 //     返回错误给单飞等待方（502）。
 //
 // cacheStatus 为 commit 时 X-Cache 观测头的取值（MISS / BYPASS）；finalize 为 EOF 后的
 // 缓存写入回调（nil = 不写缓存，BYPASS 场景）。返回值 committed=true 表示已向客户端
 // 写出响应头——此时调用方不得再 writeError（响应头已固化，写错误头只会污染日志）。
-func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Request, target string, eff config.Options, cacheStatus string, finalize func(*cache.Entry), start time.Time) (entry *cache.Entry, committed bool, err error) {
+//
+// partial 为可选的 blob 半截保留上下文（partial_resume.go，variadic 注入使既有调用方
+// 与既有测试的 7 参调用不受影响）：仅「缓存可读的客户端主路径」注入——注入后，blob
+//（/v2/<name>/blobs/<digest>）流式下载中断/失败时把已下载前缀保留为半截文件（进度不
+// 回退，见 captureStreamPartial）；BYPASS（Range / no-cache / 关缓存）不注入，维持既有
+//「失败即丢弃」行为完全不变。
+func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Request, target string, eff config.Options, cacheStatus string, finalize func(*cache.Entry), start time.Time, partial ...partialSink) (entry *cache.Entry, committed bool, err error) {
+	sink := partialSinkOf(partial)
 	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target), eff)
 	if len(candidates) == 0 {
 		// 防御分支：handleProxy 已拦截「路径目标未配置 url-redirect」，流式路径绝不直连
@@ -252,8 +261,10 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 				if errors.Is(rerr, io.EOF) {
 					break // 完整读完：半截数据不存在，可以入库
 				}
-				// commit 后上游读取失败：终止本次响应、不写缓存（半截数据绝不入库）
+				// commit 后上游读取失败：blob 半截保留（仅 blob + 开关开启 + 无 Range 的
+				// 缓存可读主路径；进度不回退，见 partial_resume.go）、终止本次响应、不写缓存
 				res.Close()
+				s.captureStreamPartial(sink, r, target, accum.Bytes())
 				s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
 					"rule", eff.Rule, "candidate", truncate(source, 300),
 					"status", res.status, "bytes", total, "err", rerr)
@@ -274,6 +285,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 				emitProgress(now, "sources", live)
 			}
 		}); merr != nil {
+			// 多源合并失败：blob 半截保留（同上——accum 即按序合并出的已送前缀）、
+			// 终止本次响应、不写缓存
+			s.captureStreamPartial(sink, r, target, accum.Bytes())
 			s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
 				"rule", eff.Rule, "candidate", truncate(source, 300),
 				"status", res.status, "bytes", total, "err", merr)
