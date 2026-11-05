@@ -71,7 +71,7 @@ const prefetchHubIdleTimeout = 30 * time.Second
 
 // prefetchHubSubBuffer 每个搭车订阅者的增量缓冲块数（块大小 = streamChunkSize，
 // 单订阅者内存上界 = prefetchHubSubBuffer × 32KB = 8MB）：广播缓冲满即摘除该订阅者
-//（消费过慢，客户端 docker 将以 Range 续传重试；预取那一路绝不被慢客户端拖住）。
+// （消费过慢，客户端 docker 将以 Range 续传重试；预取那一路绝不被慢客户端拖住）。
 const prefetchHubSubBuffer = 256
 
 // prefetchHubDoneLinger done 条目在 hub 中的滞留时长：供缓存写入完成瞬间并发 MISS 的
@@ -172,7 +172,7 @@ func (s *Server) prefetchHubOrInit() *prefetchStreamHub {
 
 // register 登记在途条目（预取开始下载时调用；调用方保证同 key 只有一个写者——
 // prefetchInflight 已挡住同 blob 的重复预取）。同 key 的 done 滞留条目被直接覆盖
-//（其 linger 定时器的 removeIf 指针比对不会误删新条目）。
+// （其 linger 定时器的 removeIf 指针比对不会误删新条目）。
 func (h *prefetchStreamHub) register(key, rule, digest string, log *slog.Logger) *prefetchStreamEntry {
 	ent := &prefetchStreamEntry{
 		key:     key,
@@ -388,7 +388,7 @@ func (e *prefetchStreamEntry) finishDone() {
 }
 
 // finishFailed 失败收尾：置 failed 并广播（关闭全部订阅 channel）后立即移除条目
-//（后续请求查不到 → 走既有原回源路径）、清理临时文件（failed 后订阅者不再读前缀：
+// （后续请求查不到 → 走既有原回源路径）、清理临时文件（failed 后订阅者不再读前缀：
 // 未 commit 的降级、已 commit 的终止，均不再触碰该文件）。幂等。
 func (e *prefetchStreamEntry) finishFailed(err error) {
 	e.mu.Lock()
@@ -429,7 +429,7 @@ func (e *prefetchStreamEntry) notifyChanged() {
 }
 
 // tryServeFromPrefetchHub 客户端 blob GET 缓存 MISS 时检查该层是否正被预取流式下载
-//（hub 在途条目），命中即「搭车」：响应用预取的响应头快照（X-Cache: PREFETCH），
+// （hub 在途条目），命中即「搭车」：响应用预取的响应头快照（X-Cache: PREFETCH），
 // body = 已落盘磁盘前缀（从 0 读临时文件）+ 订阅增量 channel 的实时后续——上游只有
 // 预取那一路下载，客户端不从 0 重新发起网络下载。返回 handled=true 表示本次请求已由
 // 搭车路径处理（含已 commit 后的各类终止），调用方直接返回；false 表示继续走既有
