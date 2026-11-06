@@ -7,6 +7,11 @@
 // 连续性保证不变：升级只增开续传源，绝不动客户端已见字节（不切状态码/响应头，不回退）。
 // 每源读继续走 progressReader+watchdog（无新增数据超时语义不变）；候选并发数上限 =
 // 候选列表长度（一般 ≤5），不做额外并发池。
+//
+// 客户端断开终止（断开即停）：合并循环的 write 回调检测到客户端写失败时，由调用方
+// abortAll 逐路关闭全部上游源（含尚未定局的 pending 续传源），合并循环随即自然退出——
+// 断开后不再有「继续读源填缓存」，半截保留与运维事件留痕由调用方统一收尾（stream.go
+// clientGoneAbort）。
 
 package proxy
 
@@ -420,6 +425,32 @@ func (m *slowMerger) closeAll(reason string) {
 	m.mu.Unlock()
 	for _, src := range toClose {
 		src.res.Close()
+		m.log.Debug("慢速升级多源续传源已关闭", "candidate", truncate(src.name, 300), "reason", reason)
+	}
+}
+
+// abortAll 客户端断开后的终止动作（fetchViaCandidatesStreaming 的 writeOut 检测到写
+// 响应体失败时调用一次）：全部未剪枝源一律置剪枝标记并关闭已建立的连接——含尚未定局
+// 的 pending 续传源（与 closeAll 不同，closeAll 只处理已有连接的源）：其尝试协程定局时
+// 发现剪枝标记即自行释放连接、绝不启动 pump（见 settleSlowResume 的 pruned 自检），
+// 已建立连接的源立即 Close 停读停看门狗。飞行中的候选尝试无法就地取消（startUpstream
+// 与客户端断开解耦），定局自检即释放，窗口受候选级超时约束。此后合并循环的存活源数为
+// 0 自然退出（run 返回失败），由调用方按「客户端断开终止」出口收尾——绝不再读上游。
+// 幂等：重复调用或与 closeAll / take 剪枝并发均安全（pruned 全部在 m.mu 下读写）。
+func (m *slowMerger) abortAll(reason string) {
+	m.mu.Lock()
+	var toClose []*slowSource
+	for _, src := range m.sources {
+		if src.pruned == "" {
+			src.pruned = reason
+			if src.res != nil {
+				toClose = append(toClose, src)
+			}
+		}
+	}
+	m.mu.Unlock()
+	for _, src := range toClose {
+		src.res.Close() // 幂等：关闭上游连接、停看门狗、取消超时预算链
 		m.log.Debug("慢速升级多源续传源已关闭", "candidate", truncate(src.name, 300), "reason", reason)
 	}
 }

@@ -40,8 +40,9 @@
 //     由续传那一路决定，过慢靠截断 + docker Range 重试兜底）。
 //
 // 生命周期：
-//   - 产生：客户端主路径流式回源失败（stream.go 两个「commit 后读上游失败」出口）/
-//     预取读上游失败（prefetch.go，临时文件改名零拷贝保留）；
+//   - 产生：客户端主路径流式回源失败（stream.go「commit 后读上游失败」与「客户端断开
+//     终止」出口，后者由断开即停语义取代旧版「继续读完填缓存」——上游读取立即终止、
+//     半截保留，进度不回退）/ 预取读上游失败（prefetch.go，临时文件改名零拷贝保留）；
 //   - 消费：无 Range 完整 GET 的续传执行方（本文件）回放前缀并续传拼接；
 //   - 删除：对应 blob 正式缓存条目落盘后立即删除（finalizeFetchEntry 钩子）；续传扫描
 //     判定上游明确不支持按断点续传（非 206）时丢弃；cache.Clean 扩展清理空半截与超过
@@ -161,9 +162,12 @@ func (s *Server) partWriter(key string) *sync.Mutex {
 // 无续传价值，见入口侧的空半截丢弃）。本函数仅在客户端主路径流式失败时被调用
 // （captureStreamPartial），日志统一 source=client；labels 为可选的 docker 日志统一标签
 // （variadic 注入，既有定参调用方与既有测试不受影响，见 dockerLogInfoOf）。
-func (s *Server) savePartialPart(disk *cache.Cache, key string, data []byte, labels ...dockerLogInfo) {
+// 返回值 kept：true = 半截保留生效（本次落盘成功，或已有不短于待存前缀的半截——进度
+// 已保住）；false = 不适用或落盘失败（disk 为 nil / 空数据 / 写文件失败，后者已有 Warn
+// 留痕）。既有语句式调用方忽略返回值不受影响。
+func (s *Server) savePartialPart(disk *cache.Cache, key string, data []byte, labels ...dockerLogInfo) (kept bool) {
 	if disk == nil || len(data) == 0 {
-		return
+		return false
 	}
 	lab := dockerLogInfoOf(labels)
 	mu := s.partWriter(key)
@@ -171,14 +175,15 @@ func (s *Server) savePartialPart(disk *cache.Cache, key string, data []byte, lab
 	defer mu.Unlock()
 	path := disk.PartPath(key)
 	if st, err := os.Stat(path); err == nil && st.Size() >= int64(len(data)) {
-		return // 已有相同或更长前缀：保持不动（进度不回退）
+		return true // 已有相同或更长前缀：保持不动（进度不回退，视为已保留）
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		s.log.Warn("保留 blob 半截前缀失败", lab.attrs(dockerLogSourceClient, "file", path, "bytes", len(data), "err", err)...)
-		return
+		return false
 	}
 	s.log.Info("blob 半截前缀已保留（下载中断，下次无 Range 请求将从断点无感续传）",
 		lab.attrs(dockerLogSourceClient, "key", key, "bytes", len(data), "file", path)...)
+	return true
 }
 
 // keepPrefetchPartial 预取路径的半截保留：预取流式下载读上游失败时，把已下载前缀的
@@ -234,24 +239,26 @@ func (s *Server) appendPartChunk(disk *cache.Cache, key string, f *os.File, expe
 }
 
 // captureStreamPartial 流式回源失败后的 blob 半截保留入口（fetchViaCandidatesStreaming
-// 的两个「commit 后读上游失败」出口调用）：仅 blob 目标 + 全局开关开启 + 无客户端 Range
-// 时保留前缀；manifest 会变不适用（仅 blob 启用）。写入按进度不回退规则（savePartialPart）。
-func (s *Server) captureStreamPartial(sink *partialSink, r *http.Request, target string, data []byte) {
+// 的「commit 后读上游失败」与「客户端断开终止」出口调用）：仅 blob 目标 + 全局开关开启 +
+// 无客户端 Range 时保留前缀；manifest 会变不适用（仅 blob 启用）。写入按进度不回退规则
+// （savePartialPart）。返回值 kept：true = 半截保留生效，false = 不适用或落盘失败——
+// 供断开终止出口的运维事件日志字段（partial）区分「保留成功 / 不适用」。
+func (s *Server) captureStreamPartial(sink *partialSink, r *http.Request, target string, data []byte) (kept bool) {
 	if sink == nil || sink.disk == nil || len(data) == 0 {
-		return
+		return false
 	}
 	if s.cfg == nil || !s.cfg.GlobalDockerPartialResumeEnabled() {
-		return // 全局开关关闭：维持既有「失败即丢弃」行为
+		return false // 全局开关关闭：维持既有「失败即丢弃」行为
 	}
 	if r.Header.Get("Range") != "" {
-		return // 防御：带 Range 的请求维持 206 透传不做本地半截（入口分流本不会带 sink）
+		return false // 防御：带 Range 的请求维持 206 透传不做本地半截（入口分流本不会带 sink）
 	}
 	// 客户端主路径半截保留：解析镜像名与 digest 作为日志统一标签（source=client）
 	name, digest, ok := parseDockerBlobNameDigest(target)
 	if !ok {
-		return // 非 blob（manifest 会变等）：不适用半截保留
+		return false // 非 blob（manifest 会变等）：不适用半截保留
 	}
-	s.savePartialPart(sink.disk, sink.key, data, dockerLogInfo{image: name, digest: digest})
+	return s.savePartialPart(sink.disk, sink.key, data, dockerLogInfo{image: name, digest: digest})
 }
 
 // //////////////////  续传候选扫描  ////////////////////////////////////////////////////////////
@@ -751,8 +758,9 @@ func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key,
 		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 		streamingError(ferr, committed)
 	case errors.Is(err, errStreamingCommitted):
-		// 本调用是续传执行方且 commit 后失败：底层原因已留痕（Error），响应头已写出
-		//（本次响应被截断，docker 会以 Range 断点续传重试，下次从更长前缀续传——进度不回退）
+		// 本调用是续传执行方且 commit 后失败：底层原因已留痕（读上游失败=Error、客户端
+		// 断开=Warn 运维事件），响应头已写出（本次响应被截断，docker 会以 Range 断点续传
+		// 重试，下次从更长前缀续传——进度不回退）
 	case err != nil:
 		// 未 commit 失败：走 streamingError 一致出口（上游明确 4xx 透传 / 其余 502）
 		streamingError(err, false)

@@ -497,6 +497,16 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 			return
 		}
 		if err != nil {
+			if errors.Is(err, errClientDisconnected) {
+				// 客户端断开终止（断开即停，正常运维事件而非失败）：连接已断，绝不再向
+				// 客户端写任何字节（不 502 不 writeError——在已关闭的连接上继续写只会
+				// 报错刷日志）；上游读取已终止、已接收字节数与半截保留状态已由流内部
+				// Warn 留痕（clientGoneAbort），此处 Debug 简记即可。客户端将以断点续传
+				// 或缓存重试接续。
+				s.log.Debug("客户端已断开，本次响应终止（流内部已留痕，客户端将以断点续传或缓存重试）",
+					labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 300))...)
+				return
+			}
 			s.log.Warn("流式回源失败（响应头已写出，终止本次响应）",
 				labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 300), "err", err)...)
 		}
@@ -604,8 +614,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 		streamingError(ferr, committed)
 	case errors.Is(err, errStreamingCommitted):
-		// 本调用是流式执行方且 commit 后失败：底层原因已留痕（Error），响应头已写出，
-		// 终止本次响应即可，绝不能再 writeError
+		// 本调用是流式执行方且 commit 后失败：底层原因已留痕（读上游失败=Error、客户端
+		// 断开=Warn 运维事件），响应头已写出，终止本次响应即可，绝不能再 writeError
+		//（断开场景客户端连接已断，同样无从写起）
 	case err != nil:
 		// 流式执行方/等待方共享到候选全败错误：最后失败为上游明确 4xx 时透传（仅流式
 		// 路径目标，docker registry 语义；完整 URL（web）目标保持既有 502 行为不变）

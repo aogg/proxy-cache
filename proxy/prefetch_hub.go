@@ -25,7 +25,8 @@
 //     过慢时靠上述订阅超时降级 + 客户端 Range 重试兜底（不在搭车链路上再开第二路
 //     续传源，避免与预取那一路重复下载同一 blob）；
 //   - 客户端搭车中途断开：仅停止读取订阅（unsubscribe），预取不受影响、继续填缓存
-//     （与既有 clientOK 断开语义一致）；订阅消费过慢（增量缓冲满）被广播端摘除同理；
+//     （预取与客户端连接解耦——客户端流式主路径的「断开即停」只取消该请求自身的
+//     回源流，见 stream.go，不波及预取那一路）；订阅消费过慢（增量缓冲满）被广播端摘除同理；
 //   - 客户端读速快于预取下载速度：reader 天然阻塞等增量（背压），无需额外处理；
 //   - 多客户端同时搭车各自独立订阅（独立增量 channel、逐订阅者独立 copy 广播块），
 //     互不阻塞、互不干扰；
@@ -606,7 +607,8 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 			}
 			if _, werr := w.Write(chunk); werr != nil {
 				// 客户端断开：仅停止读取订阅（defer 注销），预取继续填缓存不受影响
-				//（与既有「客户端写失败继续读上游仅填缓存」语义一致）
+				//（预取与客户端连接解耦，客户端断开不取消预取——客户端流式主路径的
+				//「断开即停」语义只作用于该请求自身的回源流，见 stream.go）
 				s.log.Warn("搭车写响应体失败（客户端已断开，预取继续填缓存不受影响）",
 					labels.attrs(dockerLogSourceRidealong, "target", truncate(r.URL.Path, 200), "err", werr)...)
 				return true

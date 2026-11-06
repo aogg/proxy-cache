@@ -5,6 +5,14 @@
 // 返回给单飞等待方。blob 的流式下载中断/失败时把已下载前缀保留为半截文件供下次
 // 无感续传（partial_resume.go，仅注入 partial 上下文的缓存可读主路径启用）。
 //
+// 客户端断开即停（断开终止）：commit 后写响应体失败（docker 已断开）立即终止上游读取
+// 与 slowMerger 多源合并流（逐路关闭全部上游源），blob 缓存可读主路径经 captureStreamPartial
+// 保留半截（进度不回退，下次无 Range 完整 GET 从断点无感续传），并返回 errClientDisconnected
+// 给调用方——客户端连接已断，绝不再向客户端写任何字节（不 502 不 writeError），仅 Warn/Debug
+// 级运维事件留痕。旧版「继续读完上游只填缓存」语义废止：继续读完会长时间占用上游连接与
+// 带宽（现场 500MB 层在 19% 断开后仍拖约 1.5h），其缓存价值已被「终止 + 半截保留 + 断点
+// 续传」取代。
+//
 // 慢速升级多源并发续传（slow-download escalation，见 slowdownload.go）：type=docker
 // 规则的流式回源在 commit 后的读循环里按 slow-download-window 滑动窗口判速，窗口平均
 // 送出速率低于 slow-download-speed 且剩余量足够、候选数>1 时，对其余全部候选并发发起
@@ -46,6 +54,14 @@ const streamChunkSize = 32 * 1024
 // 底层失败原因已在流式回源内部留痕（Error 级），调用方看到本标记直接终止即可。
 var errStreamingCommitted = errors.New("流式回源失败（响应头已写出，终止本次响应）")
 
+// errClientDisconnected 客户端断开（写响应体失败）终止上游读取的标记错误（errors.Is 判定）：
+// 客户端连接已断开时不再「继续读完上游只填缓存」，立即终止上游读取与多源合并流，blob
+// 缓存可读主路径保留半截（进度不回退）后以本错误收尾。该错误必然发生在 commit 之后
+// （响应头已写出，committed=true），调用方绝不能再向客户端写任何字节（连接已断，502
+// 或 writeError 只会在对端已关闭的连接上继续报错刷日志），仅按运维事件留痕（Warn/Debug
+// 级，非 Error）——客户端将以断点续传（半截已保留时）或缓存重试接续。
+var errClientDisconnected = errors.New("客户端已断开，终止上游读取")
+
 // commitStreamingHeader 向客户端写出响应头（commit 点）：
 // 沿用 skipResponseHeader 过滤逐跳头与自管头、补 X-Cache / X-Proxy-Upstream 观测头；
 // Content-Length 用上游声明值，上游没有就不设（Go 将按 chunked 编码流式传输）。
@@ -73,13 +89,17 @@ func (s *Server) commitStreamingHeader(w http.ResponseWriter, res *probeResult, 
 // fetchViaCandidatesStreaming GET 路径目标的流式回源：
 //  1. selectCandidate 竞速选定候选（commit 前不向客户端写任何字节）；
 //  2. commit：立即 WriteHeader + 透传响应头 + 写出已缓冲首块（续命 docker ~30s 响应头超时）；
-//  3. 边读上游边写客户端与内存累积缓冲；客户端写失败（docker 已断开）保持既有行为——
-//     继续读完上游只填缓存（broken pipe 后仍「写缓存成功」，docker 重试该层时可 HIT）；
+//  3. 边读上游边写客户端与内存累积缓冲；客户端写失败（docker 已断开）立即终止上游读取
+//     （见 6.，blob 缓存可读主路径保留半截、进度不回退）；
 //  4. EOF：按 finalize 回调（既有条件：仅 200 且过判据）用 cache.Set 原子写缓存，
 //     并把完整 Entry 返回给单飞等待方；
 //  5. commit 后上游读取失败：blob 半截保留（仅 blob + 开关开启 + 无 Range 的缓存可读
 //     主路径，进度不回退）、记日志、终止本次响应、不写缓存（半截数据绝不入库），
-//     返回错误给单飞等待方（502）。
+//     返回错误给单飞等待方（502）；
+//  6. 客户端断开终止（写响应体失败，断开即停）：立即终止上游读取（多源合并场景同时
+//     逐路关闭全部上游源）、按 5 同款条件保留半截、Warn 级运维事件留痕（含已接收字节
+//     数与半截保留状态）、返回 errClientDisconnected——调用方绝不再向客户端写任何字节
+//     （连接已断，不 502 不 writeError），客户端将以断点续传或缓存重试接续。
 //
 // cacheStatus 为 commit 时 X-Cache 观测头的取值（MISS / BYPASS）；finalize 为 EOF 后的
 // 缓存写入回调（nil = 不写缓存，BYPASS 场景）。返回值 committed=true 表示已向客户端
@@ -145,19 +165,43 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	var slowMerger *slowMerger  // 升级后的有序合并器（nil = 未升级）
 
 	// //////////////////  边读上游边写客户端与累积缓冲  start  ///////////////////////////////////
-	clientOK := true // 客户端写失败（docker 已断开）后置 false：继续读完上游只填缓存
+	clientOK := true    // 客户端写失败（docker 已断开）后置 false：不再写客户端
+	var clientErr error // 客户端断开错误（writeOut/writeFirst 检测到写失败时置值，非 nil = 断开即停）
 	accum := bytes.NewBuffer(make([]byte, 0, len(res.first)+streamChunkSize))
 	total := 0
+	// clientGoneAbort 客户端断开（clientErr 非 nil）的统一终止出口：关闭上游、按既有条件
+	// 保留半截（仅 blob + 开关开启 + 无 Range 的缓存可读主路径，进度不回退，见
+	// captureStreamPartial）、Warn 级运维事件留痕（含 source=client 与 image/digest 统一
+	// 标签、已接收字节数与半截保留状态 partial），返回断开错误给调用方——committed=true
+	//（响应头已写出），调用方绝不再向客户端写任何字节，客户端将以断点续传或缓存重试接续
+	//（半截保留成功时 savePartialPart 已复用既有「blob 半截前缀已保留」日志）。
+	clientGoneAbort := func() error {
+		res.Close() // 幂等：多源合并场景的源已由 abortAll 逐路关闭，此处兜底胜者自身
+		kept := s.captureStreamPartial(sink, r, target, accum.Bytes())
+		s.log.Warn("客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）",
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
+				"status", res.status, "bytes", total, "client", "disconnected", "partial", kept,
+				"err", clientErr)...)
+		return clientErr
+	}
 	// writeOut 写一块给客户端与累积缓冲（accum 语义不变）：客户端写失败（docker 已断开）
-	// 置 clientOK=false 并保持既有行为——继续读完上游只填缓存（单源循环与多源合并共用）
+	// 置 clientOK=false 并标记 clientErr——断开即停，读循环检测到 clientErr 立即终止上游
+	// 读取（单源循环与多源合并共用；多源场景同时逐路关闭全部上游源，见 abortAll）
 	writeOut := func(p []byte) {
 		total += len(p)
 		accum.Write(p)
 		if clientOK {
 			if _, werr := w.Write(p); werr != nil {
 				clientOK = false
-				// 与 serveEntry 既有日志文案一致（broken pipe 可辨认）
-				s.log.Warn("写响应体失败（客户端已断开，继续读上游仅填缓存）",
+				clientErr = fmt.Errorf("%w: 写响应体失败: %v", errClientDisconnected, werr)
+				if slowMerger != nil {
+					// 多源合并中的断开：逐路关闭全部上游源（含尚未定局的 pending 续传源），
+					// 合并循环随后自然退出，绝不再读上游
+					slowMerger.abortAll("客户端已断开，终止全部上游源")
+				}
+				// 与 serveEntry 既有日志文案同源（broken pipe 可辨认）；断开终止事件由
+				// clientGoneAbort 统一留痕（含已接收字节数与半截保留状态）
+				s.log.Warn("写响应体失败（客户端已断开，终止上游读取）",
 					labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 200), "err", werr)...)
 			}
 		}
@@ -171,11 +215,16 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		if clientOK {
 			if _, werr := w.Write(res.first); werr != nil {
 				clientOK = false
-				s.log.Warn("写响应体失败", labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 200), "err", werr)...)
+				clientErr = fmt.Errorf("%w: 写响应体失败: %v", errClientDisconnected, werr)
+				s.log.Warn("写响应体失败（客户端已断开，终止上游读取）", labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 200), "err", werr)...)
 			}
 		}
 	}
 	writeFirst()
+	if clientErr != nil {
+		// 首块写出即失败（客户端在 commit 后、读上游前已断开）：断开即停，终止本次回源
+		return nil, true, clientGoneAbort()
+	}
 
 	// emitProgress 进度日志（单源读循环与多源合并循环同一节拍共用）：extra 追加到字段尾
 	//（升级后由合并循环追加 sources=当前存活源数）
@@ -220,6 +269,11 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			if n > 0 {
 				writeOut(buf[:n])
 			}
+			// 断开即停：客户端写失败（clientErr 非 nil）立即终止上游读取——进度日志自然
+			// 不再输出，半截保留与运维事件留痕统一走 clientGoneAbort
+			if clientErr != nil {
+				return nil, true, clientGoneAbort()
+			}
 			// 流式透传进度日志：按 progress-interval 周期留痕回源进度（类似 docker pull 的
 			// xxMB/342.7MB 进度感），间隔内整条流已完成则一条都不出（最终日志已有成败留痕）。
 			// 用循环内时间检查而非定时器 goroutine 实现：上游停滞无新数据时读循环阻塞、
@@ -230,7 +284,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			// 慢速升级触发判定（与进度日志同一节拍；rerr==nil 才判，EOF 同拍到达时走正常收尾）：
 			// 窗口满且窗口平均送出速率 < slow-download-speed 判「过慢」，再校验剩余字节
 			//（已知总长 - 当前位置）>= slow-download-min-remaining 与候选数 > 1，全部满足
-			// 才升级——clientOK=false（客户端已断开、仅填缓存）同样允许，缓存填充同样受益。
+			// 才升级（客户端已断开时 clientErr 非 nil，已在上方断开出口终止本流，到不了这里）。
 			if slowEnabled && !slowEscalated && rerr == nil && time.Since(slowWindowAt) >= eff.SlowDownloadWindow {
 				windowSent := int64(total - slowWindowBytes)
 				windowElapsed := time.Since(slowWindowAt)
@@ -290,9 +344,16 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
 				emitProgress(now, "sources", live)
 			}
-		}); merr != nil {
-			// 多源合并失败：blob 半截保留（同上——accum 即按序合并出的已送前缀）、
-			// 终止本次响应、不写缓存
+		}); clientErr != nil {
+			// 断开即停：多源合并中的客户端断开——writeOut 已调 abortAll 逐路关闭全部上游
+			// 源（含尚未定局的 pending 续传源，其尝试协程定局时发现剪枝标记自行释放连接），
+			// 缓冲内未写数据一并废弃，统一走断开终止出口（半截保留 + Warn 留痕 + 断开错误）。
+			// 即便 abort 恰好发生在游标已达总长的临界（run 返回成功），同样按断开终止：
+			// 断开后不再有「继续收尾填缓存」，全路径断开语义一致。
+			return nil, true, clientGoneAbort()
+		} else if merr != nil {
+			// 多源合并失败（非断开，既有语义不变）：blob 半截保留（同上——accum 即按序
+			// 合并出的已送前缀）、终止本次响应、不写缓存
 			s.captureStreamPartial(sink, r, target, accum.Bytes())
 			s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
 				labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
