@@ -351,7 +351,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// web 完整 URL 目标不加新键，日志零变化，见 log_attrs.go）
 	labels := parseDockerLogInfo(target)
 	s.log.Debug("代理请求开始", labels.attrs(dockerLogSourceClient, "method", r.Method, "remote", r.RemoteAddr,
-		"target", target, "target_kind", targetKind(fullURL)))
+		"target", target, "target_kind", targetKind(fullURL))...)
 	// //////////////////  提取并区分目标类型  end  ////////////////////////////////////////////////
 
 	// //////////////////  allow/deny 访问控制  start  ////////////////////////////////////////////////
@@ -546,7 +546,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 			return
 		}
 	}
-	s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath))
+	s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath)...)
 	// //////////////////  查缓存：命中直接回放  end  ////////////////////////////////////////////////
 
 	// //////////////////  在途预取层搭车检查  start  //////////////////////////////////////////////
@@ -707,7 +707,7 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 			s.serveEntry(w, r, e, "HIT", eff, start)
 			return
 		}
-		s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath))
+		s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath)...)
 	} else {
 		cacheStatus = "BYPASS"
 	}
