@@ -458,7 +458,7 @@ func TestPrefetchHubFailureBroadcast(t *testing.T) {
 		fx := newHubFixture(t, nil)
 		key := prefetchBlobKey(prefetchName, prefetchDigestLayer1)
 		hub := fx.s.prefetchHubOrInit()
-		ent := hub.register(key, "prefetch-hub", prefetchDigestLayer1, quietLogger())
+		ent := hub.register(key, "prefetch-hub", prefetchName, prefetchDigestLayer1, quietLogger())
 
 		// 真实临时文件（模拟预取已落盘部分字节），验证 failed 收尾的清理
 		tmp, err := os.CreateTemp(fx.disk.Dir(), prefetchTmpPattern)
@@ -620,7 +620,7 @@ func TestPrefetchHubFailureBroadcast(t *testing.T) {
 func TestPrefetchHubWhiteboxEntry(t *testing.T) {
 	t.Run("writeBroadcast逐订阅者独立copy", func(t *testing.T) {
 		hub := newPrefetchStreamHub()
-		ent := hub.register("k1", "prefetch-hub", prefetchDigestLayer1, quietLogger())
+		ent := hub.register("k1", "prefetch-hub", prefetchName, prefetchDigestLayer1, quietLogger())
 		sub1, _, ok1 := ent.subscribe()
 		sub2, _, ok2 := ent.subscribe()
 		if !ok1 || !ok2 {
@@ -667,7 +667,7 @@ func TestPrefetchHubWhiteboxEntry(t *testing.T) {
 
 	t.Run("缓冲满摘除慢订阅者", func(t *testing.T) {
 		hub := newPrefetchStreamHub()
-		ent := hub.register("k2", "prefetch-hub", prefetchDigestLayer2, quietLogger())
+		ent := hub.register("k2", "prefetch-hub", prefetchName, prefetchDigestLayer2, quietLogger())
 		sub, _, ok := ent.subscribe()
 		if !ok {
 			t.Fatal("running 条目订阅应成功")
@@ -717,7 +717,7 @@ func TestPrefetchHubWhiteboxEntry(t *testing.T) {
 		hub := newPrefetchStreamHub()
 
 		// finishDone 幂等；done 后迟到的 finishFailed 不得覆盖终态
-		ent := hub.register("k3", "prefetch-hub", prefetchDigestConfig, quietLogger())
+		ent := hub.register("k3", "prefetch-hub", prefetchName, prefetchDigestConfig, quietLogger())
 		sub, _, _ := ent.subscribe()
 		ent.finishDone()
 		ent.finishDone() // 二次调用应无动作（仅 running 态生效），重复 close 会 panic
@@ -731,7 +731,7 @@ func TestPrefetchHubWhiteboxEntry(t *testing.T) {
 		}
 
 		// finishFailed 幂等：err 以首次为准、重复 close 订阅 channel 不 panic
-		ent2 := hub.register("k4", "prefetch-hub", prefetchDigestOther, quietLogger())
+		ent2 := hub.register("k4", "prefetch-hub", prefetchName, prefetchDigestOther, quietLogger())
 		sub2, _, _ := ent2.subscribe()
 		ent2.finishFailed(errors.New("boom"))
 		ent2.finishFailed(errors.New("boom2"))
@@ -756,7 +756,7 @@ func TestPrefetchHubWhiteboxEntry(t *testing.T) {
 		}
 
 		hub := fx.s.prefetchHubOrInit()
-		ent := hub.register(key, "prefetch-hub", prefetchDigestLayer1, quietLogger())
+		ent := hub.register(key, "prefetch-hub", prefetchName, prefetchDigestLayer1, quietLogger())
 		ent.finishDone() // 置 done 并登记 linger（滞留 1 分钟才到期移除）
 
 		// 滞留期内 lookup 仍命中，且 done 条目取出即移除（后续查询走 disk.Get 既有 HIT）
@@ -768,7 +768,7 @@ func TestPrefetchHubWhiteboxEntry(t *testing.T) {
 		}
 
 		// done 兜底出口：tryServeFromPrefetchHub 对 done 条目直接走既有 HIT 回放
-		ent2 := hub.register(key, "prefetch-hub", prefetchDigestLayer1, quietLogger())
+		ent2 := hub.register(key, "prefetch-hub", prefetchName, prefetchDigestLayer1, quietLogger())
 		ent2.finishDone()
 		r := prefetchBlobTestRequest(prefetchName, prefetchDigestLayer1)
 		w := httptest.NewRecorder()
@@ -787,7 +787,7 @@ func TestPrefetchHubWhiteboxEntry(t *testing.T) {
 
 	t.Run("waitHeaderReady快照唤醒超时与终态", func(t *testing.T) {
 		hub := newPrefetchStreamHub()
-		ent := hub.register("k5", "prefetch-hub", prefetchDigestLayer2, quietLogger())
+		ent := hub.register("k5", "prefetch-hub", prefetchName, prefetchDigestLayer2, quietLogger())
 
 		// 未就绪且未终态：超时返回 false
 		if ent.waitHeaderReady(30 * time.Millisecond) {
