@@ -23,6 +23,7 @@ import (
 
 	"proxy-cache/cache"
 	"proxy-cache/config"
+	"proxy-cache/logging"
 	"proxy-cache/proxy"
 )
 
@@ -48,7 +49,9 @@ func run() error {
 	// //////////////////  解析启动参数  end  ////////////////////////////////////////////////
 
 	// //////////////////  初始化日志  start  ////////////////////////////////////////////////
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// ReplaceAttr 统一把键名渲染成「英文(中文)」双写（日志规范：字段名称必须英文 + 中文含义
+	// 一起写，表见 logging/keys.go）；调用点仍只写英文键，输出格式由这一处集中控制
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo, ReplaceAttr: logging.ReplaceAttr}))
 	slog.SetDefault(logger)
 	// //////////////////  初始化日志  end  ////////////////////////////////////////////////
 
@@ -62,7 +65,7 @@ func run() error {
 	// //////////////////  按配置重建日志器  start  ////////////////////////////////////////////////
 	// loadConfig 成功后立刻按生效的 log.level 重建 slog 默认日志器：
 	// 后续 proxy / cache / config 全链路日志均按该级别生效
-	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel()}))
+	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.LogLevel(), ReplaceAttr: logging.ReplaceAttr}))
 	slog.SetDefault(logger)
 	// //////////////////  按配置重建日志器  end  ////////////////////////////////////////////////
 

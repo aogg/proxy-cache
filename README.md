@@ -676,41 +676,49 @@ log:
   level: info   # debug / info / warn / error
 ```
 
+所有日志的键名按「英文(中文)」双写输出（日志规范：字段名称必须英文 + 中文含义一起写；对照表见 `logging/keys.go`，新增键未登记会被 `go test ./logging` 的 `TestLogKeyCoverage` 拦下）。双写由 `main.go` 里的 `ReplaceAttr`（`logging.ReplaceAttr`）统一完成，调用点仍只写英文键，键序与取值完全不变；slog 内置的 `time`/`level`/`msg` 同样双写，一条日志里不会出现纯英文键：
+
+```text
+time(时间)=2026-11-06T18:18:41.188+08:00 level(级别)=INFO msg(消息)=缓存命中（HIT） source(来源)=client image(镜像)=foxhui/webai-2api status(状态码)=200 bytes(字节数)=52428800 speed(速率)=13.2MB/s elapsed(已耗时)=45.3s
+```
+
+grep 时按键名原文匹配即可（括号在 grep 基本正则里不是特殊字符），如 `grep 'source(来源)=prefetch'`；只按键名过滤可写 `grep 'source('`。
+
 | 级别 | 能看到什么 |
 | --- | --- |
-| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、流式透传进度（`流式透传进度`：按 `log.progress-interval` 周期输出，含已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收；间隔 `<=0` 关闭）、活跃下载周期汇总（`活跃下载进度汇总` 一条 + 每个活跃下载一条 `活跃下载进度`：按 `log.progress-summary-interval` 周期输出，覆盖 client（含缓存/回放）/ridealong/resume/prefetch，本轮无任何下载登记时静默，见下文「[活跃下载周期汇总](#活跃下载周期汇总)」）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、每条访问完成日志（`代理请求完成`） |
-| `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched` / `excluded` 明细）、每次候选尝试开始、候选竞速放行（`url-redirect 候选竞速放行`）、候选被取消（其他候选胜出/扫描预算到期）、缓存查询 MISS 细节 |
-| `warn` | 候选请求失败 / 未过成功判据 / 回退直连、等待单飞超限自拔回源（`等待同 key 单飞回源超限，自行走候选回源`）、commit 后客户端断开（`写响应体失败（客户端已断开，终止上游读取）` 与断开终止事件 `客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）`——运维事件而非故障，含已接收字节数 `bytes` 与半截保留状态 `partial`）、commit 后读上游失败（`流式回源读上游失败...不写缓存`）、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
+| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason(原因)=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index(起始下标)` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail(硬失败原因)=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、流式透传进度（`流式透传进度`：按 `log.progress-interval` 周期输出，含已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收；间隔 `<=0` 关闭）、活跃下载周期汇总（`活跃下载进度汇总` 一条 + 每个活跃下载一条 `活跃下载进度`：按 `log.progress-summary-interval` 周期输出，覆盖 client（含缓存/回放）/ridealong/resume/prefetch，本轮无任何下载登记时静默，见下文「[活跃下载周期汇总](#活跃下载周期汇总)」）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file(文件)`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、每条访问完成日志（`代理请求完成`） |
+| `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched(是否命中)` / `excluded(是否被排除)` 明细）、每次候选尝试开始、候选竞速放行（`url-redirect 候选竞速放行`）、候选被取消（其他候选胜出/扫描预算到期）、缓存查询 MISS 细节 |
+| `warn` | 候选请求失败 / 未过成功判据 / 回退直连、等待单飞超限自拔回源（`等待同 key 单飞回源超限，自行走候选回源`）、commit 后客户端断开（`写响应体失败（客户端已断开，终止上游读取）` 与断开终止事件 `客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）`——运维事件而非故障，含已接收字节数 `bytes(字节数)` 与半截保留状态 `partial(半截保留)`）、commit 后读上游失败（`流式回源读上游失败...不写缓存`）、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
 | `error` | 仅错误：回源彻底失败（502）、候选扫描总预算耗尽（`url-redirect 候选扫描总预算耗尽，提前终止候选扫描`）、候选尝试 panic 等 |
 
 ### 日志字段说明（docker 链路统一标签）
 
-docker 加速链路（`/v2/` 路径目标请求）的全部日志统一附带以下键，用于区分「异步下载」与「客户端请求下载」、并按镜像 grep（键名与附加顺序全仓库统一，由 `proxy/log_attrs.go` 的 helper 拼装；`source` 恒在首位、`image` 次之、`digest`/`ref` 再次，既有键 `rule`/`candidate`/`key`/`target`/`err` 等原样保留在其后）：
+docker 加速链路（`/v2/` 路径目标请求）的全部日志统一附带以下键，用于区分「异步下载」与「客户端请求下载」、并按镜像 grep（键名与附加顺序全仓库统一，由 `proxy/log_attrs.go` 的 helper 拼装；`source` 恒在首位、`image` 次之、`digest`/`ref` 再次，既有键 `rule`/`candidate`/`key`/`target`/`err` 等原样保留在其后；下表的「键」列即实际输出形态，如 `source(来源)=client`）：
 
-| 键 | 含义 |
+| 键（输出形态） | 含义 |
 | --- | --- |
-| `source` | 本次日志行为的来源，四值枚举：`client`（客户端请求触发的回源：客户端流式主路径、HIT/MISS/BYPASS 回放与等待单飞超限后自行回源）、`ridealong`（搭车订阅在途流的客户端请求，即撞上预取/续传在途层拼接回放的请求，`X-Cache: PREFETCH`）、`resume`（blob 半截续传执行方——候选扫描/拼接/写缓存，`X-Cache: RESUME`）、`prefetch`（后台异步预取，manifest 驱动的 layer 异步下载） |
-| `image` | 镜像仓库名（`/v2/<name>/...` 的 `<name>`，多级原样保留，如 `foxhui/webai-2api`、`library/nvidia/cuda`）；解析不出（异常路径）时省略该键，不填空串 |
-| `digest` | blob digest（blob 目标 `/v2/<name>/blobs/<digest>` 的日志附带，如 `sha256:...`） |
-| `ref` | manifest 的 tag 或 digest 引用（manifest 目标 `/v2/<name>/manifests/<ref>` 的日志附带，如 `latest`） |
+| `source(来源)` | 本次日志行为的来源，四值枚举：`client`（客户端请求触发的回源：客户端流式主路径、HIT/MISS/BYPASS 回放与等待单飞超限后自行回源）、`ridealong`（搭车订阅在途流的客户端请求，即撞上预取/续传在途层拼接回放的请求，`X-Cache: PREFETCH`）、`resume`（blob 半截续传执行方——候选扫描/拼接/写缓存，`X-Cache: RESUME`）、`prefetch`（后台异步预取，manifest 驱动的 layer 异步下载） |
+| `image(镜像)` | 镜像仓库名（`/v2/<name>/...` 的 `<name>`，多级原样保留，如 `foxhui/webai-2api`、`library/nvidia/cuda`）；解析不出（异常路径）时省略该键，不填空串 |
+| `digest(摘要)` | blob digest（blob 目标 `/v2/<name>/blobs/<digest>` 的日志附带，如 `sha256:...`） |
+| `ref(引用)` | manifest 的 tag 或 digest 引用（manifest 目标 `/v2/<name>/manifests/<ref>` 的日志附带，如 `latest`） |
 
-判定规则：只有能判定为 `/v2/` 请求的日志才附加这些键；web 完整 URL 目标等非 docker 请求的日志不加，行为与旧版零变化。同一 blob 的完整生命周期串起来看就是：`source=client`（首个请求回源写缓存）→ `source=prefetch`（后台预取其余层）→ `source=ridealong`（后续请求搭上在途预取层）→ 中断时 `source=client`（半截保留）与 `source=resume`（断点续传执行方）。
+判定规则：只有能判定为 `/v2/` 请求的日志才附加这些键；web 完整 URL 目标等非 docker 请求的日志不加，行为与旧版零变化。同一 blob 的完整生命周期串起来看就是：`source(来源)=client`（首个请求回源写缓存）→ `source(来源)=prefetch`（后台预取其余层）→ `source(来源)=ridealong`（后续请求搭上在途预取层）→ 中断时 `source(来源)=client`（半截保留）与 `source(来源)=resume`（断点续传执行方）。
 
-**客户端断开终止事件（断开即停）**：commit 后写响应体失败（docker 已断开）时，流式回源不再「继续读完只填缓存」，而是立即终止上游读取（多源合并场景逐路关闭全部上游源）并留两条 Warn 级运维事件日志（`source=client`，属正常运维而非故障，不会出现 Error 级）：先是「`写响应体失败（客户端已断开，终止上游读取）`」（含 broken pipe 原始错误 `err`），随后是断开终止事件「`客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）`」——含统一标签 `image`/`digest`、已接收字节数 `bytes`、半截保留状态 `partial`（`true` = 半截已保留可断点续传 / `false` = 不适用，如非 blob 目标或 `docker-partial-resume-enabled` 关闭或 BYPASS）；半截保留成功时另有既有「`blob 半截前缀已保留（下载中断，下次无 Range 请求将从断点无感续传）`」Info 日志。调用方对断开错误绝不再向客户端写任何字节（不 502），仅补一条 Debug「客户端已断开，本次响应终止」简记。按镜像 + 断开事件 grep：`grep '客户端已断开，终止上游读取' proxy-cache.log | grep 'image=<镜像名>'`。
+**客户端断开终止事件（断开即停）**：commit 后写响应体失败（docker 已断开）时，流式回源不再「继续读完只填缓存」，而是立即终止上游读取（多源合并场景逐路关闭全部上游源）并留两条 Warn 级运维事件日志（`source(来源)=client`，属正常运维而非故障，不会出现 Error 级）：先是「`写响应体失败（客户端已断开，终止上游读取）`」（含 broken pipe 原始错误 `err(错误)`），随后是断开终止事件「`客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）`」——含统一标签 `image(镜像)`/`digest(摘要)`、已接收字节数 `bytes(字节数)`、半截保留状态 `partial(半截保留)`（`true` = 半截已保留可断点续传 / `false` = 不适用，如非 blob 目标或 `docker-partial-resume-enabled` 关闭或 BYPASS）；半截保留成功时另有既有「`blob 半截前缀已保留（下载中断，下次无 Range 请求将从断点无感续传）`」Info 日志。调用方对断开错误绝不再向客户端写任何字节（不 502），仅补一条 Debug「客户端已断开，本次响应终止」简记。按镜像 + 断开事件 grep：`grep '客户端已断开，终止上游读取' proxy-cache.log | grep 'image(镜像)=<镜像名>'`。
 
 grep 示例（TextHandler 输出键值按 `k=v` 空格分隔、键序固定 `source` 在前，跨键过滤用管道、与键序无关）：
 
 ```bash
 # 某镜像的全部链路日志（预取 + 客户端 + 搭车 + 续传一网打尽）
-grep 'image=foxhui/webai-2api' proxy-cache.log
+grep 'image(镜像)=foxhui/webai-2api' proxy-cache.log
 
-# 只看某镜像的后台异步预取（等价于 image=xxx source=prefetch 的组合过滤）
-grep 'image=foxhui/webai-2api' proxy-cache.log | grep 'source=prefetch'
+# 只看某镜像的后台异步预取（等价于 image=xxx 与 source=prefetch 的组合过滤）
+grep 'image(镜像)=foxhui/webai-2api' proxy-cache.log | grep 'source(来源)=prefetch'
 
 # 只看客户端请求触发的下载 / 搭车 / 断点续传
-grep 'source=client' proxy-cache.log
-grep 'source=ridealong' proxy-cache.log
-grep 'source=resume' proxy-cache.log
+grep 'source(来源)=client' proxy-cache.log
+grep 'source(来源)=ridealong' proxy-cache.log
+grep 'source(来源)=resume' proxy-cache.log
 ```
 
 ### 活跃下载周期汇总
@@ -723,27 +731,27 @@ grep 'source=resume' proxy-cache.log
 - **输出格式**：一轮汇总 = 一条汇总头 + 每个活跃下载一条进度（`info` 级，与单流进度日志同级）：
 
 ```
-level=INFO msg=活跃下载进度汇总 active=3 started=5 client=1 ridealong=0 resume=0 prefetch=2 interval=3m0s
-level=INFO msg=活跃下载进度 source=client image=foxhui/webai-2api digest=sha256:... method=GET bytes=125829120 total=524288000 percent=24 speed=13.2MB/s elapsed=45.3s
-level=INFO msg=活跃下载进度 source=prefetch image=foxhui/webai-2api digest=sha256:... method=GET bytes=83886080 total=209715200 percent=40 speed=8.4MB/s elapsed=21.0s
+time(时间)=... level(级别)=INFO msg(消息)=活跃下载进度汇总 active(活跃下载数)=3 started(新登记数)=5 client(客户端)=1 ridealong(搭车数)=0 resume(续传数)=0 prefetch(预取数)=2 interval(汇总间隔)=3m0s
+time(时间)=... level(级别)=INFO msg(消息)=活跃下载进度 source(来源)=client image(镜像)=foxhui/webai-2api digest(摘要)=sha256:... method(请求方法)=GET bytes(字节数)=125829120 total(总长)=524288000 percent(进度百分比)=24 speed(速率)=13.2MB/s elapsed(已耗时)=45.3s
+time(时间)=... level(级别)=INFO msg(消息)=活跃下载进度 source(来源)=prefetch image(镜像)=foxhui/webai-2api digest(摘要)=sha256:... method(请求方法)=GET bytes(字节数)=83886080 total(总长)=209715200 percent(进度百分比)=40 speed(速率)=8.4MB/s elapsed(已耗时)=21.0s
 ```
 
-字段语义：`active` 为 tick 时活跃下载总数（`client`/`ridealong`/`resume`/`prefetch` 为各来源的活跃数量）；`started` 为自上次汇总以来新登记的下载数（含周期内已结束的）；`bytes` 已下载字节数（原始字节）；`total` 为总长、`percent` 为 0-100 进度（总长从响应头 `Content-Length` 取得时才输出这两个字段；区间回放的 `total` 为本次区间长度）；`speed` 是**与上次汇总之间的区间速率**（不是整条流的平均速率），格式沿用既有 `humanBytesPerSec` 习惯；`elapsed` 为自本次下载开始写的耗时（秒，一位小数）。`image`/`digest` 仅 docker 目标附带（非 docker 下载省略该键，不填空串）。
+字段语义：`active(活跃下载数)` 为 tick 时活跃下载总数（`client(客户端)`/`ridealong(搭车数)`/`resume(续传数)`/`prefetch(预取数)` 为各来源的活跃数量）；`started(新登记数)` 为自上次汇总以来新登记的下载数（含周期内已结束的）；`bytes(字节数)` 已下载字节数（原始字节）；`total(总长)` 为总长、`percent(进度百分比)` 为 0-100 进度（总长从响应头 `Content-Length` 取得时才输出这两个字段；区间回放的 `total(总长)` 为本次区间长度）；`speed(速率)` 是**与上次汇总之间的区间速率**（不是整条流的平均速率），格式沿用既有 `humanBytesPerSec` 习惯；`elapsed(已耗时)` 为自本次下载开始写的耗时（秒，一位小数）。`image(镜像)`/`digest(摘要)` 仅 docker 目标附带（非 docker 下载省略该键，不填空串）。
 
 - **两类 docker 进度分开看**（TextHandler 输出键序固定 `source` 在首位）：
 
 ```bash
 # 只看周期汇总（客户端下载 + 异步下载一次性拿到）
-grep 'msg=活跃下载进度' proxy-cache.log
+grep 'msg(消息)=活跃下载进度' proxy-cache.log
 
 # 只看客户端下载进度（client / ridealong / resume）
-grep 'msg=活跃下载进度' proxy-cache.log | grep -Ev 'source=prefetch'
+grep 'msg(消息)=活跃下载进度' proxy-cache.log | grep -Ev 'source\(来源\)=prefetch'
 
 # 只看异步预取下载进度
-grep 'msg=活跃下载进度' proxy-cache.log | grep 'source=prefetch'
+grep 'msg(消息)=活跃下载进度' proxy-cache.log | grep 'source(来源)=prefetch'
 
 # 某镜像的全部活跃下载进度
-grep 'msg=活跃下载进度' proxy-cache.log | grep 'image=foxhui/webai-2api'
+grep 'msg(消息)=活跃下载进度' proxy-cache.log | grep 'image(镜像)=foxhui/webai-2api'
 ```
 
 - **与单流进度的分工**：`log.progress-interval`（默认 10s）是**每条流自己的节拍**，只覆盖该请求自身的回源/续传流；`log.progress-summary-interval`（默认 3m）是**全局活跃视图**，把客户端下载与异步预取下载放在一起看，两者互不影响、可分别关闭。
@@ -752,10 +760,10 @@ grep 'msg=活跃下载进度' proxy-cache.log | grep 'image=foxhui/webai-2api'
 ### 排障指引
 
 - **规则缓存目录没有生成缓存文件**，按顺序看三处日志：
-  1. 启动日志 `域名规则已加载`：核对每条规则的 `match`、`cache_enabled`、`cache_path`、`cache_ttl`、`url_redirect` 是否符合预期（规则未配置项显示沿用全局后的生效值）；
-  2. 请求日志 `规则匹配结果`：`rule` 是命中规则名，`global-default` 表示没命中任何规则——match 里写了入站 Host 段（如 `http://github\.path\..+`）时，请求的 Host 必须以该段开头（如 `github.path.xxx`），直接用 IP:端口访问不会命中，会落全局默认（没有规则的 url-redirect、缓存写进全局 `cache.path` 目录）；
-  3. `GET 请求绕过缓存（BYPASS）` / `写入缓存成功` / `缓存命中（HIT）`：分别说明这次为什么不缓存、实际写到了哪个文件（`file` 字段）、命中了哪个文件。
-- **域名规则没按预期命中**：把 `log.level` 设为 `debug`，观察每条规则的「域名规则匹配」日志（`matched` 表示 match 是否命中、`excluded` 表示是否被 exclude 排除）与最终的「规则匹配结果」日志（`rule` 为命中的规则名，未命中为 `global-default`），即可区分是 match 没命中还是被 exclude 排除。
+  1. 启动日志 `域名规则已加载`：核对每条规则的 `match(匹配表达式)`、`cache_enabled(缓存开关)`、`cache_path(缓存路径)`、`cache_ttl(缓存有效期)`、`url_redirect(重定向模板数)` 是否符合预期（规则未配置项显示沿用全局后的生效值）；
+  2. 请求日志 `规则匹配结果`：`rule(规则)` 是命中规则名，`global-default` 表示没命中任何规则——match 里写了入站 Host 段（如 `http://github\.path\..+`）时，请求的 Host 必须以该段开头（如 `github.path.xxx`），直接用 IP:端口访问不会命中，会落全局默认（没有规则的 url-redirect、缓存写进全局 `cache.path` 目录）；
+  3. `GET 请求绕过缓存（BYPASS）` / `写入缓存成功` / `缓存命中（HIT）`：分别说明这次为什么不缓存、实际写到了哪个文件（`file(文件)` 字段）、命中了哪个文件。
+- **域名规则没按预期命中**：把 `log.level` 设为 `debug`，观察每条规则的「域名规则匹配」日志（`matched(是否命中)` 表示 match 是否命中、`excluded(是否被排除)` 表示是否被 exclude 排除）与最终的「规则匹配结果」日志（`rule(规则)` 为命中的规则名，未命中为 `global-default`），即可区分是 match 没命中还是被 exclude 排除。
 - **url-redirect 候选行为异常**：`info` 级别即可看到「url-redirect 轮询展开」（候选数量、轮询起始下标、按尝试顺序的模板与替换后 URL）与每条候选的结果日志（命中为 `url-redirect 候选命中并作为最终返回`，失败在 `warn` 级别），无需开 debug 就能还原整轮轮询；`debug` 额外提供每次尝试开始的明细。
 
 ## 缓存实现说明
