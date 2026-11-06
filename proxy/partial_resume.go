@@ -465,6 +465,12 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "part_bytes", n, "total", total,
 			"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)...)
 
+	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始写即登记
+	// source=resume，初始已下载字节 = 半截前缀 n（进度不回退，percent 直接对总长），
+	// defer 注销——失败/成功/panic 返回都不留幽灵条目；每追加一块经 addBytes 累加
+	prog := s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, total)
+	defer prog.unregister()
+
 	// 回放半截前缀：写锁内一次性整读进累积缓冲（与并发保存方的整体重写互斥，保证读到
 	// 的每个字节来自同一份合法前缀；磁盘顺序读，锁持有时间 = 磁盘读耗时），锁外再写给
 	// 客户端（慢客户端绝不拖住写锁）。前缀字节即同 digest 内容前缀（digest 寻址不可变）
@@ -533,6 +539,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			return aerr
 		}
 		written += int64(len(p))
+		prog.addBytes(len(p)) // 活跃下载周期汇总累加（剩余区间增量；半截前缀已计入初始值）
 		if berr := ent.writeBroadcast(p); berr != nil {
 			return fmt.Errorf("blob 半截续传广播失败: %w", berr)
 		}

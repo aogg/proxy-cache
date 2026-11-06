@@ -549,6 +549,14 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 		labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "key", key,
 			"prefix_bytes", prefixLen, "candidate", truncate(source, 300), "status", status)...)
 
+	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始回放即登记
+	// source=ridealong，初始已下载字节 = 已落盘前缀 prefixLen（回放前缀不重复累加，
+	// 只对随后消费的增量 addBytes），total 取预取响应头快照的 Content-Length；
+	// defer 注销——完成/断开/超时终止都不留幽灵条目
+	prog := s.progressRegister(dockerLogSourceRidealong, labels.image, labels.digest, r.Method,
+		prefixLen, progressSummaryTotal(header))
+	defer prog.unregister()
+
 	// 读磁盘前缀（0..prefixLen）：预取写者按「先写文件后推进字节数」推进，读到的字节
 	// 一定是已完整写入的；文件极小竞态窗口（订阅后预取即失败清理）按已 commit 终止处理
 	f, err := os.Open(ent.tmpPathOf())
@@ -614,6 +622,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 				return true
 			}
 			total += int64(len(chunk))
+			prog.addBytes(len(chunk)) // 活跃下载周期汇总累加（回放增量；磁盘前缀已计入初始值）
 		case <-time.After(prefetchHubIdleTimeout):
 			// 预取增量停滞（卡死/过慢）：已 commit，终止本次响应；docker 会以 Range
 			// 断点续传重试（命中已写盘的前缀缓存则 HIT、否则回源 206，都不从 0 拉整层）
@@ -745,11 +754,20 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 		return nil, cause
 	}
 
+	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：响应头快照就绪（本路
+	// commit 点）后即登记 source=prefetch，total 取 Content-Length（不可得则不输出
+	// percent）；defer 注销——EOF 写缓存 / 失败 / panic 都不留幽灵条目。初始已下载
+	// 字节取条目既有 written（登记时通常为 0），随后每写一块经 addBytes 累加
+	prog := s.progressRegister(dockerLogSourcePrefetch, labels.image, labels.digest, req.Method,
+		ent.writtenOf(), progressSummaryTotal(res.header))
+	defer prog.unregister()
+
 	// 首块先行写入并广播（与客户端流式路径同一节拍：探测阶段已缓冲的首块直接入列）
 	if len(res.first) > 0 {
 		if err := ent.writeBroadcast(res.first); err != nil {
 			return fail(fmt.Errorf("预取流式回源写临时文件失败（%s）: %w", res.url, err))
 		}
+		prog.addBytes(len(res.first)) // 活跃下载周期汇总累加
 	}
 	// 上游读经 progressReader 记入看门狗：read-timeout（无新增数据超时）语义与客户端
 	// 流式路径一致，慢速但持续传输的大 blob 不会被误砍；res.body 为 nil 表示探测期已到
@@ -763,6 +781,7 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 				if err := ent.writeBroadcast(buf[:n]); err != nil {
 					return fail(fmt.Errorf("预取流式回源写临时文件失败（%s）: %w", res.url, err))
 				}
+				prog.addBytes(n) // 活跃下载周期汇总累加
 			}
 			if rerr != nil {
 				if errors.Is(rerr, io.EOF) {

@@ -37,6 +37,12 @@ const DefaultCacheTTL = 30 * time.Minute
 // DefaultProgressLogInterval 全局 log.progress-interval 未配置时的默认流式透传进度日志间隔。
 const DefaultProgressLogInterval = 10 * time.Second
 
+// DefaultProgressSummaryInterval 全局 log.progress-summary-interval 未配置时的默认活跃
+// 下载周期进度汇总间隔：每 3 分钟把当时全部活跃下载（客户端流式回源 / 搭车订阅 /
+// 半截续传 / 后台预取）的进度集中输出一次；无活跃下载时整轮静默。与单流
+// progress-interval（10s 节拍）分工不同，取 3 分钟避免汇总日志淹没单流进度。
+const DefaultProgressSummaryInterval = 3 * time.Minute
+
 // DefaultDockerPrefetchConcurrency docker 层预取并发数未配置时的缺省值：
 // docker daemon 默认 max-concurrent-downloads=3，预取并发略高于它即可在客户端逐层
 // 请求前把 layer 备好，同时不与客户端请求争抢过多上游带宽。
@@ -506,6 +512,15 @@ type LogConfig struct {
 	// 间隔输出一条回源进度日志）：nil（未配置）默认 10s（DefaultProgressLogInterval）；
 	// 显式 <=0 关闭进度日志（负数归一化为 0，Validate 不报错，风格同 cache.clean-interval）。
 	ProgressInterval *Duration `yaml:"progress-interval"`
+	// ProgressSummaryEnabled 活跃下载周期进度汇总开关（每 progress-summary-interval
+	// 输出一次全局活跃下载视图，含客户端与异步预取两类下载）：nil（未配置）默认开启；
+	// 显式 false 关闭（关闭后不启动汇总 goroutine，不输出任何汇总日志）。
+	ProgressSummaryEnabled *bool `yaml:"progress-summary-enabled"`
+	// ProgressSummaryInterval 活跃下载周期进度汇总的输出间隔：nil（未配置）默认 3m
+	//（DefaultProgressSummaryInterval）；显式 <=0 关闭周期汇总（负数归一化为 0，Validate
+	// 不报错，风格同 progress-interval）。与 progress-interval 的分工：前者是单条流的
+	// 10s 节拍，本项是全局活跃下载的 3 分钟汇总视图。
+	ProgressSummaryInterval *Duration `yaml:"progress-summary-interval"`
 }
 
 // CacheConfig 全局缓存配置。
@@ -837,6 +852,13 @@ func (c *Config) Validate() error {
 	if c.Log.ProgressInterval != nil && c.Log.ProgressInterval.D() < 0 {
 		v := Duration(0)
 		c.Log.ProgressInterval = &v
+	}
+	// log.progress-summary-interval：nil（未配置）默认 3m（生效值经
+	// ProgressSummaryInterval() 读取）；显式负数归一化为 0（关闭周期进度汇总，与
+	// log.progress-interval 同风格，Validate 不报错）
+	if c.Log.ProgressSummaryInterval != nil && c.Log.ProgressSummaryInterval.D() < 0 {
+		v := Duration(0)
+		c.Log.ProgressSummaryInterval = &v
 	}
 	// //////////////////  默认值补全  end  ////////////////////////////////////////////////
 
@@ -1224,6 +1246,26 @@ func (c *Config) ProgressLogInterval() time.Duration {
 		return DefaultProgressLogInterval
 	}
 	return c.Log.ProgressInterval.D()
+}
+
+// ProgressSummaryEnabled 返回活跃下载周期进度汇总开关生效值：nil（未配置）= 开启
+// （默认开）；显式 false 关闭（不启动汇总 goroutine，不输出任何汇总日志）。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底（布尔键无额外校验约束）。
+func (c *Config) ProgressSummaryEnabled() bool {
+	if c.Log.ProgressSummaryEnabled == nil {
+		return true
+	}
+	return *c.Log.ProgressSummaryEnabled
+}
+
+// ProgressSummaryInterval 返回活跃下载周期进度汇总的输出间隔生效值：
+// nil（未配置）= 缺省 3m（DefaultProgressSummaryInterval）；显式 <=0 = 0（关闭周期汇总）。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底。
+func (c *Config) ProgressSummaryInterval() time.Duration {
+	if c.Log.ProgressSummaryInterval == nil {
+		return DefaultProgressSummaryInterval
+	}
+	return c.Log.ProgressSummaryInterval.D()
 }
 
 // LogLevel 返回 log.level 对应的 slog.Level。必须在 Validate 之后调用

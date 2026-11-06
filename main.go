@@ -90,6 +90,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// 活跃下载周期进度汇总（客户端流式回源 / 搭车 / 续传 / 后台预取四类下载的全局视图，
+	// 见 proxy/progress_summary.go）：开关 log.progress-summary-enabled（默认开）与间隔
+	// log.progress-summary-interval（默认 3m，<=0 关闭）在内部判定；goroutine 随上方
+	// signal ctx 取消退出（与 cache.StartJanitor 同一生命周期模式，进程退出无泄漏）
+	srv.StartProgressSummary(ctx)
 
 	httpSrv := &http.Server{
 		Handler:           srv,

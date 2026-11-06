@@ -153,6 +153,12 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		contentLength = v
 	}
 
+	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit（响应头已写出）后
+	// 开始写即登记 source=client，defer 注销——任何返回路径（EOF / 断开 / 读上游失败）
+	// 都不留幽灵条目；每写一块经 addBytes 累加，total 取上游声明总长
+	prog := s.progressRegister(dockerLogSourceClient, labels.image, labels.digest, r.Method, 0, contentLength)
+	defer prog.unregister()
+
 	// 慢速升级多源并发续传（slow-download escalation）门控与状态：
 	// 仅 type=docker 规则的 GET 路径目标流式回源启用，speed<=0 / window<=0 / max-behind<=0
 	// 视为关闭（未配置时 Options 已带默认值，规则显式 0 = 显式关闭）；窗口计时在循环内
@@ -190,6 +196,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	writeOut := func(p []byte) {
 		total += len(p)
 		accum.Write(p)
+		prog.addBytes(len(p)) // 活跃下载周期汇总累加（与 total 同源，含客户端已断开后仍在写缓存的块）
 		if clientOK {
 			if _, werr := w.Write(p); werr != nil {
 				clientOK = false
@@ -212,6 +219,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		}
 		total += len(res.first)
 		accum.Write(res.first)
+		prog.addBytes(len(res.first))
 		if clientOK {
 			if _, werr := w.Write(res.first); werr != nil {
 				clientOK = false

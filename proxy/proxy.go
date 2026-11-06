@@ -106,6 +106,13 @@ type Server struct {
 	// 交错产生「非前缀」内容（半截必须是 blob 原文前缀，续传拼接正确性的前提）。
 	// 见 partial_resume.go（New 预构建，防御性惰性补建见 partWriter）。
 	partialWriters map[string]*sync.Mutex
+	// progressMu 保护 progressReg 的并发访问/惰性补建（活跃下载周期进度汇总，见 progress_summary.go）。
+	progressMu sync.Mutex
+	// progressReg 活跃下载注册表：全部下载流（client / ridealong / resume / prefetch）开始写时
+	// 登记、结束注销，供周期汇总输出全局活跃下载进度（New 预构建，防御性惰性补建见 progressOrInit）。
+	progressReg *progressRegistry
+	// progressOnce 保证周期汇总 goroutine 只启动一次（StartProgressSummary 幂等）。
+	progressOnce sync.Once
 }
 
 // New 创建 Server：预编译全局/各域名规则及其 url-redirect 候选对象用到的上游代理客户端
@@ -124,6 +131,9 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	s.prefetchHub = newPrefetchStreamHub()
 	// blob 半截文件的按 key 写锁注册表（半截保留与无感续传，见 partial_resume.go）
 	s.partialWriters = make(map[string]*sync.Mutex)
+	// 活跃下载注册表（周期进度汇总，见 progress_summary.go）：New 只预构建注册表，
+	// 定时汇总 goroutine 由 main.go 调 StartProgressSummary(ctx) 启动（生命周期归调用方）
+	s.progressReg = newProgressRegistry()
 
 	// 预构建全局与各域名规则可能用到的 (上游代理, connect-timeout) 组合客户端：
 	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建。
