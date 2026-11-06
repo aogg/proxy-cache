@@ -1421,7 +1421,13 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 		h.Set("Content-Length", strconv.Itoa(len(e.Body)))
 		w.WriteHeader(status)
 		if len(e.Body) > 0 {
-			if _, err := w.Write(e.Body); err != nil {
+			// 活跃下载进度登记（周期汇总，见 progress_summary.go）：缓存命中 / 单飞等待
+			// 回放 / BYPASS 回放同样是把内容传给客户端，按 source=client（续传链路回放为
+			// resume）登记，分块写逐块 addBytes——大 blob 一次 Write 会让 3 分钟汇总在
+			// 传输期间只能看到 0 字节。写失败/成功返回都 defer 注销，不留幽灵条目
+			prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, int64(len(e.Body)))
+			defer prog.unregister()
+			if err := writeBodyWithProgress(w, e.Body, prog); err != nil {
 				s.log.Warn("写响应体失败", labels.attrs(logSource, "target", truncate(r.URL.Path, 200), "err", err)...)
 			}
 		}

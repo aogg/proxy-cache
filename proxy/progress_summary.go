@@ -7,15 +7,20 @@
 //   - progress-interval：单条流自己的进节奏拍，只覆盖「该请求自身的回源/续传流」；客户端
 //     搭车回放与后台预取那一路默认看不到；
 //   - progress-summary-interval（本文件）：Server 级全局视图，每周期把**全部**活跃下载
-//     聚合输出——客户端流式回源（client）、搭车订阅（ridealong）、半截续传执行方
-//     （resume）、后台预取（prefetch）四类来源齐全。docker 场景下即可直接看到「正在
-//     下载哪些镜像层、各到几成」，客户端下载与异步（预取）下载按 source 区分；没有被
-//     访问（无活跃下载）时整轮静默，一条日志都不输出。
+//     聚合输出——客户端流式回源（client）、缓存/回放（client 或 resume，见 serveEntry /
+//     serveEntryBlobRange）、搭车订阅（ridealong）、半截续传执行方（resume）、后台预取
+//     （prefetch）来源齐全。docker 场景下即可直接看到「正在下载哪些镜像层、各到几成」，
+//     客户端下载与异步（预取）下载按 source 区分。
+//
+// 可见性：一轮汇总 = 一条汇总头（active 活跃数 + started 本轮新登记数）+ 每个活跃下载
+// 一条进度。只要「本轮有下载登记」或「tick 时仍有活跃下载」就输出（哪怕下载在 tick 前
+// 已结束，也留一条 started 统计，避免 3 分钟窗口内短下载完全看不到）；两者都没有（没有
+// 被访问）才整轮静默，一条日志都不输出。
 //
 // 注册表语义（progressRegistry）：
-//   - 下载开始写时登记（四处登记点：stream.go 的客户端流式回源 commit 后、
-//     partial_resume.go 的续传执行方 commit 后、prefetch_hub.go 的搭车订阅 commit 后与
-//     后台预取响应头快照就绪后），结束时 defer 注销——任何返回路径都不留幽灵条目；
+//   - 下载开始写时登记（客户端流式回源 commit 后、续传执行方 commit 后、搭车订阅 commit
+//     后、后台预取响应头快照就绪后，以及缓存/续传回放开始写时），结束时 defer 注销——
+//     任何返回路径都不留幽灵条目；
 //   - 每写一块经 addBytes 原子累加（written 为 atomic.Int64，写循环热路径不加锁）；
 //   - total 从响应头 Content-Length（或续传扫描出的总长）取得后 setTotal，不可得则不输出
 //     total/percent（与既有单流进度日志的取舍一致）；
@@ -35,6 +40,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -54,6 +60,10 @@ type progressRegistry struct {
 	mu sync.Mutex
 	// nextID 自增下载 ID：输出按 ID 升序排序，保证同一轮汇总的日志顺序稳定。
 	nextID uint64
+	// started 自上次汇总以来新登记的下载数（含在 tick 前就结束的短下载）：tick 时随
+	// 快照一起取走并清零，是「本轮有访问」的判据——没有它，3 分钟窗口内完成的下载在
+	// tick 时已注销，汇总会整轮静默，用户看不到任何周期输出。
+	started uint64
 	// m 活跃下载条目表（登记即入表，注销即删除）。
 	m map[uint64]*progressSummaryEntry
 }
@@ -135,17 +145,32 @@ func (r *progressRegistry) register(source, image, digest, method string, initia
 	ent.id = r.nextID
 	ent.lastWritten = initial
 	r.m[ent.id] = ent
+	r.started++
 	r.mu.Unlock()
 	return ent
 }
 
-// snapshot 复制一份汇总快照并推进各条目的「上次快照」基线：无活跃下载返回 nil
-// （调用方据此静默跳过整轮输出）。全部字段读取与基线推进都在锁内完成，锁外只做格式化。
+// snapshot 复制一份汇总快照并推进各条目的「上次快照」基线（不关心本轮 started 计数的
+// 调用方用这个薄封装；tick 路径用 snapshotTick 同时取走 started）。
 func (r *progressRegistry) snapshot(now time.Time) []progressSummaryRow {
+	rows, _ := r.snapshotTick(now)
+	return rows
+}
+
+// snapshotTick 复制汇总快照并返回「自上次 tick 以来新登记的下载数」：
+//   - 无活跃下载且本轮没有任何登记（started==0）→ (nil, 0)，调用方静默跳过整轮；
+//   - 有活跃下载 → 返回全部活跃行 + started（可能为 0，长下载跨多轮）；
+//   - 无活跃下载但 started>0 → (nil, started)，调用方仍输出一条汇总头统计本轮活动，
+//     保证 3 分钟窗口内完成的短下载（含 HIT 回放）不会完全没有周期输出。
+//
+// 全部字段读取与基线推进都在锁内完成，锁外只做格式化。
+func (r *progressRegistry) snapshotTick(now time.Time) ([]progressSummaryRow, uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	started := r.started
+	r.started = 0
 	if len(r.m) == 0 {
-		return nil
+		return nil, started
 	}
 	rows := make([]progressSummaryRow, 0, len(r.m))
 	for _, e := range r.m {
@@ -166,7 +191,7 @@ func (r *progressRegistry) snapshot(now time.Time) []progressSummaryRow {
 		e.lastAt = now
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
-	return rows
+	return rows, started
 }
 
 // addBytes 累加已下载字节数（写循环每块调用一次；原子累加，不加注册表锁）。
@@ -244,13 +269,15 @@ func (s *Server) progressSummaryLoop(ctx context.Context, interval time.Duration
 	}
 }
 
-// emitProgressSummary 输出一轮活跃下载进度汇总：先一条汇总头（active 总数 + 各来源
-// 数量），再每个活跃下载一条进度。快照为空（无活跃下载）时零日志。
+// emitProgressSummary 输出一轮活跃下载进度汇总：先一条汇总头（active 活跃数 + started
+// 本轮新登记数 + 各来源活跃数量），再每个活跃下载一条进度。tick 时没有活跃下载、且本轮
+// 也没有任何下载登记（没有被访问）时整轮静默；只有短下载落在窗口内时仍输出汇总头，
+// 让运维在 3 分钟周期里稳定看到「本轮有下载」的统计。
 // 只读快照、不持注册表锁写日志（见文件头并发说明）。
 func (s *Server) emitProgressSummary(now time.Time, interval time.Duration) {
-	rows := s.progressOrInit().snapshot(now)
-	if len(rows) == 0 {
-		return // 无活跃下载：整轮静默（需求：没有被访问时不输出）
+	rows, started := s.progressOrInit().snapshotTick(now)
+	if len(rows) == 0 && started == 0 {
+		return // 本轮没有访问（无活跃下载、也无新登记）：整轮静默
 	}
 	// 各来源计数（汇总头用）：客户端下载（client/ridealong/resume）与异步下载（prefetch）
 	// 在 source 上区分，看日志即可判断「当前带宽是客户端在拉还是后台预取在拉」
@@ -269,6 +296,7 @@ func (s *Server) emitProgressSummary(now time.Time, interval time.Duration) {
 	}
 	s.log.Info("活跃下载进度汇总",
 		"active", len(rows),
+		"started", started,
 		"client", client,
 		"ridealong", ridealong,
 		"resume", resume,
@@ -324,4 +352,30 @@ func progressSummaryTotal(header http.Header) int64 {
 		return v
 	}
 	return 0
+}
+
+// writeBodyWithProgress 分块写出响应体并逐块累加活跃下载进度：缓存/续传回放原实现一次
+// w.Write(整个 body)，大 blob 单次写会阻塞数秒到数十秒，周期汇总在写期间只能看到 0 字节；
+// 改成固定分块后 addBytes 才能反映真实进度。语义与一次 Write 等价（顺序写完整 body），
+// 遇错立即返回、短写按 io.ErrShortWrite 处理，绝不吞字节。
+func writeBodyWithProgress(w io.Writer, body []byte, prog *progressSummaryEntry) error {
+	const chunk = 64 * 1024
+	for len(body) > 0 {
+		n := chunk
+		if n > len(body) {
+			n = len(body)
+		}
+		wn, err := w.Write(body[:n])
+		if wn > 0 {
+			prog.addBytes(wn)
+		}
+		if err != nil {
+			return err
+		}
+		if wn != n {
+			return io.ErrShortWrite
+		}
+		body = body[n:]
+	}
+	return nil
 }

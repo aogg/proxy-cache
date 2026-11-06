@@ -29,10 +29,11 @@ log:
   # progress-interval: 10s
   # progress-summary-enabled: 活跃下载周期进度汇总开关（默认 true 开启；显式 false 关闭）：
   # 开启时每 progress-summary-interval 输出一轮全局汇总——先一条「活跃下载进度汇总」
-  # （active 总数 + client/ridealong/resume/prefetch 各自数量），再每个活跃下载一条
-  # 「活跃下载进度」（source/image/digest/method/bytes/total/percent/speed/elapsed）；
-  # docker 场景下客户端下载（client/ridealong/resume）与异步预取下载（prefetch）按 source
-  # 区分；没有被访问（无活跃下载）时整轮静默、一条日志都不输出
+  # （active 活跃数 + started 本轮新登记数 + client/ridealong/resume/prefetch 各自数量），
+  # 再每个活跃下载一条「活跃下载进度」（source/image/digest/method/bytes/total/percent/
+  # speed/elapsed）；docker 场景下客户端下载（client/ridealong/resume，含缓存命中回放）
+  # 与异步预取下载（prefetch）按 source 区分；本轮没有任何下载登记（没有被访问）时静默，
+  # 窗口内已结束的短下载仍会体现在 started 里，不会整轮看不到
   # progress-summary-enabled: true
   # progress-summary-interval: 活跃下载周期进度汇总的输出间隔（默认 3m；<=0 关闭周期汇总）：
   # 与上方 progress-interval（单条流的 10s 节拍）分工不同，本项是全局活跃下载视图，

@@ -254,6 +254,12 @@ func (z *zeroRangeWriter) Write(p []byte) (int, error) {
 //     同一 layer 时不再打镜像站的保证。
 func (s *Server) serveEntryBlobRange(w http.ResponseWriter, r *http.Request, e *cache.Entry, spec blobRangeSpec, cacheStatus string, eff config.Options, start time.Time) {
 	labels := parseDockerLogInfo(r.URL.Path)
+	// source 按回放链路派生（与 serveEntry 一致）：X-Cache: RESUME 的区间回放属续传链路，
+	// 其余 HIT / MISS / BYPASS 区间回放属客户端主路径（日志规范四值枚举）
+	logSource := dockerLogSourceClient
+	if cacheStatus == resumeCacheStatus {
+		logSource = dockerLogSourceResume
+	}
 	total := int64(len(e.Body))
 	h := w.Header()
 	for k, vv := range e.Header {
@@ -276,10 +282,10 @@ func (s *Server) serveEntryBlobRange(w http.ResponseWriter, r *http.Request, e *
 		h.Set("Content-Range", fmt.Sprintf("bytes */%d", total))
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 		s.log.Warn("blob 区间请求起点越界，回 416（本地内容总长已知，不发上游）",
-			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "cache", cacheStatus,
+			labels.attrs(logSource, "rule", eff.Rule, "cache", cacheStatus,
 				"range_start", spec.start, "total", total, "target", truncate(r.URL.Path, 300))...)
 		s.log.Info("代理请求完成",
-			labels.attrs(dockerLogSourceClient,
+			labels.attrs(logSource,
 				"method", r.Method, "target", truncate(r.URL.Path, 300),
 				"status", http.StatusRequestedRangeNotSatisfiable, "cache", cacheStatus,
 				"upstream", e.Source, "rule", eff.Rule, "bytes", 0,
@@ -295,17 +301,22 @@ func (s *Server) serveEntryBlobRange(w http.ResponseWriter, r *http.Request, e *
 	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", spec.start, last, total))
 	h.Set("Content-Length", strconv.FormatInt(n, 10))
 	w.WriteHeader(http.StatusPartialContent)
-	if _, err := w.Write(e.Body[int(spec.start) : int(last)+1]); err != nil {
+	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：区间回放同样是客户端下载
+	//（source 与上方日志派生一致），分块写逐块 addBytes；total 取本次区间长度（percent
+	// 描述这次要发的区间而不是完整对象），不输出超区间语义
+	prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, n)
+	defer prog.unregister()
+	if err := writeBodyWithProgress(w, e.Body[int(spec.start):int(last)+1], prog); err != nil {
 		s.log.Warn("写响应体失败（客户端可能已断开）",
-			labels.attrs(dockerLogSourceClient, "cache", cacheStatus,
+			labels.attrs(logSource, "cache", cacheStatus,
 				"target", truncate(r.URL.Path, 200), "err", err)...)
 	}
 	s.log.Info("成功返回内容（本地完整内容按客户端区间切片回 206，不发上游）",
-		labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "cache", cacheStatus,
+		labels.attrs(logSource, "rule", eff.Rule, "cache", cacheStatus,
 			"range_start", spec.start, "range_last", last, "total", total, "bytes", n,
 			"upstream", e.Source)...)
 	s.log.Info("代理请求完成",
-		labels.attrs(dockerLogSourceClient,
+		labels.attrs(logSource,
 			"method", r.Method, "target", truncate(r.URL.Path, 300),
 			"status", http.StatusPartialContent, "cache", cacheStatus,
 			"upstream", e.Source, "rule", eff.Rule, "bytes", n,

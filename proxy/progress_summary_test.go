@@ -21,6 +21,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -396,7 +398,92 @@ func TestProgressSummaryEmptyRegistrySilent(t *testing.T) {
 	}
 }
 
-// TestProgressSummaryNotStartedWhenDisabled 关闭路径不启动协程：enabled 显式 false、
+// TestProgressSummaryStartedAfterShortDownload 3 分钟窗口内已结束的短下载也必须可见：
+// 登记后立刻注销（tick 时注册表已空），下一轮仍应输出汇总头并带 active=0、started=1，
+// 且不应再输出「活跃下载进度」明细行（已完成条目不在快照里，避免统计口径混淆）。
+func TestProgressSummaryStartedAfterShortDownload(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	s, sb := newProgressServer(t, nil, durPtr(interval))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.StartProgressSummary(ctx)
+
+	e := s.progressRegister(dockerLogSourceClient, "short/app", "sha256:1234", http.MethodGet, 0, 100)
+	e.addBytes(100)
+	e.unregister() // tick 前已结束
+
+	waitLogContains(t, sb, 2*time.Second, func(log string) bool {
+		return countLogMsg(log, "msg=活跃下载进度汇总") >= 1
+	}, "窗口内结束的下载应仍输出汇总头（started 统计）")
+
+	log := sb.String()
+	header := firstLogLine(log, "msg=活跃下载进度汇总")
+	wantLineField(t, header, "active=0", "started=1")
+	if n := countLogMsg(log, "msg=活跃下载进度 "); n != 0 {
+		t.Errorf("已完成下载不应输出明细行, got %d 条:\n%s", n, log)
+	}
+
+	// 再等一轮：started 已被上一轮取走清零，之后没有新登记 → 整轮静默
+	marker := sb.Len()
+	time.Sleep(4 * interval)
+	if got := sb.String()[marker:]; strings.TrimSpace(got) != "" {
+		t.Errorf("started 消费后无新访问应整轮静默，新增日志:\n%s", got)
+	}
+}
+
+// TestProgressSummarySnapshotTickStarted snapshotTick 取走 started（每次 tick 只统计一次）：
+// 登记后未注销时 tick 同时返回活跃行与 started=1；紧接着的 tick started=0，避免同一批
+// 下载在后续每一轮被重复计数。
+func TestProgressSummarySnapshotTickStarted(t *testing.T) {
+	r := newProgressRegistry()
+	t0 := time.Now()
+	e := r.register(dockerLogSourceClient, "demo/app", "sha256:aaaa", http.MethodGet, 0, 100, t0)
+
+	rows, started := r.snapshotTick(t0.Add(time.Second))
+	if len(rows) != 1 || started != 1 {
+		t.Fatalf("首轮应返回 1 行且 started=1, got rows=%d started=%d", len(rows), started)
+	}
+	rows, started = r.snapshotTick(t0.Add(2 * time.Second))
+	if len(rows) != 1 || started != 0 {
+		t.Fatalf("次轮无新登记应 started=0, got rows=%d started=%d", len(rows), started)
+	}
+	e.unregister()
+	if rows, started := r.snapshotTick(t0.Add(3 * time.Second)); rows != nil || started != 0 {
+		t.Fatalf("注销且无新登记应静默, got rows=%v started=%d", rows, started)
+	}
+}
+
+// TestWriteBodyWithProgress 分块写出与进度累加：大 body 按块写完、字节数精确累加；
+// 短写返回 io.ErrShortWrite 且不吞未写字节。
+func TestWriteBodyWithProgress(t *testing.T) {
+	r := newProgressRegistry()
+	e := r.register(dockerLogSourceClient, "demo/app", "sha256:bbbb", http.MethodGet, 0, 0, time.Now())
+	var buf bytes.Buffer
+	body := make([]byte, 200*1024)
+	if err := writeBodyWithProgress(&buf, body, e); err != nil {
+		t.Fatalf("writeBodyWithProgress() 意外报错: %v", err)
+	}
+	if buf.Len() != len(body) || e.written.Load() != int64(len(body)) {
+		t.Errorf("写出 %d 字节、进度 %d，want %d/%d", buf.Len(), e.written.Load(), len(body), len(body))
+	}
+
+	// 短写：writer 只收一半，必须报 io.ErrShortWrite（绝不把截断当成功）
+	short := &shortWriter{limit: 10}
+	if err := writeBodyWithProgress(short, body, e); !errors.Is(err, io.ErrShortWrite) {
+		t.Errorf("短写应返回 io.ErrShortWrite, got %v", err)
+	}
+}
+
+// shortWriter 只写 limit 字节后返回短写（n < len(p), err == nil）。
+type shortWriter struct{ limit int }
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit {
+		return w.limit, nil
+	}
+	return len(p), nil
+}
+
 // interval 显式 0、interval 负数（Validate 归一化 0）三种配置下，即使有活跃下载
 // 也一条汇总日志都不输出。
 func TestProgressSummaryNotStartedWhenDisabled(t *testing.T) {

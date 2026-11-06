@@ -523,7 +523,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 			return s.servePrefetchHubDoneHit(w, r, key, eff, disk, start)
 		}
 		s.log.Warn("搭车放弃：等待预取响应头快照超时（预取疑似卡死），改走原回源路径",
-			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key, "digest", ent.digest,
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
 				"target", truncate(target, 300), "wait", prefetchHubIdleTimeout.String())...)
 		return false
 	}
@@ -534,7 +534,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	case prefetchStreamFailed:
 		// 预取失败广播：搭车放弃改走既有原回源路径（客户端自己回源，上游只此一路）
 		s.log.Debug("预取失败广播，搭车放弃改走原回源路径",
-			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key, "digest", ent.digest,
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
 				"target", truncate(target, 300), "err", terr)...)
 		return false
 	}
@@ -546,7 +546,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	status, header, source := ent.snapshot()
 	s.commitPrefetchHubHeader(w, status, header, source)
 	s.log.Info("搭车在途预取层（拼接磁盘前缀+实时增量，上游仅预取一路下载）",
-		labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "key", key,
+		labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
 			"prefix_bytes", prefixLen, "candidate", truncate(source, 300), "status", status)...)
 
 	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始回放即登记
@@ -562,7 +562,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	f, err := os.Open(ent.tmpPathOf())
 	if err != nil {
 		s.log.Warn("搭车读磁盘前缀失败，终止本次响应（客户端将以 Range 续传重试）",
-			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest,
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule,
 				"file", ent.tmpPathOf(), "err", err)...)
 		return true
 	}
@@ -587,18 +587,18 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 				// 订阅结束（预取侧终态广播 close，缓冲内增量已收完）：按终态收尾
 				if ent.subOverflow(sub) {
 					s.log.Warn("搭车增量消费过慢被摘除，终止本次响应（客户端将以 Range 续传重试）",
-						labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "sent", total)...)
+						labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "sent", total)...)
 					return true
 				}
 				st, terr := ent.terminal()
 				if st == prefetchStreamFailed {
 					s.log.Warn("预取失败广播，终止本次搭车响应（客户端将以 Range 续传重试）",
-						labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "sent", total, "err", terr)...)
+						labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "sent", total, "err", terr)...)
 					return true
 				}
 				// done：磁盘前缀 + 增量恰好拼出完整 body，搭车完成
 				s.log.Info("搭车完成（在途预取层已完整回放）",
-					labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "bytes", total,
+					labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "bytes", total,
 						"upstream", source, "cost", time.Since(start).Round(time.Millisecond).String())...)
 				s.log.Info("代理请求完成",
 					labels.attrs(dockerLogSourceRidealong,
@@ -627,7 +627,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 			// 预取增量停滞（卡死/过慢）：已 commit，终止本次响应；docker 会以 Range
 			// 断点续传重试（命中已写盘的前缀缓存则 HIT、否则回源 206，都不从 0 拉整层）
 			s.log.Warn("搭车订阅超时（预取增量停滞），终止本次响应（客户端将以 Range 续传重试）",
-				labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "sent", total,
+				labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "sent", total,
 					"idle", prefetchHubIdleTimeout.String())...)
 			return true
 		}

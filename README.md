@@ -135,7 +135,7 @@ docker run -d --name proxy-cache \
 | `cache.*` | object | 见下 | 全局缓存配置 |
 | `log.level` | string | `info` | 日志级别：`debug` / `info` / `warn` / `error`（大小写不敏感，非法值启动时直接报错），详见下文「日志」 |
 | `log.progress-interval` | duration | `10s` | 流式透传进度日志的输出间隔：GET 路径目标流式回源（docker pull 大 blob）期间每隔该间隔输出一条「流式透传进度」日志（已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收），上游停滞无新数据期间自然不输出；整条流在该间隔内完成则一条进度日志都不出（最终日志已有）。`<=0` 关闭进度日志 |
-| `log.progress-summary-enabled` | bool | `true` | **活跃下载周期进度汇总开关**：开启时每 `log.progress-summary-interval` 输出一轮全局汇总（客户端流式回源 / 搭车订阅 / 半截续传 / 后台预取四类下载的进度集中输出），无活跃下载时整轮静默。显式 `false` 关闭 |
+| `log.progress-summary-enabled` | bool | `true` | **活跃下载周期进度汇总开关**：开启时每 `log.progress-summary-interval` 输出一轮全局汇总（客户端流式回源 / 缓存回放 / 搭车订阅 / 半截续传 / 后台预取的进度集中输出），本轮没有任何下载登记时静默。显式 `false` 关闭 |
 | `log.progress-summary-interval` | duration | `3m` | **活跃下载周期进度汇总的输出间隔**：与 `log.progress-interval`（单条流的 10s 节拍）分工不同，本项是全局活跃下载视图（含异步预取下载），取 3 分钟避免汇总日志淹没单流进度。`<=0` 关闭周期汇总。详见下文「[活跃下载周期汇总](#活跃下载周期汇总)」 |
 | `domain-rules` | list | 空 | 域名/URL 规则列表，自上而下第一条命中生效 |
 | `allow-list` | string[] | 空 | 允许列表（正则）。非空时为白名单模式 |
@@ -678,7 +678,7 @@ log:
 
 | 级别 | 能看到什么 |
 | --- | --- |
-| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、流式透传进度（`流式透传进度`：按 `log.progress-interval` 周期输出，含已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收；间隔 `<=0` 关闭）、活跃下载周期汇总（`活跃下载进度汇总` 一条 + 每个活跃下载一条 `活跃下载进度`：按 `log.progress-summary-interval` 周期输出，覆盖 client/ridealong/resume/prefetch 四类下载，无活跃下载时静默，见下文「[活跃下载周期汇总](#活跃下载周期汇总)」）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、每条访问完成日志（`代理请求完成`） |
+| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、流式透传进度（`流式透传进度`：按 `log.progress-interval` 周期输出，含已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收；间隔 `<=0` 关闭）、活跃下载周期汇总（`活跃下载进度汇总` 一条 + 每个活跃下载一条 `活跃下载进度`：按 `log.progress-summary-interval` 周期输出，覆盖 client（含缓存/回放）/ridealong/resume/prefetch，本轮无任何下载登记时静默，见下文「[活跃下载周期汇总](#活跃下载周期汇总)」）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、每条访问完成日志（`代理请求完成`） |
 | `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched` / `excluded` 明细）、每次候选尝试开始、候选竞速放行（`url-redirect 候选竞速放行`）、候选被取消（其他候选胜出/扫描预算到期）、缓存查询 MISS 细节 |
 | `warn` | 候选请求失败 / 未过成功判据 / 回退直连、等待单飞超限自拔回源（`等待同 key 单飞回源超限，自行走候选回源`）、commit 后客户端断开（`写响应体失败（客户端已断开，终止上游读取）` 与断开终止事件 `客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）`——运维事件而非故障，含已接收字节数 `bytes` 与半截保留状态 `partial`）、commit 后读上游失败（`流式回源读上游失败...不写缓存`）、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
 | `error` | 仅错误：回源彻底失败（502）、候选扫描总预算耗尽（`url-redirect 候选扫描总预算耗尽，提前终止候选扫描`）、候选尝试 panic 等 |
@@ -715,19 +715,20 @@ grep 'source=resume' proxy-cache.log
 
 ### 活跃下载周期汇总
 
-除单条流自己的 10s 进度节拍（`log.progress-interval`，见上文「流式透传进度」）外，服务还维护一份 **Server 级活跃下载注册表**，按 `log.progress-summary-interval`（默认 **3m**；开关 `log.progress-summary-enabled` 默认开）把当时仍在进行的下载集中输出一次——docker 场景下可直接看到「正在下载哪些镜像层、各到几成」，无需逐条翻单流进度日志。
+除单条流自己的 10s 进度节拍（`log.progress-interval`，见上文「流式透传进度」）外，服务还维护一份 **Server 级活跃下载注册表**，按 `log.progress-summary-interval`（默认 **3m**；开关 `log.progress-summary-enabled` 默认开）把该周期内的下载集中输出一次——docker 场景下可直接看到「正在下载哪些镜像层、各到几成」，无需逐条翻单流进度日志。
 
-- **覆盖范围（四类下载，按 `source` 区分）**：`client`（客户端流式回源，`stream.go`）、`ridealong`（客户端搭车在途预取/续传层，`X-Cache: PREFETCH`）、`resume`（blob 半截续传执行方，`X-Cache: RESUME`）、`prefetch`（后台异步预取，manifest 驱动的 layer 下载）。前三类是**客户端下载**（由 docker 请求驱动），`prefetch` 是**异步下载**——两者在 `source` 上天然区分，这也是「docker 客户端下载进度」与「异步下载进度」各自 grep 的依据。
-- **无活跃下载时整轮静默**：注册表为空（没有被访问 / 所有下载都已结束）时一条日志都不输出，空转零噪音；每个下载在结束、断开、失败时都立即注销条目（`defer`），不会残留幽灵条目。
+- **覆盖范围（按 `source` 区分）**：`client`（客户端流式回源 `stream.go`，以及缓存命中 / 单飞等待 / BYPASS / 区间回放这类**本地回放** `serveEntry`、`serveEntryBlobRange`）、`ridealong`（客户端搭车在途预取/续传层，`X-Cache: PREFETCH`）、`resume`（blob 半截续传执行方与续传完成后的整体/区间回放，`X-Cache: RESUME`）、`prefetch`（后台异步预取，manifest 驱动的 layer 下载）。前三类是**客户端下载**（由 docker 请求驱动），`prefetch` 是**异步下载**——两者在 `source` 上天然区分，这也是「docker 客户端下载进度」与「异步下载进度」各自 grep 的依据。
+- **可见性（本轮有访问就一定有输出）**：汇总头每轮带 `active`（tick 时仍在进行的下载数）与 `started`（自上次 tick 以来新登记的下载数）。只要 `active>0` 或 `started>0` 就输出一轮：活跃下载逐条给进度；即使在 3 分钟窗口内已经结束的短下载（含缓存命中回放），也会通过 `started` 体现在汇总头里，不会出现「确实在下载、但周期日志里什么都没有」。只有本轮既没有活跃下载、也没有任何新登记（没有被访问）时才整轮静默。
+- **无幽灵条目**：每个下载在结束、断开、失败时都立即注销条目（`defer`），`started` 只是窗口内登记计数，不保留已完成条目，长期运行不增长内存。
 - **输出格式**：一轮汇总 = 一条汇总头 + 每个活跃下载一条进度（`info` 级，与单流进度日志同级）：
 
 ```
-level=INFO msg=活跃下载进度汇总 active=3 client=1 ridealong=0 resume=0 prefetch=2 interval=3m0s
+level=INFO msg=活跃下载进度汇总 active=3 started=5 client=1 ridealong=0 resume=0 prefetch=2 interval=3m0s
 level=INFO msg=活跃下载进度 source=client image=foxhui/webai-2api digest=sha256:... method=GET bytes=125829120 total=524288000 percent=24 speed=13.2MB/s elapsed=45.3s
 level=INFO msg=活跃下载进度 source=prefetch image=foxhui/webai-2api digest=sha256:... method=GET bytes=83886080 total=209715200 percent=40 speed=8.4MB/s elapsed=21.0s
 ```
 
-字段语义：`active` 为活跃下载总数（`client`/`ridealong`/`resume`/`prefetch` 为各来源数量）；`bytes` 已下载字节数（原始字节）；`total` 为总长、`percent` 为 0-100 进度（总长从响应头 `Content-Length` 取得时才输出这两个字段）；`speed` 是**与上次汇总之间的区间速率**（不是整条流的平均速率），格式沿用既有 `humanBytesPerSec` 习惯；`elapsed` 为自本次下载开始写的耗时（秒，一位小数）。`image`/`digest` 仅 docker 目标附带（非 docker 下载省略该键，不填空串）。
+字段语义：`active` 为 tick 时活跃下载总数（`client`/`ridealong`/`resume`/`prefetch` 为各来源的活跃数量）；`started` 为自上次汇总以来新登记的下载数（含周期内已结束的）；`bytes` 已下载字节数（原始字节）；`total` 为总长、`percent` 为 0-100 进度（总长从响应头 `Content-Length` 取得时才输出这两个字段；区间回放的 `total` 为本次区间长度）；`speed` 是**与上次汇总之间的区间速率**（不是整条流的平均速率），格式沿用既有 `humanBytesPerSec` 习惯；`elapsed` 为自本次下载开始写的耗时（秒，一位小数）。`image`/`digest` 仅 docker 目标附带（非 docker 下载省略该键，不填空串）。
 
 - **两类 docker 进度分开看**（TextHandler 输出键序固定 `source` 在首位）：
 

@@ -467,7 +467,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			disk.RemovePart(key)
 		}
 		s.log.Warn("blob 半截续传候选扫描失败，降级既有全量回源",
-			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "part_bytes", n,
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n,
 				"invalid", invalid, "err", serr)...)
 		// 网络/超时类失败保留半截：下方全量回源若再失败，其失败捕获会把更长前缀存回
 		// 半截（进度不回退）；全量成功则写缓存并删半截，两条路都正确
@@ -486,7 +486,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		upRes.Close()
 		ent.finishFailed(errBlobRangeUnavailable)
 		s.log.Warn("blob 半截续传拿不到对象总长，无法满足客户端区间请求，改走旧版 206 透传",
-			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest,
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
 				"part_bytes", n, "range_start", spec.start)...)
 		return nil, false, errBlobRangeUnavailable
 	}
@@ -523,7 +523,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 此后响应头固化，任何失败只能截断本次响应（docker 以 Range 重试，下次从更长前缀
 	// 续传——进度不回退）
 	s.commitResumeHeader(w, hdr, upRes.url, total, cr...)
-	startArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "part_bytes", n, "total", total,
+	startArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n, "total", total,
 		"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)
 	if hasRange {
 		startArgs = append(startArgs, "range_start", clientStart, "range_end", clientLast)
@@ -592,7 +592,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	lastProgressAt := time.Now()
 	lastProgressBytes := int(n) // int64→int 对齐 accum.Len()（int）的差值/赋值运算；语义不变——速率按前缀回放之后的新增量计算
 	emitProgress := func(now time.Time) {
-		args := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", accum.Len())
+		args := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "bytes", accum.Len())
 		if total > 0 {
 			pct := int(float64(accum.Len()) / float64(total) * 100)
 			if pct < 0 {
@@ -660,7 +660,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 				// commit 后读上游失败：保留更新后的半截文件（已追加到最新前缀，进度
 				// 不回退），广播 failed 并截断本次响应（docker 重试接着更长前缀续传）
 				s.log.Error("blob 半截续传读上游失败，终止本次响应（半截已保留，进度不回退）",
-					labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest,
+					labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
 						"candidate", truncate(upRes.url, 300),
 						"bytes", accum.Len(), "part_bytes", written, "err", rdErr)...)
 				return fail(fmt.Errorf("blob 半截续传读上游失败（%s）: %w", upRes.url, rdErr))
@@ -675,7 +675,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 数据）；两者均按失败截断（半截保留已收到的内容，进度不回退）
 	if total > 0 && int64(accum.Len()) != total {
 		s.log.Error("blob 半截续传长度不符，终止本次响应且不写缓存（半截已保留，进度不回退）",
-			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest,
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
 				"candidate", truncate(upRes.url, 300),
 				"bytes", accum.Len(), "total", total)...)
 		return fail(fmt.Errorf("blob 半截续传长度不符（累计 %d ≠ 总长 %d）", accum.Len(), total))
@@ -703,7 +703,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		respStatus = http.StatusPartialContent
 		sentBytes = blobRangeLast(spec, int64(accum.Len())) - clientStart + 1
 	}
-	doneArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", accum.Len(),
+	doneArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "bytes", accum.Len(),
 		"part_bytes", n, "upstream", upRes.url,
 		"cost", time.Since(start).Round(time.Millisecond).String())
 	if hasRange {
@@ -738,7 +738,7 @@ func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key
 		cerr := fmt.Errorf("读回完整半截失败: %w", rerr)
 		ent.finishFailed(cerr)
 		s.log.Warn("blob 半截已完整但读回失败，降级既有全量回源",
-			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "err", rerr)...)
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "err", rerr)...)
 		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 	}
 	entry := &cache.Entry{
@@ -766,7 +766,7 @@ func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key
 			sentBytes = blobRangeLast(spec, int64(len(data))) - spec.start + 1
 		}
 	}
-	doneArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", len(data),
+	doneArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "bytes", len(data),
 		"cost", time.Since(start).Round(time.Millisecond).String())
 	if len(cr) > 0 {
 		doneArgs = append(doneArgs, "range_start", cr[0].start, "sent", sentBytes)

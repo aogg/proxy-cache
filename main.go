@@ -124,13 +124,14 @@ func run() error {
 		"domain_rules", len(cfg.DomainRules),
 		"http_proxy", cfg.HTTPProxy,
 	)
-	// 逐目录输出缓存预热结果（source 标明全局目录还是规则独立目录）
+	// 逐目录输出缓存预热结果（scope 标明全局目录还是规则独立目录；不复用 source 键——
+	// source 是 docker 链路日志的四值枚举 client/ridealong/resume/prefetch，语义不能混用）
 	for _, dir := range preheatDirs {
-		source := "rule" // 规则独立缓存目录
+		scope := "rule" // 规则独立缓存目录
 		if dir == cfg.Cache.Path {
-			source = "global"
+			scope = "global"
 		}
-		logger.Info("缓存目录已就绪", "dir", dir, "clean_interval", activeDirs[dir].String(), "source", source)
+		logger.Info("缓存目录已就绪", "dir", dir, "clean_interval", activeDirs[dir].String(), "scope", scope)
 	}
 	// 逐条输出域名规则摘要：match 正则与规则级 cache / url-redirect 的生效值（未配置项沿用全局），
 	// 启动时即可核对「规则是否注册了独立缓存目录与轮询候选」——排查不写缓存先看这里
