@@ -125,10 +125,24 @@ fallback-direct: true
 # headers），「选定候选」的总耗时必须压在 30s 内（越快越好）
 # ----------------------------------------------------------------------------
 # url-redirect-probe-timeout  单次候选尝试的探测预算（默认 5s，0=不限制）：
-#                             从发出请求到「响应头可用（含 401 token dance 的
-#                             第二次响应）且成功判据可判定（首块读出或 EOF）」
-#                             的时限，覆盖建连后的等待与 token dance 全程；到期
-#                             取消该次尝试并硬失败快切下一候选。
+#                             从发出请求到「**最终响应头到达**（含 401 token dance 的
+#                             第二次响应）」的时限，覆盖建连后的等待与 token dance
+#                             全程；到期取消该次尝试并硬失败快切下一候选。
+#                             口径很关键：**响应头到手即算探测成功**，不把「首块 body
+#                             到达」算进预算——现场日志里 1ms.run 已在 5s 内回 206
+#                             （dance 花 2.9s），却因为还在等首块被判 probe-timeout
+#                             硬失败丢弃；停表之后只等首块，由 read-timeout（无新增
+#                             数据）与 http-timeout（整次尝试）兜底。
+#                             docker blob 目标（/v2/<name>/blobs/<digest>）在候选级/
+#                             规则级/全局都未显式配置时改用更大的缺省 30s（302MB 级
+#                             layer 的上游响应头经常 5s 内到不了，5s 预算会把候选全判
+#                             硬失败直接 502）；manifest 等其它目标仍用 5s 快速失败。
+#                             命中候选仍立即 commit：commit 时刻 = 首个通过判据的候选
+#                             （hedge 竞速），与预算大小无关；预算只是「放弃阈值」。
+#                             内置候选扫描总预算同步按目标类型放宽：manifest 等仍是
+#                             20s，docker blob 目标 60s 起（max(60s, (候选数-1)×
+#                             hedge-delay + 最大探测预算 + 20s)）——否则 20s 总预算会
+#                             在 30s 探测预算用完之前先把整轮扫描掐死，等于白加。
 #                             与既有三个超时的边界：
 #                               - http-timeout  管整次尝试总时长（含完整读 body），
 #                                 探测通过后 body 读取仍受它约束；
@@ -145,13 +159,19 @@ fallback-direct: true
 #                             取消（context 取消，连接及时释放）。
 #                             最坏「选定候选」耗时 ≈ (候选数-1)×hedge-delay +
 #                             胜者的探测耗时（如 5 候选 ≈ 4×2s + 1s ≈ 9s）；
-#                             全部候选都失败的极坏情况由内置扫描总预算（20s）兜底：
-#                             提前终止并 502，docker 客户端会自行重试该层
+#                             全部候选都失败的极坏情况由内置扫描总预算兜底（manifest
+#                             等 20s、docker blob 60s 起，见上方 probe-timeout 段）：
+#                             到期提前终止并 502，docker 客户端会自行重试该层
 #url-redirect-hedge-delay: 2s
 
 # ----------------------------------------------------------------------------
 # 慢速升级多源并发续传（slow-download escalation，全局与 domain-rules 规则级都可配，
 # 规则覆盖全局；仅 type=docker 规则的 GET 路径目标流式回源生效）
+#
+# ⚠ 坑（线上真实踩过）：规则里**没写 `type: docker`**（留空 = 不过滤请求类型）时，
+# 下面四个 slow-download-* 参数与规则级同名参数**静默不生效**——请求照样命中规则、
+# 缓存与候选照常工作，只是「慢速升级多源并发续传」不启用，日志里也不会有任何报错。
+# 想用它，务必在该 domain-rule 上显式写 `type: docker`（见文末 Docker 场景示例）。
 # ----------------------------------------------------------------------------
 # docker pull 大 blob 时若选中的镜像站下载过慢，自动向其余全部候选并发发起
 # Range 续传（每个源拉满剩余区间自己的流），与胜者既有连接按偏移有序合并写给
@@ -385,7 +405,15 @@ domain-rules:
   # 上游边写给 docker——docker 客户端等响应头约 30s 就超时断开（net/http: timeout awaiting
   # response headers），流式透传把首字节时间压缩为「选定候选」的耗时，不再被大 blob 的
   # 完整下载拖超时；EOF 后按既有条件写缓存，docker 断开后重试该层即可缓存命中（HIT）。
-  # 带 Range 的断点续传请求：上游回 206 视为成功并流式透传、不写缓存。
+  # 带 Range 的请求（docker/containerd 的 httpReadSeeker 无论从哪个偏移都带 Range）：
+  #   - 起点 0（`bytes=0-`，首次拉某层）：**等价于完整 GET**——剥离 Range 后走缓存 HIT /
+  #     半截无感续传 / 预取搭车，对客户端回 206 + Content-Range，链路中途断也能续传拉完；
+  #   - 起点 >0（`bytes=<偏移>-`，断点续传重试，现场起点 ≈ 82.8MB）：**本地有完整内容就
+  #     秒回**——缓存 HIT 直接从条目 body 切片回 206（不发上游）；只有半截前缀且起点不
+  #     超过半截长度时，从半截的起点位置回放 + 上游剩余区间续传拼接（同样回 206，内部照常
+  #     写完整缓存）；无半截或起点超出半截（中间缺一段、不能凭空补）才维持旧版 206 透传
+  #     （缺口场景会打一条 Warn 说明缺口大小）；
+  #   - 非 blob 目标 / 后缀区间 / 多区间：维持旧版 206 透传、不写缓存。
   # 镜像站对匿名 blob/manifest 常回 401 + WWW-Authenticate: Bearer 挑战：本代理会自动按挑战
   # 去 realm 匿名取 token 并带 Authorization: Bearer 重试一次（与 docker 客户端直连行为等价），
   # token 进程内缓存（TTL 取 expires_in，缺省 60s），不会每个 blob 层都打一次 auth 端点。
@@ -393,6 +421,7 @@ domain-rules:
   #   docker pull registry-proxy-cache.linkease.net:5480/adockero/proxy-cache
   # - name: docker-registry
   #   type: docker              # 仅路径目标请求命中本规则（web 流量不受本规则影响，可另配 type: web 规则分流）
+  #                             # ⚠ 必须写：缺 type 时本规则与全局的 slow-download-* 四个参数静默不生效
   #   match: '.+registry-proxy-cache\.linkease\...+'   # 换成自己的入站域名（对整串非锚定匹配）
   #   cache:
   #     enabled: true
@@ -403,13 +432,16 @@ domain-rules:
   #   fallback-direct: false     # 路径目标无完整原始 URL 可直连回退，候选全败直接报错
   #   read-timeout: 120s         # 大镜像 blob 慢速但持续传输不被砍：120s 内无任何新增数据才判超时
   #   http-timeout: 600s         # 单次尝试总超时兜底（含 token dance 与读 body 全程）
+  #   # 探测预算不配时按目标类型取缺省：docker blob 目标 30s（大 layer 上游响应头慢）、
+  #   # manifest 等其它目标 5s；下面显式写 5s 表示「所有目标统一 5s」（0 = 不限制）
   #   url-redirect-probe-timeout: 5s     # 单候选探测预算：响应头 5s 未就绪即硬失败快切下一候选
   #   url-redirect-hedge-delay: 2s       # 候选阶梯竞速：每 2s 放行下一个候选并发探测，先过判据者胜出
   #   url-redirect-item-error-retry: 1   # 镜像站偶发抖动：候选失败后原地重试一次（硬失败跳过）
   #   url-redirect-all-error-retry: 1    # 整轮候选全败后再整体重试一轮
   #   # ---- 慢速升级多源并发续传（仅 type=docker 生效；含义见顶部全局说明） ----
   #   # 竞速胜出的镜像站拉 blob 太慢时（10s 窗口平均 < 1MB/s），其余镜像站并发 Range 续传
-  #   # 合并提速；慢源超过 8MB 落后被剪枝。slow-download-speed: 0 可显式关闭整个特性
+  #   # 合并提速；慢源超过 8MB 落后被剪枝。slow-download-speed: 0 可显式关闭整个特性。
+  #   # ⚠ 本规则的 type 不是 docker（或没写）时，下面四个参数静默不生效（不报错、不打日志）
   #   slow-download-speed: 1MB           # 判慢阈值（B/s；<=0 关闭特性）
   #   slow-download-window: 10s          # 判速滑动窗口（启用时最小 1s）
   #   slow-download-min-remaining: 64MB  # 剩余量不足不升级（0 = 不设门槛）
@@ -423,8 +455,22 @@ domain-rules:
   #     - template: https://docker.1ms.run/$http.server.header.full_url_no_server
   #     - template: https://docker.actima.top/$http.server.header.full_url_no_server
   #       insecure-skip-verify: true   # 仅这个镜像站证书不受信，候选级精确开启
+  #     # 内网 kspeeder（如 https://kspeeder.common-all:5443）：地址里的主机名不在它证书的
+  #     # SAN 里（证书只对 *.linkease.net 有效）→ 必须给该候选显式 insecure-skip-verify: true，
+  #     # 否则每次 TLS 握手都失败、还会按 url-redirect-item-error-retry 原地反复重试（纯噪音，
+  #     # 该候选永远不可能胜出）。若该服务有证书匹配的域名，改成那个域名比关校验更安全：
+  #     #   - template: https://kspeeder.linkease.net:5443/$http.server.header.full_url_no_server
+  #     - template: https://kspeeder.common-all:5443/$http.server.header.full_url_no_server
+  #       insecure-skip-verify: true   # 证书里的域名与地址不匹配（非证书链不全），必需
+  #     # ⚠ docker 规则（路径目标）下绝不要写 `template: $1`：$1 是「不带 scheme 的路径串」
+  #     #（如 v2/xxx/blobs/sha256:...），回源必然报 unsupported protocol scheme "" 失败，
+  #     # 属永远失败的噪音候选。$1 只对完整 URL 目标（web 规则）有意义（见 README 说明）。
+  #     # 想让 Docker Hub 官方 registry 也作为候选兜底，写完整模板并给该候选配代理：
+  #     - template: https://registry-1.docker.io/$http.server.header.full_url_no_server
+  #       http-proxy: socks5://127.0.0.1:1080
   #     # 候选级 http-proxy 与超时（三级优先级：候选 > 规则 > 全局；仅该候选生效）：
-  #     # 慢代理候选单独走 socks5 并放宽超时（直连候选保持规则级 5s 探测预算快速失败）；
+  #     # 慢代理候选单独走 socks5 并放宽超时（直连候选不显式配置探测预算时：manifest 用 5s
+  #     # 快速失败、blob 用 30s 大文件缺省）；
   #     # 候选 http-proxy 显式写 ""（空串）= 该候选强制直连（覆盖规则/全局代理）
   #     - template: https://slow.via-proxy.example/$http.server.header.full_url_no_server
   #       http-proxy: socks5://127.0.0.1:1080

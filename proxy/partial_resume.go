@@ -34,8 +34,14 @@
 //     错位，因此非 206 一律安全降级（丢弃半截走既有全量回源路径，绝不给客户端错误数据）；
 //   - 半截为 0 字节直接丢弃；上游 416（起点 ≥ 总长，而半截是合法前缀）证明半截已完整，
 //     直接读回写缓存回放，不再全量下载；
-//   - 客户端带 Range 的请求维持现状（206 透传，不做本地拼接，不写半截）——docker 重试
-//     时既有 206 机制已兜底；no-cache / 关缓存等 BYPASS 请求同样维持既有行为；
+//   - 客户端带 Range 的请求按起点与半截长度的关系分流（见 client_range.go）：
+//     起点 0（`bytes=0-`）等价于完整 GET——handleGet 入口剥离 Range 后按完整 GET 处理，
+//     半截照常保留、照常无感续传（docker/containerd 首次拉 blob 就带它）；
+//     起点 >0 且 起点 <= 半截长度（无缺口）——复用本文件的续传执行方：从半截的起点
+//     位置回放 + 上游剩余区间续传拼接，对客户端回 206（内部仍按完整 blob 拼接并写缓存）；
+//     起点 >0 但 起点 > 半截长度（中间缺一段，不能凭空补）——维持旧版 206 透传，只打
+//     Warn 说明缺口大小；
+//     no-cache / 关缓存等 BYPASS 请求维持既有行为；
 //   - 续传路径不叠加 slowdownload 慢速升级多源并发续传（与预取一路同一取舍：上游速率
 //     由续传那一路决定，过慢靠截断 + docker Range 重试兜底）。
 //
@@ -78,10 +84,20 @@ import (
 // PREFETCH 风格一致的新值，标示本次内容来自「半截前缀回放 + 断点续传实时拼接」。
 const resumeCacheStatus = "RESUME"
 
-// resumeScanBudget 续传候选扫描的整体预算（全部候选轮询完的上限，到期按超时类失败
-// 收场并降级既有全量回源；半截保留不受影响）。取值沿用既有 candidateScanBudget
-// （20s，与 docker 客户端约 30s 响应头超时的匹配依据一致，见 candidates.go）。
-const resumeScanBudget = candidateScanBudget
+// errBlobRangeUnavailable 客户端区间请求（起点 >0 的 blob Range）无法由本地半截续传满足：
+// 典型是上游 206 没带可解析的 Content-Range（对象总长未知）——此时给不出合法的
+// Content-Range / Content-Length，绝不 commit（半截前缀长度 ≠ 对象总长）。此刻未向客户端
+// 写出任何字节，调用方按旧版 206 透传兜底（语义与旧版完全一致）。
+var errBlobRangeUnavailable = errors.New("本地半截无法满足客户端区间请求")
+
+// resumeScanBudgetFor 续传候选扫描的整体预算（全部候选轮询完的上限，到期按超时类失败
+// 收场并降级既有全量回源；半截保留不受影响）。续传只服务 docker blob，故按 blob 的
+// 放大预算算（candidates.go 的 blobCandidateScanBudget：60s 起，随候选数×hedge 与候选
+// 探测预算动态放大）——旧的固定 20s 会在「7 个候选 × 慢上游」的现场场景里，于某个慢
+// 候选的 206 到手之前就退出扫描（随后降级全量回源 = 又从头下一遍，等于半截白留）。
+func resumeScanBudgetFor(n int, eff config.Options) time.Duration {
+	return blobCandidateScanBudget(n, eff)
+}
 
 // parseDockerBlobTarget 判断路径目标是否为 docker blob 请求并拆出 digest：形如
 // v2/<name>/blobs/<digest>（target 为 ExtractTarget 输出的路径目标原文：不带 scheme
@@ -239,8 +255,11 @@ func (s *Server) appendPartChunk(disk *cache.Cache, key string, f *os.File, expe
 }
 
 // captureStreamPartial 流式回源失败后的 blob 半截保留入口（fetchViaCandidatesStreaming
-// 的「commit 后读上游失败」与「客户端断开终止」出口调用）：仅 blob 目标 + 全局开关开启 +
-// 无客户端 Range 时保留前缀；manifest 会变不适用（仅 blob 启用）。写入按进度不回退规则
+// 的「commit 后读上游失败」与「客户端断开终止」出口调用）：仅 blob 目标 + 全局开关开启时
+// 保留前缀；manifest 会变不适用（仅 blob 启用）。带 Range 的请求原则上不保留（它的语义是
+// 「我要某一段」，与「整 blob 前缀」不同）——唯一例外是「docker blob 目标 + Range 起点 0」：
+// 它等价于完整 GET（见 client_range.go），断在半路的字节就是合法的整 blob 前缀，必须保留，
+// 否则下次重试又从 0 开始（现场 302MB 层白扔 30MB 的根因之一）。写入按进度不回退规则
 // （savePartialPart）。返回值 kept：true = 半截保留生效，false = 不适用或落盘失败——
 // 供断开终止出口的运维事件日志字段（partial）区分「保留成功 / 不适用」。
 func (s *Server) captureStreamPartial(sink *partialSink, r *http.Request, target string, data []byte) (kept bool) {
@@ -251,7 +270,13 @@ func (s *Server) captureStreamPartial(sink *partialSink, r *http.Request, target
 		return false // 全局开关关闭：维持既有「失败即丢弃」行为
 	}
 	if r.Header.Get("Range") != "" {
-		return false // 防御：带 Range 的请求维持 206 透传不做本地半截（入口分流本不会带 sink）
+		// 防御：带 Range 的请求默认不保留半截（入口分流本不会给它们注入 sink）。
+		// 例外 = blob 目标 + 起点 0（等价完整 GET）：保留半截，下次重试从断点无感续传。
+		// 注：正常链路里 handleGet 已在入口把这种 Range 从请求头剥离（内部按完整 GET 回源），
+		// 此分支是不依赖剥离顺序的兜底（请求对象被直接构造 / 未来新增调用方时同样正确）。
+		if _, ok := parseZeroRangeBlob(r, target); !ok {
+			return false
+		}
 	}
 	// 客户端主路径半截保留：解析镜像名与 digest 作为日志统一标签（source=client）
 	name, digest, ok := parseDockerBlobNameDigest(target)
@@ -266,7 +291,7 @@ func (s *Server) captureStreamPartial(sink *partialSink, r *http.Request, target
 // scanResumeCandidate 续传候选轮询扫描：按 round-robin 起始下标（共用 s.rr 计数器，
 // 与既有候选管线同一负载轮询语义）逐个候选发 `Range: bytes=<partSize>-`（复用
 // startUpstream 公共底层：候选级超时覆盖 / http-proxy / insecure TLS / 401 匿名
-// token dance 全复用），整体受 resumeScanBudget 兜底。逐候选失败不中断轮询（换下一
+// token dance 全复用），整体受 resumeScanBudgetFor（blob 放大预算）兜底。逐候选失败不中断轮询（换下一
 // 候选重试语义与既有管线一致）。返回值：
 //   - res：首个通过校验的 206 探测结果（活体 body 所有权移交调用方；complete=true 时为 nil）
 //   - total：对象总长（206 Content-Range 的 total；不可知为 -1，调用方流式不设 Content-Length）
@@ -297,7 +322,8 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 	// 的 onClose(cancelBase) 同款）：命中 206 的出口把 cancel 挂 upRes.onClose，
 	// 随调用方流结束/放弃的 Close 统一释放；416 / 扫描全败 / 预算耗尽等不返回
 	// 活体 body 的出口显式 cancel()，绝不泄漏。
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), resumeScanBudget)
+	scanBudget := resumeScanBudgetFor(n, eff)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), scanBudget)
 
 	var lastErr error
 	for i := 0; i < n; i++ {
@@ -306,7 +332,7 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 		}
 		idx := (start + i) % n
 		cand := candidates[idx]
-		upRes, uerr := s.startUpstream(ctx, r, cand, eff, rangeHeader, nil)
+		upRes, uerr := s.startUpstream(ctx, r, cand, eff, rangeHeader, nil, nil)
 		if uerr != nil {
 			lastErr = uerr
 			s.log.Debug("blob 半截续传候选请求失败，轮询下一候选",
@@ -366,25 +392,45 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 //  3. 候选轮询 Range 续传扫描（scanResumeCandidate）：全部失败按失败类别降级——上游
 //     明确拒绝按断点续传（非 206）丢弃半截、网络/超时保留半截，均走既有全量回源兜底
 //     （commit 前未向客户端写过任何字节，行为与旧版一致）；
-//  4. 扫描发现半截已完整（上游 416）：读回半截写缓存并回放，不再全量下载；
-//  5. 206 且起点匹配（commit 前置校验）：合成完整 200 响应头（Content-Length=总长，
-//     剔除上游 206 的 Content-Range），对客户端 commit 一次完整 200；
-//  6. 回放半截前缀（写锁内整读、锁外写客户端——慢客户端不拖住写锁），随后流式读取
-//     上游剩余区间：逐块「追加写半截文件 → 广播增量给搭车订阅者 → 写客户端与累积缓冲」
-//     （先磁盘后推进 written，是搭车订阅者读前缀的既有契约）；
+//  4. 扫描发现半截已完整（上游 416）：读回半截写缓存并回放（区间请求按区间切片回 206），
+//     不再全量下载；
+//  5. 206 且起点匹配（commit 前置校验）：合成响应头（剔除上游 206 的 Content-Range）——
+//     缺省对客户端 commit 一次完整 200（Content-Length=总长）；cr 非空（客户端区间请求，
+//     起点 >0）时 commit 206 + Content-Range，body 只发区间内字节；
+//  6. 回放半截前缀（写锁内整读、锁外按客户端区间窗口写客户端——慢客户端不拖住写锁），
+//     随后流式读取上游剩余区间：逐块「追加写半截文件 → 广播增量给搭车订阅者 → 写客户端
+//     与累积缓冲」（先磁盘后推进 written，是搭车订阅者读前缀的既有契约）；
 //  7. EOF 且累积长度与总长一致：半截内容 = 完整 blob，复用 finalize（既有 cache.Set
 //     语义）原子写缓存（blob 落盘成功即删半截，见 finalizeFetchEntry 钩子），置 done
 //     关闭订阅（搭车方收完缓冲内增量即完整）；
 //  8. 任何失败：保留更新后的半截文件、广播 failed 并移除条目、本次响应被截断（docker
 //     以 Range 断点续传重试，下次从更长前缀接着续传——进度不回退）。
 //
+// 可选参数 cr（variadic，既有调用方不受影响）：客户端区间请求（起点 >0 的 blob Range，
+// 见 client_range.go）。非空时对客户端回 206 且只发区间内字节，内部仍按完整 blob 拼接
+// 并照常写缓存（缓存条目必须是完整 blob，后续任意起点才能直接本地切片秒回）；上游 206
+// 拿不到对象总长时绝不 commit（半截前缀长度不等于总长），返回 errBlobRangeUnavailable
+// 让调用方走旧版 206 透传。
+//
 // 返回值语义与 fetchViaCandidatesStreaming 一致：committed=true 表示已向客户端写出
 // 响应头（调用方不得再 writeError）。不叠加 slowdownload 慢速升级多源并发续传
 // （取舍见文件头边界说明）。
-func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key, target, digest string, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry)) (*cache.Entry, bool, error) {
+func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key, target, digest string, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry), cr ...blobRangeSpec) (*cache.Entry, bool, error) {
 	// docker 日志统一标签：续传请求必然是 /v2/ blob 目标，按需解析 image/digest
 	//（本函数全部执行方日志统一 source=resume，见 log_attrs.go）
 	labels := parseDockerLogInfo(target)
+	// 客户端区间窗口（缺省 = 旧版完整 200 语义）：clientStart 之前的字节跳过、clientLast
+	// 之后的字节不再写给客户端；两者都不影响内部累积（accum / 半截文件始终是完整 blob）
+	hasRange := len(cr) > 0
+	var spec blobRangeSpec
+	clientStart, clientLast := int64(0), int64(-1)
+	if hasRange {
+		spec = cr[0]
+		clientStart = spec.start
+		if spec.hasEnd {
+			clientLast = spec.end
+		}
+	}
 	// 重查半截前缀：前置检查与成为执行方之间可能被并发流程消费（前一个执行方完成
 	// 写缓存并删半截等），竞态按既有全量回源兜底（行为与旧版一致）
 	n, ok := disk.PartSize(key)
@@ -428,14 +474,29 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 	}
 	if complete {
-		// 半截已完整（上游 416 证实）：读回半截写缓存并回放
-		return s.serveResumeComplete(w, r, key, target, digest, ent, eff, disk, start, finalize)
+		// 半截已完整（上游 416 证实）：读回半截写缓存并回放（区间请求按区间切片回 206）
+		return s.serveResumeComplete(w, r, key, target, digest, ent, eff, disk, start, finalize, cr...)
 	}
 
-	// 合成完整 200 响应头（对客户端绝不透传 206 语义）：沿用上游响应头（Content-Type /
-	// Docker-Content-Digest / ETag 等），剔除 Content-Range、Content-Length 重置为总长
-	//（拿不到总长则不设，Go 按 chunked 编码流式传输）。hdr 为本次探测独立深拷贝，
-	// 构建后只读（直接共享给缓存条目与搭车快照，与既有 probeResult.header 用法一致）
+	if hasRange && total <= 0 {
+		// 客户端区间请求必须有总长才能给出合法的 Content-Range / Content-Length：上游 206
+		// 没带可解析的 Content-Range 时绝不 commit（半截前缀长度 ≠ 对象总长，谎报会让客户端
+		// 从错误偏移继续）。此刻未向客户端写任何字节 → 按「本地半截无法满足」收场，调用方
+		// 改走旧版 206 透传（client_range.go 的 errBlobRangeUnavailable 分支）
+		upRes.Close()
+		ent.finishFailed(errBlobRangeUnavailable)
+		s.log.Warn("blob 半截续传拿不到对象总长，无法满足客户端区间请求，改走旧版 206 透传",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest,
+				"part_bytes", n, "range_start", spec.start)...)
+		return nil, false, errBlobRangeUnavailable
+	}
+
+	// 合成（以完整 blob 为基准的）响应头：沿用上游响应头（Content-Type /
+	// Docker-Content-Digest / ETag 等），剔除上游 206 的 Content-Range、Content-Length
+	// 重置为总长（拿不到总长则不设，Go 按 chunked 编码流式传输）。完整 GET 时它直接作为
+	// 客户端的 200 响应头；区间请求（cr 非空）时 commitResumeHeader 会把它改写成 206 +
+	// 区间 Content-Range/Content-Length（上游 206 语义绝不透传给客户端）。
+	// hdr 为本次探测独立深拷贝，构建后只读（直接共享给缓存条目与搭车快照）。
 	hdr := upRes.header.Clone()
 	hdr.Del("Content-Range")
 	if total > 0 {
@@ -457,13 +518,17 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		return nil, true, cause
 	}
 
-	// commit 点：对客户端回一次完整 200（本地前缀回放 + 上游剩余实时拼接，docker 无需
-	// 支持 Range）。此后响应头固化，任何失败只能截断本次响应（docker 以 Range 重试，
-	// 下次从更长前缀续传——进度不回退）
-	s.commitResumeHeader(w, hdr, upRes.url, total)
-	s.log.Info("blob 半截续传开始（回放半截前缀+实时拼接剩余区间，上游仅此一路 Range 续传）",
-		labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "part_bytes", n, "total", total,
-			"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)...)
+	// commit 点：缺省回一次完整 200（本地前缀回放 + 上游剩余实时拼接，docker 无需支持
+	// Range）；cr 非空（客户端区间请求）回 206 + Content-Range，body 只含区间内字节。
+	// 此后响应头固化，任何失败只能截断本次响应（docker 以 Range 重试，下次从更长前缀
+	// 续传——进度不回退）
+	s.commitResumeHeader(w, hdr, upRes.url, total, cr...)
+	startArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "part_bytes", n, "total", total,
+		"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)
+	if hasRange {
+		startArgs = append(startArgs, "range_start", clientStart, "range_end", clientLast)
+	}
+	s.log.Info("blob 半截续传开始（回放半截前缀+实时拼接剩余区间，上游仅此一路 Range 续传）", startArgs...)
 
 	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始写即登记
 	// source=resume，初始已下载字节 = 半截前缀 n（进度不回退，percent 直接对总长），
@@ -488,14 +553,32 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	}
 	accum := bytes.NewBuffer(make([]byte, 0, int(n)+streamChunkSize))
 	clientOK := true // 客户端写失败（docker 已断开）后置 false：继续读完上游只填缓存（与既有语义一致）
-	accum.Write(prefix[:n])
-	if n > 0 {
-		if _, werr := w.Write(prefix[:n]); werr != nil {
+	// writeClient 按客户端区间窗口把「完整 blob 中偏移 off 起的 p」写给客户端：起点之前的
+	// 字节跳过、终点之后的字节不再写；内部累积（accum 与半截文件）始终是完整 blob——缓存
+	// 条目必须完整，后续任意起点才能直接本地切片秒回（客户端只收区间内字节）。
+	// 完整 GET（无 cr）时窗口 = [0, +∞)，等价于原来的 w.Write(p)。
+	writeClient := func(off int64, p []byte) {
+		if !clientOK || len(p) == 0 {
+			return
+		}
+		lo, hi := off, off+int64(len(p)) // 该块在完整 blob 中的半开区间 [lo, hi)
+		if lo < clientStart {
+			lo = clientStart
+		}
+		if clientLast >= 0 && hi > clientLast+1 {
+			hi = clientLast + 1
+		}
+		if hi <= lo {
+			return // 整块都在客户端区间之外：只进缓存/半截，不写客户端
+		}
+		if _, werr := w.Write(p[lo-off : hi-off]); werr != nil {
 			clientOK = false
 			s.log.Warn("写响应体失败（客户端已断开，续传继续只填缓存）",
 				labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200), "err", werr)...)
 		}
 	}
+	accum.Write(prefix[:n])
+	writeClient(0, prefix[:n])
 
 	// 追加写句柄：上游剩余区间逐块追加到半截文件（O_APPEND 顺序追加 + 每块大小一致性
 	// 校验，见 appendPartChunk）
@@ -535,6 +618,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	//「追加半截 → 广播增量 → 写客户端与累积缓冲」
 	written := n // 追加游标 = 半截文件当前字节数（appendPartChunk 以此做一致性校验）
 	writeRemainChunk := func(p []byte) error {
+		off := written // 该块在完整 blob 中的起始偏移（= 追加前的半截长度）
 		if aerr := s.appendPartChunk(disk, key, paf, written, p); aerr != nil {
 			return aerr
 		}
@@ -544,13 +628,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			return fmt.Errorf("blob 半截续传广播失败: %w", berr)
 		}
 		accum.Write(p)
-		if clientOK {
-			if _, werr := w.Write(p); werr != nil {
-				clientOK = false
-				s.log.Warn("写响应体失败（客户端已断开，续传继续只填缓存）",
-					labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200), "err", werr)...)
-			}
-		}
+		writeClient(off, p)
 		return nil
 	}
 	if len(upRes.first) > 0 {
@@ -619,19 +697,28 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 一小段时间供并发 MISS 兜底检出「done → 直接 HIT」，到期自动移除（不碰半截文件）
 	ent.finishDone()
 
-	s.log.Info("blob 半截续传完成（半截前缀+剩余区间拼出完整 blob 并已写缓存）",
-		labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", accum.Len(),
-			"part_bytes", n, "upstream", upRes.url,
-			"cost", time.Since(start).Round(time.Millisecond).String())...)
+	// 客户端实际收到的状态码与字节数：区间请求是 206 + 区间长度，完整 GET 是 200 + 总长
+	respStatus, sentBytes := http.StatusOK, int64(accum.Len())
+	if hasRange {
+		respStatus = http.StatusPartialContent
+		sentBytes = blobRangeLast(spec, int64(accum.Len())) - clientStart + 1
+	}
+	doneArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", accum.Len(),
+		"part_bytes", n, "upstream", upRes.url,
+		"cost", time.Since(start).Round(time.Millisecond).String())
+	if hasRange {
+		doneArgs = append(doneArgs, "range_start", clientStart, "sent", sentBytes)
+	}
+	s.log.Info("blob 半截续传完成（半截前缀+剩余区间拼出完整 blob 并已写缓存）", doneArgs...)
 	s.log.Info("代理请求完成",
 		labels.attrs(dockerLogSourceResume,
 			"method", r.Method,
 			"target", truncate(r.URL.Path, 300),
-			"status", http.StatusOK,
+			"status", respStatus,
 			"cache", resumeCacheStatus,
 			"upstream", upRes.url,
 			"rule", eff.Rule,
-			"bytes", accum.Len(),
+			"bytes", sentBytes,
 			"cost", time.Since(start).Round(time.Millisecond).String(),
 		)...)
 	return entry, true, nil
@@ -641,7 +728,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 // 语义 = 请求起点不小于对象总长，而半截是同 digest 内容的合法前缀（起点 ≤ 总长），
 // 只能 n == total——半截即完整 blob。直接读回半截写缓存并回放（X-Cache: RESUME），
 // 不再全量下载。读回失败降级既有全量回源兜底（半截保留）。
-func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key, target, digest string, ent *prefetchStreamEntry, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry)) (*cache.Entry, bool, error) {
+// 可选 cr（客户端区间请求，起点 >0）：写缓存后按区间切片回 206（serveEntryBlobRange），
+// 而不是回完整 200——语义与兼容两条路径一致（内容都是完整 blob 原文）。
+func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key, target, digest string, ent *prefetchStreamEntry, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry), cr ...blobRangeSpec) (*cache.Entry, bool, error) {
 	labels := parseDockerLogInfo(target) // 日志统一标签（执行方日志统一 source=resume）
 	data, rerr := os.ReadFile(disk.PartPath(key))
 	if rerr != nil {
@@ -664,30 +753,57 @@ func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key
 	// blob 落盘成功即删半截见 finalizeFetchEntry 钩子）
 	s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume)
 	ent.finishDone()
-	s.log.Info("blob 半截续传完成（半截已完整，整体回放写缓存）",
-		labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", len(data),
-			"cost", time.Since(start).Round(time.Millisecond).String())...)
+	// 回放方式按请求语义定：区间请求（起点 >0）切片回 206，其余保持完整 200 回放；
+	// 起点越界按 RFC 回 416（serveEntryBlobRange 内部同样按 416 处理），日志字节数为 0
+	respStatus, sentBytes := http.StatusOK, int64(len(data))
+	if len(cr) > 0 && int64(len(data)) > 0 {
+		spec := cr[0]
+		switch {
+		case spec.start >= int64(len(data)):
+			respStatus, sentBytes = http.StatusRequestedRangeNotSatisfiable, 0
+		default:
+			respStatus = http.StatusPartialContent
+			sentBytes = blobRangeLast(spec, int64(len(data))) - spec.start + 1
+		}
+	}
+	doneArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", len(data),
+		"cost", time.Since(start).Round(time.Millisecond).String())
+	if len(cr) > 0 {
+		doneArgs = append(doneArgs, "range_start", cr[0].start, "sent", sentBytes)
+	}
+	s.log.Info("blob 半截续传完成（半截已完整，整体回放写缓存）", doneArgs...)
 	s.log.Info("代理请求完成",
 		labels.attrs(dockerLogSourceResume,
 			"method", r.Method,
 			"target", truncate(r.URL.Path, 300),
-			"status", http.StatusOK,
+			"status", respStatus,
 			"cache", resumeCacheStatus,
 			"upstream", entry.Source,
 			"rule", eff.Rule,
-			"bytes", len(data),
+			"bytes", sentBytes,
 			"cost", time.Since(start).Round(time.Millisecond).String(),
 		)...)
+	if len(cr) > 0 {
+		// 区间请求：缓存条目已就绪，直接本地切片回 206（绝不发上游）
+		s.serveEntryBlobRange(w, r, entry, cr[0], resumeCacheStatus, eff, start)
+		return entry, true, nil
+	}
 	s.serveEntry(w, r, entry, resumeCacheStatus, eff, start)
 	return entry, true, nil
 }
 
-// commitResumeHeader 续传执行方对客户端的 commit 点：对客户端回一次完整 200（客户端
-// 无需支持 Range）——沿用 skipResponseHeader 过滤逐跳头与自管头（上游 206 的
-// Content-Range 已由调用方在 hdr 中剔除；Content-Length 在过滤名单内由下方按总长补回），
-// X-Cache 用 RESUME 观测值、X-Proxy-Upstream 观测来源候选。调用后响应头固化，后续失败
-// 只能截断本次响应（docker 以 Range 重试，从更长前缀续传，进度不回退）。
-func (s *Server) commitResumeHeader(w http.ResponseWriter, hdr http.Header, source string, total int64) {
+// commitResumeHeader 续传执行方对客户端的 commit 点——沿用 skipResponseHeader 过滤逐跳头
+// 与自管头（上游 206 的 Content-Range 已由调用方在 hdr 中剔除），X-Cache 用 RESUME 观测值、
+// X-Proxy-Upstream 观测来源候选。两种语义：
+//   - 缺省（无 cr，客户端发的是完整 GET）：对客户端回一次完整 200，Content-Length = 总长
+//     （客户端无需支持 Range）；
+//   - cr 非空（客户端区间请求，起点 >0）：回 206 + `Content-Range: bytes <start>-<last>/<total>`，
+//     并补 `Accept-Ranges: bytes`、Content-Length 收窄为区间长度——调用方保证 total > 0
+//     （拿不到总长时不会走到 commit，见 resumeBlobStreaming 的 errBlobRangeUnavailable 分支）。
+//
+// 调用后响应头固化，后续失败只能截断本次响应（docker 以 Range 重试，从更长前缀续传，
+// 进度不回退）。
+func (s *Server) commitResumeHeader(w http.ResponseWriter, hdr http.Header, source string, total int64, cr ...blobRangeSpec) {
 	h := w.Header()
 	for k, vv := range hdr {
 		if skipResponseHeader(k) {
@@ -701,30 +817,48 @@ func (s *Server) commitResumeHeader(w http.ResponseWriter, hdr http.Header, sour
 	if source != "" {
 		h.Set("X-Proxy-Upstream", source) // 观测续传命中的候选 URL
 	}
-	if total > 0 {
-		h.Set("Content-Length", strconv.FormatInt(total, 10)) // 一次完整 200 的总长
+	if len(cr) == 0 {
+		if total > 0 {
+			h.Set("Content-Length", strconv.FormatInt(total, 10)) // 一次完整 200 的总长
+		}
+		w.WriteHeader(http.StatusOK)
+		return
 	}
-	w.WriteHeader(http.StatusOK)
+	spec := cr[0]
+	last := blobRangeLast(spec, total)
+	h.Set("Accept-Ranges", "bytes")
+	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", spec.start, last, total))
+	h.Set("Content-Length", strconv.FormatInt(last-spec.start+1, 10))
+	w.WriteHeader(http.StatusPartialContent)
 }
 
 // //////////////////  客户端请求入口  //////////////////////////////////////////////////////////
 
 // tryServeBlobResume 客户端 blob GET 缓存 MISS 后的「半截续传」入口（handleGet 在在途
-// 预取搭车检查之后调用；调用位置保证：路径目标无 Range 完整 GET、缓存可读、正式缓存
-// MISS）。返回 handled=true 表示本次请求已由续传路径处理（含内部降级后的既有全量
-// 回源），调用方直接返回；false = 续传不适用（非 blob / 开关关闭 / 无半截文件 / 半截
-// 为空），行为与旧版完全一致。
+// 预取搭车检查之后调用；调用位置保证：路径目标 GET、缓存可读、正式缓存 MISS）。
+// 返回 handled=true 表示本次请求已由续传路径处理（含内部降级后的既有全量回源 / 区间透传），
+// 调用方直接返回；false = 续传不适用（非 blob / 开关关闭 / 无半截文件 / 半截为空 /
+// 区间请求起点超出半截长度），行为与旧版完全一致。
+//
+// 可选参数 cr（variadic，既有调用方不受影响）：客户端区间请求（起点 >0 的 blob Range，
+// 见 client_range.go）。非空时本路径对客户端回 206 且只发区间内字节：
+//   - 起点 <= 半截长度（无缺口）：复用续传执行方（本地半截从起点回放 + 上游剩余区间续传
+//     拼接），执行方内部仍按完整 blob 拼接并写缓存；
+//   - 起点 > 半截长度（中间缺一段，不能凭空补）：打一条 Warn 说明缺口大小后返回 false，
+//     调用方维持旧版 206 透传（不写缓存、不保留半截）。
 //
 // 时序（全部编排在同 key 既有 flightGroup 上——谁先到谁执行、其余等待共享结果，与
 // 预取/客户端回源的合并语义一致，上游对该 blob 只有一路下载）：
-//  1. 前置检查：blob 语义、全局开关、半截文件存在且非空（空半截立即丢弃）；
+//  1. 前置检查：blob 语义、全局开关、半截文件存在且非空（空半截立即丢弃）、区间请求的
+//     起点与半截长度的对齐（缺口即不接管）；
 //  2. flight.DoLimit：首个调用方成为续传执行方（resumeBlobStreaming），其余同 key
 //     请求成为等待方（等待上限 flightWaitLimit，与既有流式回源一致）；
-//  3. 等待方超限：先查续传 hub 条目搭车（tryServeFromPrefetchHub，前缀+增量拼接，
-//     X-Cache: PREFETCH——续传条目在执行方扫描候选前已登记，搭车窗口覆盖整个续传
-//     过程）；搭不上（执行方已失败移除）再走既有全量回源兜底（失败捕获会把更长前缀
-//     存回半截，进度不回退）。
-func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key, target string, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry), streamingError func(error, bool)) bool {
+//  3. 等待方超限：完整 GET 先查续传 hub 条目搭车（tryServeFromPrefetchHub，前缀+增量
+//     拼接，X-Cache: PREFETCH——续传条目在执行方扫描候选前已登记，搭车窗口覆盖整个续传
+//     过程），搭不上（执行方已失败移除）再走既有全量回源兜底（失败捕获会把更长前缀
+//     存回半截，进度不回退）；区间请求不搭车（搭车只提供从 0 起的完整内容），直接走
+//     旧版 206 透传兜底（rangePassthrough）。
+func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key, target string, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry), streamingError func(error, bool), cr ...blobRangeSpec) bool {
 	if disk == nil {
 		return false // 防御：缓存不可读时不适用（handleGet 已分流）
 	}
@@ -735,16 +869,41 @@ func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key,
 	if !ok {
 		return false // 非 blob（manifest 会变等）：半截保留与续传仅对 blob 启用
 	}
-	if n, pok := disk.PartSize(key); !pok || n <= 0 {
+	// 客户端区间请求（起点 >0）：本路径要么完整满足（206 拼接），要么交回调用方旧版透传
+	hasRange := len(cr) > 0
+	var spec blobRangeSpec
+	if hasRange {
+		spec = cr[0]
+	}
+	n, pok := disk.PartSize(key)
+	if !pok || n <= 0 {
 		if pok {
 			// 空半截（0 字节）：立即丢弃（无续传价值），走既有全量回源
 			disk.RemovePart(key)
 		}
 		return false
 	}
+	if hasRange && spec.start > n {
+		// 起点超出了本地半截：中间缺的这段没有任何本地来源，不能凭空补（拼上去就是损坏
+		// 内容）。维持旧版 206 透传（Range 原样发上游），这里留一条 Warn 说明缺口大小——
+		// 运维据此判断「半截为什么没帮上忙」（通常是上次中断在更早的位置）。
+		s.log.Warn("blob 区间请求起点超出本地半截长度（中间缺一段，无法凭空补齐），本次维持旧版 206 透传",
+			parseDockerLogInfo(target).attrs(dockerLogSourceClient, "rule", eff.Rule,
+				"range_start", spec.start, "part_bytes", n, "gap_bytes", spec.start-n,
+				"target", truncate(target, 300))...)
+		return false
+	}
+
+	// rangePassthrough 区间请求的兜底：恢复旧版「Range 原样透传上游 206」行为（不写缓存、
+	// 不保留半截），语义与 handleGet 的 request-range BYPASS 分支一致。只在尚未向客户端
+	// 写出任何字节时调用（commit 之后的失败绝不能走这里，见各分支）。
+	rangePassthrough := func() {
+		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "BYPASS", nil, start)
+		streamingError(ferr, committed)
+	}
 
 	e, executed, err := s.flight.DoLimit(key, flightWaitLimit, func() (*cache.Entry, error) {
-		ent, committed, ferr := s.resumeBlobStreaming(w, r, key, target, digest, eff, disk, start, finalize)
+		ent, committed, ferr := s.resumeBlobStreaming(w, r, key, target, digest, eff, disk, start, finalize, cr...)
 		if ferr != nil && committed {
 			// 已 commit 后失败：响应头已固化，标记与既有流式执行方同款（不得再 writeError）
 			return nil, fmt.Errorf("%w: %v", errStreamingCommitted, ferr)
@@ -753,6 +912,14 @@ func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key,
 	})
 	switch {
 	case errors.Is(err, errFlightWaitTimeout):
+		if hasRange {
+			// 区间请求不搭车（搭车提供的是从 0 起的完整内容）：直接按旧版 206 透传兜底
+			s.log.Warn("等待同 blob 半截续传超限（区间请求不搭车），改走旧版 206 透传",
+				parseDockerLogInfo(target).attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+					"wait", flightWaitLimit.String(), "range_start", spec.start, "target", truncate(target, 300))...)
+			rangePassthrough()
+			return true
+		}
 		// 等待续传执行方超限：先查续传 hub 条目搭车（条目在执行方扫描候选前已登记，
 		// 覆盖整个续传窗口）；搭不上（执行方已失败移除）走既有全量回源兜底
 		if s.tryServeFromPrefetchHub(w, r, key, target, eff, disk, start) {
@@ -764,6 +931,14 @@ func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key,
 				"rule", eff.Rule, "key", key, "wait", flightWaitLimit.String(), "target", truncate(target, 300))...)
 		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 		streamingError(ferr, committed)
+	case errors.Is(err, errBlobRangeUnavailable):
+		// 区间请求无法由本地半截满足（上游 206 未带可解析总长等）：未 commit，按旧版 206
+		// 透传兜底（语义与旧版完全一致；绝不 commit 一个总长错误的 206）
+		s.log.Warn("blob 半截续传无法满足客户端区间请求，改走旧版 206 透传",
+			parseDockerLogInfo(target).attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+				"range_start", spec.start, "part_bytes", n, "target", truncate(target, 300))...)
+		rangePassthrough()
+		return true
 	case errors.Is(err, errStreamingCommitted):
 		// 本调用是续传执行方且 commit 后失败：底层原因已留痕（读上游失败=Error、客户端
 		// 断开=Warn 运维事件），响应头已写出（本次响应被截断，docker 会以 Range 断点续传
@@ -772,11 +947,20 @@ func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key,
 		// 未 commit 失败：走 streamingError 一致出口（上游明确 4xx 透传 / 其余 502）
 		streamingError(err, false)
 	case executed:
-		// 本调用是续传执行方：响应已直接写给客户端（commit 200 + 拼接回放），无需再回放
+		// 本调用是续传执行方：响应已直接写给客户端（commit + 拼接回放），无需再回放
 	default:
-		// 等待方共享到执行方的完整结果：缓存此刻已就绪，按 RESUME 语义回放
+		// 等待方共享到执行方的完整结果：缓存/内容此刻已就绪，按 RESUME 语义回放
 		if e != nil {
+			if hasRange {
+				// 共享到的结果是完整 blob（执行方内部按完整 blob 拼接），本地切片回 206
+				s.serveEntryBlobRange(w, r, e, spec, resumeCacheStatus, eff, start)
+				return true
+			}
 			s.serveEntry(w, r, e, resumeCacheStatus, eff, start)
+			return true
+		}
+		if hasRange {
+			rangePassthrough() // 防御：无结果时按旧版 206 透传
 			return true
 		}
 		return false // 防御：无结果时走既有路径

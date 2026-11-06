@@ -728,7 +728,7 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 
 	// 竞速选定候选（commit 前可自由切换/重试/竞速，失败不向搭车方输出任何字节——
 	// 此时搭车方还在等快照，会按 failed 广播降级）；全败按既有路径目标语义报错
-	res, serr := s.selectCandidate(req, candidates, eff)
+	res, serr := s.selectCandidate(req, candidates, eff, target)
 	if serr != nil {
 		s.log.Warn("预取 blob 回源候选全败（路径目标无直连回退，已广播搭车订阅者降级）",
 			dockerLogAttrs(dockerLogSourcePrefetch, labels.image, "rule", eff.Rule, "digest", digest,

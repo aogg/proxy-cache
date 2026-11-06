@@ -122,7 +122,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	}
 
 	// //////////////////  竞速选定候选（commit 前，可自由切换）  start  /////////////////////////
-	res, serr := s.selectCandidate(r, candidates, eff)
+	res, serr := s.selectCandidate(r, candidates, eff, target)
 	if serr != nil {
 		// 路径目标没有完整原始 URL 可直连：fallback-direct 不适用，候选全败直接报错
 		//（错误语义与旧版 fetchViaCandidates 的路径目标分支一致）

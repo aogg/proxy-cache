@@ -19,11 +19,12 @@ package proxy
 //   6. EOF 长度不符：截断响应、不写缓存、半截保留且更长；
 //   7. 并发合并：续传进行中第二客户端搭车（X-Cache: PREFETCH、body 一致、上游对 blob
 //      仅一路 Range 请求）；同 blob 预取任务经 flightGroup 与续传合并；
-//   8. 边界：带 Range 的 GET 不触发续传（206 透传现状）、开关关闭不续传不产生半截、
-//      manifest 不产生半截；
+//   8. 边界：起点 >0 的 Range 在「无半截 / 起点超出半截（有缺口）」时维持 206 透传、
+//      起点 0 的 Range 等价完整 GET（走续传、对客户端 206 + Content-Range，绝不 BYPASS）、
+//      开关关闭不续传不产生半截、manifest 不产生半截；
 //   9. 白盒：parseDockerBlobTarget 表驱动、savePartialPart / keepPrefetchPartial 进度
-//      不回退、captureStreamPartial 门控（开关 / Range / 非 blob）、appendPartChunk 错位
-//      校验终止。
+//      不回退、captureStreamPartial 门控（开关 / Range 起点 / 非 blob）、appendPartChunk
+//      错位校验终止。
 
 import (
 	"bytes"
@@ -812,23 +813,25 @@ func rangesEqual(got, want []string) bool {
 
 // //////////////////  B8：边界  //////////////////////////////////////////////////////////////////
 
-// TestBlobResumeBoundaries 覆盖点 8：带 Range 的 GET 不触发续传（206 透传现状）、
+// TestBlobResumeBoundaries 覆盖点 8：起点 >0 的 Range 在「无半截 / 起点超出半截（缺口）」
+// 时维持旧版 206 透传、起点 0 的 Range 等价完整 GET（走续传并对客户端回 206，不再 BYPASS）、
 // 开关关闭不续传且不产生半截、manifest 不产生半截。
 func TestBlobResumeBoundaries(t *testing.T) {
-	t.Run("带Range的GET不触发续传走206透传", func(t *testing.T) {
+	t.Run("起点100超出半截_有缺口走206透传", func(t *testing.T) {
 		fx := newResumeFixture(t, nil)
 		name, digest := prefetchName, prefetchDigestLayer1
 		content := hubBlobContent(0xb1, 4096)
-		half := 1000
+		half := 40 // 半截只有 40 字节 < 客户端起点 100：中间缺 60 字节，不能凭空补
 		fx.reg.setContent(digest, content)
 		fx.reg.setChunkConfig(4096, 0)
 
 		key := prefetchBlobKey(name, digest)
 		fx.s.savePartialPart(fx.disk, key, content[:half])
 
-		// 带 Range 的 GET：BYASS 分流（Range 请求绕过缓存），206 透传现状，不做本地拼接
+		// 起点 100 > 半截 40：续传不接管（缺口无法补齐），维持旧版 206 透传——客户端
+		// Range 原样发上游、不写缓存、不消费半截，只留一条缺口 Warn 供运维定位。
 		rr := prefetchBlobTestRequest(name, digest)
-		rr.Header.Set("Range", "bytes=0-")
+		rr.Header.Set("Range", "bytes=100-")
 		w := httptest.NewRecorder()
 		fx.s.ServeHTTP(w, rr)
 
@@ -836,13 +839,16 @@ func TestBlobResumeBoundaries(t *testing.T) {
 			t.Fatalf("Code = %d, want %d（206 透传现状）, body: %s", w.Code, http.StatusPartialContent, w.Body.String())
 		}
 		if got := w.Header().Get("X-Cache"); got != "BYPASS" {
-			t.Errorf("X-Cache = %q, want BYPASS（Range 请求绕过缓存）", got)
+			t.Errorf("X-Cache = %q, want BYPASS（缺口无法补齐时维持旧版透传）", got)
 		}
-		if got := w.Body.Bytes(); !bytes.Equal(got, content) {
-			t.Errorf("206 透传 body 与上游原文不一致（got %d 字节, want %d 字节）", len(got), len(content))
+		if got := w.Header().Get("Content-Range"); got != fmt.Sprintf("bytes 100-%d/%d", len(content)-1, len(content)) {
+			t.Errorf("Content-Range = %q, want 上游 206 的 bytes 100-%d/%d", got, len(content)-1, len(content))
 		}
-		// 上游收到的是客户端自己的 Range（bytes=0-），不是续传 Range（bytes=1000-）
-		want := []string{"bytes=0-"}
+		if got := w.Body.Bytes(); !bytes.Equal(got, content[100:]) {
+			t.Errorf("206 透传 body 应为上游原文 content[100:]（got %d 字节, want %d 字节）", len(got), len(content)-100)
+		}
+		// 上游收到的是客户端自己的 Range（bytes=100-），不是续传 Range（bytes=40-）
+		want := []string{"bytes=100-"}
 		if got := fx.reg.rangesOf(digest); !rangesEqual(got, want) {
 			t.Errorf("上游收到的 Range 头 = %v, want %v（客户端 Range 原样透传）", got, want)
 		}
@@ -853,6 +859,89 @@ func TestBlobResumeBoundaries(t *testing.T) {
 		data := partBytes(t, fx.disk.PartPath(key))
 		if !bytes.Equal(data, content[:half]) {
 			t.Errorf("带 Range 的 GET 不应触碰半截（got %d 字节, want %d 字节）", len(data), half)
+		}
+	})
+
+	t.Run("无半截起点100维持206透传", func(t *testing.T) {
+		fx := newResumeFixture(t, nil)
+		name, digest := prefetchName, prefetchDigestLayer2
+		content := hubBlobContent(0xb5, 4096)
+		fx.reg.setContent(digest, content)
+		fx.reg.setChunkConfig(4096, 0)
+
+		// 无半截：续传不适用（tryServeBlobResume 直接返回 false），旧版 206 透传
+		rr := prefetchBlobTestRequest(name, digest)
+		rr.Header.Set("Range", "bytes=100-")
+		w := httptest.NewRecorder()
+		fx.s.ServeHTTP(w, rr)
+
+		if w.Code != http.StatusPartialContent {
+			t.Fatalf("Code = %d, want %d（206 透传现状）, body: %s", w.Code, http.StatusPartialContent, w.Body.String())
+		}
+		if got := w.Header().Get("X-Cache"); got != "BYPASS" {
+			t.Errorf("X-Cache = %q, want BYPASS（无半截时不接管，维持旧版透传）", got)
+		}
+		if got := w.Body.Bytes(); !bytes.Equal(got, content[100:]) {
+			t.Errorf("206 透传 body 应为上游原文 content[100:]（got %d 字节, want %d 字节）", len(got), len(content)-100)
+		}
+		want := []string{"bytes=100-"}
+		if got := fx.reg.rangesOf(digest); !rangesEqual(got, want) {
+			t.Errorf("上游收到的 Range 头 = %v, want %v（客户端 Range 原样透传）", got, want)
+		}
+		if n := fx.reg.rec.calls(digest); n != 1 {
+			t.Errorf("上游 blob 回源 %d 次, want 1", n)
+		}
+		if n := partCount(t, fx.disk.Dir()); n != 0 {
+			t.Errorf("旧版 206 透传不应产生半截文件, got %d 个", n)
+		}
+	})
+
+	t.Run("起点0等价完整GET_回206不BYPASS", func(t *testing.T) {
+		fx := newResumeFixture(t, nil)
+		name, digest := prefetchName, prefetchDigestLayer1
+		content := hubBlobContent(0xb4, 4096)
+		half := 1000
+		fx.reg.setContent(digest, content)
+		fx.reg.setChunkConfig(4096, 0)
+
+		key := prefetchBlobKey(name, digest)
+		fx.s.savePartialPart(fx.disk, key, content[:half])
+
+		// 起点 0 = 等价完整 GET（docker/containerd 首次请求的真实形态）：入口剥离 Range
+		// 后走既有半截续传（X-Cache: RESUME），响应侧改写成 206 + 完整 Content-Range；
+		// Range 绝不再透传上游（上游只收到续传自己的 Range），也不再进 BYPASS。
+		rr := prefetchBlobTestRequest(name, digest)
+		rr.Header.Set("Range", "bytes=0-")
+		w := httptest.NewRecorder()
+		fx.s.ServeHTTP(w, rr)
+
+		if w.Code != http.StatusPartialContent {
+			t.Fatalf("Code = %d, want %d（起点 0 对客户端仍是 206）, body: %s", w.Code, http.StatusPartialContent, w.Body.String())
+		}
+		if got := w.Header().Get("Content-Range"); got != fmt.Sprintf("bytes 0-%d/%d", len(content)-1, len(content)) {
+			t.Errorf("Content-Range = %q, want %q（完整 blob 总长）", got, fmt.Sprintf("bytes 0-%d/%d", len(content)-1, len(content)))
+		}
+		if got := w.Header().Get("Content-Length"); got != strconv.Itoa(len(content)) {
+			t.Errorf("Content-Length = %q, want %q（区间长度 = 总长）", got, strconv.Itoa(len(content)))
+		}
+		if got := w.Header().Get("X-Cache"); got != resumeCacheStatus {
+			t.Errorf("X-Cache = %q, want %q（起点 0 走续传，不是 BYPASS）", got, resumeCacheStatus)
+		}
+		if got := w.Body.Bytes(); !bytes.Equal(got, content) {
+			t.Errorf("body 与上游完整原文不一致（got %d 字节, want %d 字节）", len(got), len(content))
+		}
+		// 上游只收到续传 Range（起点 = 半截长度），客户端的 bytes=0- 绝不透传
+		want := []string{fmt.Sprintf("bytes=%d-", half)}
+		if got := fx.reg.rangesOf(digest); !rangesEqual(got, want) {
+			t.Errorf("上游收到的 Range 头 = %v, want %v", got, want)
+		}
+		// 续传完成后写完整缓存、半截删除
+		if _, ok := fx.disk.PartSize(key); ok {
+			t.Error("续传完成后半截应已删除")
+		}
+		e, ok := fx.disk.Get(key)
+		if !ok || !bytes.Equal(e.Body, content) {
+			t.Error("续传完成后缓存应命中且内容为完整 blob")
 		}
 	})
 
@@ -979,7 +1068,8 @@ func TestParseDockerBlobTarget(t *testing.T) {
 // TestPartialProgressNeverRegresses 白盒验证「半截进度只增不减」与写侧门控：
 //   - savePartialPart：更短前缀不覆盖、空数据不落盘、更长前缀覆盖重写；
 //   - keepPrefetchPartial：已有更长半截时预取临时文件不被改名（保留原文件）；
-//   - captureStreamPartial：开关关闭 / 客户端 Range / 非 blob 目标一律不落盘；
+//   - captureStreamPartial：开关关闭 / 客户端 Range 起点>0 / 非 blob 目标一律不落盘，
+//     而「blob + Range 起点 0」等价完整 GET，照常落盘；
 //   - appendPartChunk：追加前大小校验——不匹配即报错终止（并发交错防护）。
 func TestPartialProgressNeverRegresses(t *testing.T) {
 	t.Run("savePartialPart进度不回退", func(t *testing.T) {
@@ -1075,12 +1165,28 @@ func TestPartialProgressNeverRegresses(t *testing.T) {
 			mustAbsent(t, disk, key)
 		})
 
-		t.Run("客户端带Range不落盘", func(t *testing.T) {
+		// 起点 0 的 blob Range 等价完整 GET（docker/containerd 首次请求的真实形态）：
+		// 断在半路的字节就是合法的整 blob 前缀，必须落盘——否则下次重试又从 0 开始。
+		// 注：正常链路里 handleGet 已在入口剥离 Range，此分支是不依赖剥离顺序的兜底。
+		t.Run("客户端带Range起点0落盘", func(t *testing.T) {
+			s := newPartialTestServer(t)
+			disk, _ := cache.New(t.TempDir())
+			key := "k-gate-range-zero"
+			r := prefetchBlobTestRequest(prefetchName, digest)
+			r.Header.Set("Range", "bytes=0-")
+			s.captureStreamPartial(&partialSink{key: key, disk: disk}, r, blobTarget, []byte("data"))
+			if n, ok := disk.PartSize(key); !ok || n != 4 {
+				t.Errorf("半截大小 = (%d, %v), want (4, true)（起点 0 等价完整 GET，应保留前缀）", n, ok)
+			}
+		})
+
+		// 起点 >0 的 Range 语义是「我要某一段」，与「整 blob 前缀」不同：维持旧版不落盘。
+		t.Run("客户端带Range起点100不落盘", func(t *testing.T) {
 			s := newPartialTestServer(t)
 			disk, _ := cache.New(t.TempDir())
 			key := "k-gate-range"
 			r := prefetchBlobTestRequest(prefetchName, digest)
-			r.Header.Set("Range", "bytes=0-")
+			r.Header.Set("Range", "bytes=100-")
 			s.captureStreamPartial(&partialSink{key: key, disk: disk}, r, blobTarget, []byte("data"))
 			mustAbsent(t, disk, key)
 		})

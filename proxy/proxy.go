@@ -446,6 +446,10 @@ func targetKind(fullURL bool) string {
 // 候选竞速选定后立即 commit（WriteHeader + 透传响应头）再边读上游边写客户端，
 // 保证首字节时间只有「选定候选」的耗时，不被上游完整下载拖到超过 docker 客户端
 // 约 30s 的响应头超时（详见 stream.go）。完整 URL 目标（web）保持整包缓冲回放不变。
+//
+// 客户端 Range 分流（docker blob，详见 client_range.go）：起点 0 等价完整 GET（剥离 Range
+// 后走缓存/半截续传/预取搭车，响应侧改写成 206）；起点 >0 时缓存 HIT 直接本地切片回 206、
+// 有半截前缀时按半截长度对齐走续传拼接（都是 206），无半截 / 有缺口才维持旧版 206 透传。
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string, fullURL bool, eff config.Options, start time.Time) {
 	key := cache.Key(cacheKeyInput(r, target, fullURL))
 	// docker 日志统一标签：客户端主路径（HIT / BYPASS / 单飞回源）统一 source=client，
@@ -453,10 +457,52 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	labels := parseDockerLogInfo(target)
 	// 路径目标 GET：流式透传（选定候选立即 commit）；完整 URL GET：缓冲回放（行为不变）
 	streaming := !fullURL
+
+	// //////////////////  客户端 Range 分流：docker blob（起点 0 / 任意起点）  start  ////////////////
+	// 现场故障：docker/containerd 拉 blob 无论从哪个偏移都带 Range（httpReadSeeker）——首次
+	// `bytes=0-`，断点续传重试 `bytes=<已有偏移>-`（现场起点 ≈ 82.8MB）。旧版把所有 Range
+	// 一律判 BYPASS，于是每次重试都绕过缓存/半截续传/预取搭车、纯透传（现场上游 13KB/s，
+	// 慢而不死、每轮重试还要再烧一遍候选探测）：链路中途断一次就只能从 0 重来，302MB 层
+	// 必然断，最终 502。现在 docker blob 目标的单区间 bytes Range 全部接管（见 client_range.go）：
+	//   - 起点 0 = 完整 GET：立刻剥离 Range，内部一切机制（缓存 HIT / 半截续传 / 预取搭车 /
+	//     单飞合并）照常生效，且 Range 绝不再透传给上游（否则上游回 206，判据/写缓存/续传
+	//     全部失配）；响应侧包一层 zeroRangeWriter 把内部 200 改写成 206 + Content-Range；
+	//   - 起点 >0 = 真正的断点续传：缓存 HIT 直接从条目 body 本地切片回 206（不发上游）；
+	//     缓存 MISS 时按「起点与半截长度的关系」走续传管线（起点 <= 半截长度）或落到下方
+	//     既有 request-range 206 透传（无半截 / 有缺口，缺口另打 Warn）。
+	// 非 blob 目标与后缀区间/多区间保持原样（下方 request-range）。
+	rangeSpec, blobRange := parseBlobRange(r, target)
+	zeroRange := blobRange && rangeSpec.start == 0
+	if zeroRange {
+		r.Header.Del("Range")
+		w = newZeroRangeWriter(w, rangeSpec)
+		s.log.Info("docker blob 请求带 Range 起点 0：按完整 GET 处理（对客户端回 206 + Content-Range，缓存/半截续传/预取搭车全部生效）",
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "target", truncate(target, 300),
+				"range_end", rangeSpec.end, "range_has_end", rangeSpec.hasEnd)...)
+	}
+	// 起点 >0 的 blob Range 仍保留 Range 头（本轮不写正式缓存条目、也不按完整 GET 回放），
+	// 由下方 blobRangeLocal 分支决定「本地缓存切片 / 半截对齐续传 / 旧版 206 透传」；
+	// 客户端 no-cache（显式要求强制回源）与缓存关闭/负 TTL 时不拿本地内容满足它
+	blobRangeLocal := blobRange && rangeSpec.start > 0 &&
+		eff.CacheEnabled && eff.CacheTTL >= 0 && !clientNoCache(r)
+	// //////////////////  客户端 Range 分流：docker blob（起点 0 / 任意起点）  end  ////////////////
+
+	// serveEntry 的可选区间参数：仅 zeroRange（blob 起点 0）的 HIT 回放需要——用来抑制
+	// ETag 304 降级（对 Range 请求回 304 会让 docker 拿不到任何内容），body/状态码的 206
+	// 改写由 zeroRangeWriter 负责。起点 >0 的区间请求由 serveEntryBlobRange 直接切片回放
+	// （天然不回 304）；非 blobRange 请求传空，行为与旧版完全一致。
+	var zeroArgs []blobRangeSpec
+	if zeroRange {
+		zeroArgs = []blobRangeSpec{rangeSpec}
+	}
+
 	// 先判定本请求不走缓存的具体原因（空串表示可缓存），再把原因暴露到日志，
 	// 避免出现「没写缓存文件但日志看不出为什么」的排查黑洞。
 	// 可缓存条件：cache.enabled 且 ttl>=0（TTL=0 表示永不过期，同样可缓存；负数理论上
 	// 已被 config.Validate 拦截，此处 >=0 兜底防御）且无 Range / no-cache 语义冲突
+	//（起点 0 的 blob Range 已在上方按完整 GET 接管并剥离，走不到下面的 request-range；
+	//  起点 >0 的 blob Range 只在「读缓存 / 半截续传」上放开（blob-range），仍不写正式
+	//  缓存条目与半截——它的完整内容由续传执行方按整 blob 写缓存）
 	bypassReason := ""
 	switch {
 	case !eff.CacheEnabled:
@@ -464,16 +510,21 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	case eff.CacheTTL < 0:
 		bypassReason = "negative-ttl" // 防御分支：Validate 已拦截负 TTL
 	case r.Header.Get("Range") != "":
-		bypassReason = "request-range" // Range 请求绕过缓存读取（避免语义冲突）
+		if blobRangeLocal {
+			bypassReason = "blob-range" // blob 起点 >0：不写缓存，但允许本地切片 / 半截续传
+		} else {
+			bypassReason = "request-range" // Range 请求绕过缓存读取（避免语义冲突）
+		}
 	case clientNoCache(r):
 		bypassReason = "request-no-cache" // 客户端要求强制回源刷新
 	}
 	cacheable := bypassReason == ""
 
 	// 解析本请求生效的缓存实例：规则可配独立缓存目录，按生效目录向管理器获取（复用已预热实例）；
-	// 获取失败时本次请求降级为直接回源（BYPASS），不中断服务
+	// 获取失败时本次请求降级为直接回源（BYPASS），不中断服务。
+	// blobRangeLocal 同样要拿到实例：缓存 HIT 才能本地切片回 206，半截文件也在该目录下
 	var disk *cache.Cache
-	if cacheable {
+	if cacheable || blobRangeLocal {
 		c, err := s.cacheFor(eff)
 		if err != nil {
 			s.log.Warn("获取缓存实例失败，本次请求降级为直接回源", "dir", eff.CachePath, "err", err)
@@ -522,6 +573,33 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		}
 	}
 
+	// //////////////////  起点 >0 的 blob Range：本地切片 / 半截对齐  start  //////////////////
+	// 本地已有完整内容就绝不再打上游：任意起点直接从缓存条目 body 切片回 206（「一次落盘、
+	// 后续任意起点全秒回」）。只有半截前缀时按「起点与半截长度的关系」分流（见 client_range.go）：
+	//   - 起点 <= 半截长度：复用既有续传管线（本地半截从起点回放 + 上游剩余区间续传拼接），
+	//     对客户端回 206；执行方照常把完整 blob 写缓存，下次任意起点直接走上面的切片；
+	//   - 起点 > 半截长度（中间缺一段，不能凭空补）：tryServeBlobResume 内部打 Warn 后返回
+	//     false，落到下方旧版 206 透传；
+	//   - 无半截 / 半截为空：同样返回 false，维持旧版 206 透传（语义与旧版完全一致）。
+	// 本块必须在 !cacheable 的 BYPASS 分支之前：blobRangeLocal 的 bypassReason 是 blob-range
+	// （不写缓存），但「读缓存」与「半截续传」仍然可用。
+	if blobRangeLocal && disk != nil {
+		// A) 正式缓存 HIT：条目 body 即完整 blob，任意起点本地切片回 206（不发上游）
+		if e, ok := disk.Get(key); ok && e.Status == http.StatusOK && len(e.Body) > 0 {
+			s.log.Info("缓存命中（HIT）并按客户端区间本地切片回 206（不发上游）",
+				labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+					"file", disk.FilePath(key), "range_start", rangeSpec.start,
+					"range_has_end", rangeSpec.hasEnd, "bytes", len(e.Body))...)
+			s.serveEntryBlobRange(w, r, e, rangeSpec, "HIT", eff, start)
+			return
+		}
+		// B) 本地半截对齐：起点 <= 半截长度时走续传管线（前缀从起点切片回放 + 上游续传拼接）
+		if streaming && s.tryServeBlobResume(w, r, key, target, eff, disk, start, finalize, streamingError, rangeSpec) {
+			return
+		}
+	}
+	// //////////////////  起点 >0 的 blob Range：本地切片 / 半截对齐  end  ////////////////////
+
 	if !cacheable {
 		// 不走缓存的决策留痕：Info 级输出原因与生效规则（含未命中任何规则的 global-default），
 		// 让「为什么不写缓存文件」在日志里直接可见
@@ -552,7 +630,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 			// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径
 			s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
 				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
-			s.serveEntry(w, r, e, "HIT", eff, start)
+			s.serveEntry(w, r, e, "HIT", eff, start, zeroArgs...)
 			return
 		}
 	}
@@ -799,7 +877,7 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 	}
 
 	// //////////////////  探测提速管线竞速选定候选  start  ///////////////////////////////////////
-	res, err := s.selectCandidate(r, candidates, eff)
+	res, err := s.selectCandidate(r, candidates, eff, target)
 	if err != nil {
 		return s.candidatesExhaustedFallback(r, target, eff, err)
 	}
@@ -1288,7 +1366,13 @@ func maskToken(tok string) string {
 // serveEntry 把上游响应/缓存条目回放给客户端：
 // 透传状态码与响应头（剔除逐跳头）、补 X-Cache / X-Proxy-Upstream 观测头、
 // 缓存命中时支持 If-None-Match/ETag 条件请求（304）。
-func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Entry, cacheStatus string, eff config.Options, start time.Time) {
+//
+// 可选参数 zr（variadic，既有调用方与既有测试不受影响）：zeroRange（docker blob 起点 0 的
+// Range，见 client_range.go）的客户端请求语义——仅在 HIT 回放时用于**抑制 ETag 304 降级**：
+// Range 请求必须拿到内容（206），回 304 会让 docker 的 httpReadSeeker 直接报
+// 「unexpected status」。body/状态码到 206 的改写由 zeroRangeWriter 负责，这里不重复做。
+// （起点 >0 的 blob Range 不走这里：handleGet 在缓存 HIT 时已用 serveEntryBlobRange 直接切片回 206。）
+func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Entry, cacheStatus string, eff config.Options, start time.Time, zr ...blobRangeSpec) {
 	// docker 日志统一标签（source 按回放链路派生）：X-Cache: RESUME 的回放属续传链路
 	//（source=resume），其余 HIT / MISS / BYPASS 回放属客户端请求主路径（source=client）；
 	// /v2/ 目标按需解析 image/digest/ref（见 log_attrs.go）
@@ -1314,9 +1398,10 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 	// //////////////////  透传上游响应头  end  ////////////////////////////////////////////////
 
 	// //////////////////  写响应  start  ////////////////////////////////////////////////
-	// 先算最终给客户端的状态码：HIT 且客户端 If-None-Match 命中条目 ETag 时降为 304
+	// 先算最终给客户端的状态码：HIT 且客户端 If-None-Match 命中条目 ETag 时降为 304；
+	// len(zr) != 0（blob 起点 0 的 Range 请求）时绝不降 304——客户端要的是内容（206）
 	status := e.Status
-	if cacheStatus == "HIT" && etagNotModified(r, e.Header) {
+	if cacheStatus == "HIT" && len(zr) == 0 && etagNotModified(r, e.Header) {
 		status = http.StatusNotModified
 	}
 	switch {

@@ -11,14 +11,14 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **通用反代**：支持任意 `http://` / `https://` 目标 URL（不限于 GitHub），状态码/响应头/Body 透传
 - **路径目标请求（docker registry 等）**：请求路径不是完整 URL（如 `/v2/<name>/manifests/<ref>`）时识别为「路径目标」，由命中的域名规则 + url-redirect 模板拼出回源地址（详见下文「[Docker Registry 镜像加速](#docker-registry-镜像加速)」）；仅支持 GET/HEAD、必须命中规则且配置 url-redirect、无直连回退，缓存 key 含入站 Host
 - **本地文件缓存**：目标 URL 的 sha256 作为缓存键（路径目标以「`http://<入站Host>/<路径目标>`」为 key 输入），命中返回 `X-Cache: HIT`，未命中回源后写缓存返回 `X-Cache: MISS`；TTL 过期自动失效（惰性删除 + 后台扫描），写入原子替换、并发安全，内置 singleflight 防缓存击穿
-- **GET 路径目标流式回源（docker registry 必备）**：缓存 MISS / BYPASS 的路径目标 GET 在候选竞速选定后**立即向客户端写出响应头（commit）**，随后边读上游边写给客户端与缓存——docker 客户端等响应头约 30s 就超时断开（`net/http: timeout awaiting response headers`），流式透传把首字节时间压缩为「选定候选」的耗时，不再被大 blob 的完整下载拖超时；EOF 后按既有条件原子写缓存；commit 后客户端断开（broken pipe）则**断开即停**——立即终止上游读取与多源合并流（不再「继续读完只填缓存」长时间占用上游连接与带宽），blob 缓存可读主路径保留半截（进度不回退，下次无 Range 请求从断点无感续传），客户端将以断点续传或缓存重试接续；commit 后上游读取失败则终止响应且不写缓存（半截数据绝不入库）；带 Range 的断点续传：上游 206 视为成功并流式透传、不写缓存（完整 URL 目标（web）与 HEAD 保持整包缓冲回放不变）
+- **GET 路径目标流式回源（docker registry 必备）**：缓存 MISS / BYPASS 的路径目标 GET 在候选竞速选定后**立即向客户端写出响应头（commit）**，随后边读上游边写给客户端与缓存——docker 客户端等响应头约 30s 就超时断开（`net/http: timeout awaiting response headers`），流式透传把首字节时间压缩为「选定候选」的耗时，不再被大 blob 的完整下载拖超时；EOF 后按既有条件原子写缓存；commit 后客户端断开（broken pipe）则**断开即停**——立即终止上游读取与多源合并流（不再「继续读完只填缓存」长时间占用上游连接与带宽），blob 缓存可读主路径保留半截（进度不回退，下次无 Range 请求从断点无感续传），客户端将以断点续传或缓存重试接续；commit 后上游读取失败则终止响应且不写缓存（半截数据绝不入库）；带 Range 的断点续传：**docker blob 目标的单区间 bytes Range 全部本地接管**——起点 0（`bytes=0-`，docker/containerd 首次拉层就带它）等价于完整 GET（缓存 HIT / 半截无感续传 / 预取搭车照常，对客户端回 206 + Content-Range）；起点 >0（断点续传重试，docker 无论从哪个偏移都带 Range）则「缓存里有完整条目就直接从条目 body 切片回 206、发都不发上游；只有半截前缀且起点不超过半截长度时从半截的起点位置回放 + 上游剩余区间续传拼接」，无半截 / 起点超出半截（有缺口）才维持旧版 206 透传；非 blob 目标与后缀区间/多区间同样维持旧版 206 透传（完整 URL 目标（web）与 HEAD 保持整包缓冲回放不变）
 - **规则级独立缓存目录**：每条 domain-rule 的 `cache` 可独立配置 `enabled`/`ttl`/`path`/`clean-interval`，支持「全局 `cache.enabled: false` 关闭缓存、命中规则的流量按规则开启并写入各自独立目录」（启动时预热创建全部缓存目录，按目录复用缓存实例与后台清理协程）
-- **url-redirect 多上游轮询回源**：模板展开为多个候选代理 URL，round-robin **起始下标逐请求轮换**（第 1 个请求从第 1 条开始、第 2 个从第 2 条开始……），默认**阶梯并发竞速**（hedge：首个候选立即发出，每隔 `url-redirect-hedge-delay` 放行下一个并发探测，第一个通过成功判据的候选胜出、其余取消；`0` 退化为纯串行）；单候选探测预算 `url-redirect-probe-timeout`（响应头/判据未就绪即硬失败快切）；硬失败（403 / token dance 后仍 401 / 探测预算耗尽）跳过原地重试直接切下一候选；全部失败可回退直连原始 URL（路径目标无直连回退），极坏情况由内置扫描总预算（20s）兜底提前 502
+- **url-redirect 多上游轮询回源**：模板展开为多个候选代理 URL，round-robin **起始下标逐请求轮换**（第 1 个请求从第 1 条开始、第 2 个从第 2 条开始……），默认**阶梯并发竞速**（hedge：首个候选立即发出，每隔 `url-redirect-hedge-delay` 放行下一个并发探测，第一个通过成功判据的候选胜出、其余取消；`0` 退化为纯串行）；单候选探测预算 `url-redirect-probe-timeout`（响应头/判据未就绪即硬失败快切）；硬失败（403 / token dance 后仍 401 / 探测预算耗尽）跳过原地重试直接切下一候选；全部失败可回退直连原始 URL（路径目标无直连回退），极坏情况由内置扫描总预算兜底提前 502（manifest 等 20s、docker blob 60s 起）
 - **url-redirect 模板变量**：除 `$1`（目标串，兼容保留）外支持请求级预定义变量 `$http.server.header.full_url`（入站请求完整 URL）与 `$http.server.header.full_url_no_server`（入站请求去掉 `scheme://host` 的 `/path?query`），均支持 `${...}` 大括号写法；按变量名长度降序替换（避免前缀遮蔽），未知 `$` 序列原样保留，详见下文「[url-redirect 模板变量](#url-redirect-模板变量)」
 - **url-redirect 候选对象与候选级覆盖**：`url-redirect` 为**对象数组**（破坏性变更：旧版纯字符串写法解析期报错并给出迁移示例），候选 = `template`（原模板字符串，占位符语义不变）+ 可选 `insecure-skip-verify` / `http-proxy` / `connect-timeout` / `http-timeout` / `read-timeout` / `probe-timeout`；这些可选项均为三级优先级**候选 > 规则 > 全局**（未配置逐级继承；候选显式空串 `http-proxy` = 强制直连、显式 `0` 超时 = 不限制），适合「个别镜像站证书链不全」「单个候选必须走慢代理并放宽超时」的场景，详见下文「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」
 - **HEAD 走候选轮询管线**：HEAD 与 GET 一致先查缓存（命中回放响应头，无 body），未命中按候选轮询回源（方法保持 HEAD，docker registry 的 HEAD 探测同样打到镜像站）；HEAD 响应无 body 不写缓存；未配置 url-redirect 时回退直连（与旧版一致）
 - **docker 镜像 layer 异步预取（manifest 驱动）**：识别出 `GET /v2/<name>/manifests/<ref>` 路径目标回源成功且响应为单平台 image manifest 后，异步预取该镜像其余 layer blob 写入缓存（`docker-prefetch-enabled` 默认开，并发 `docker-prefetch-concurrency` 默认 4）——docker daemon 默认 `max-concurrent-downloads=3` 逐层下载慢，预取后客户端后续 blob 请求直接 `X-Cache: HIT`；预取复用与客户端完全相同的回源路径（候选轮询/超时覆盖/http-proxy/insecure TLS/token dance/缓存写入），只写缓存不产生客户端响应；同一 blob 在途集合去重 + singleflight 与客户端并发请求合并；**预取在途中的层被客户端请求时直接搭车**（拼接已落盘前缀与实时增量，`X-Cache: PREFETCH`，上游仅预取一路下载、已下载部分直接复用，详见下文「[在途预取层搭车](#在途预取层搭车)」）；失败只记日志绝不影响客户端；blob 按 digest 不可变、不存在刷新问题，详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」
-- **docker blob 半截保留与无感续传**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时，把已下载前缀保留为缓存目录内的半截文件（`.part-<缓存key>`，大小即已下载字节数，`docker-partial-resume-enabled` 默认开）——重 pull 时 docker 客户端是无 Range 的完整 GET（从 0 开始），proxy 撞上「缓存 MISS + 半截文件」时从断点 Range 续传并对客户端回**一次完整 200**（本地前缀回放 + 上游剩余实时拼接，docker 无需支持 Range、完全无感知，`X-Cache: RESUME`）；并发请求经既有搭车机制共享同一路续传流，上游只一路下载；续传中途失败保留更新后的半截（进度不回退）；manifest 仅 blob 启用、带 Range 维持 206 透传、上游不回 206 时安全降级，详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」
+- **docker blob 半截保留与无感续传**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时，把已下载前缀保留为缓存目录内的半截文件（`.part-<缓存key>`，大小即已下载字节数，`docker-partial-resume-enabled` 默认开）——重 pull 时 docker 客户端是无 Range 的完整 GET（从 0 开始），proxy 撞上「缓存 MISS + 半截文件」时从断点 Range 续传并对客户端回**一次完整 200**（本地前缀回放 + 上游剩余实时拼接，docker 无需支持 Range、完全无感知，`X-Cache: RESUME`）；并发请求经既有搭车机制共享同一路续传流，上游只一路下载；续传中途失败保留更新后的半截（进度不回退）；manifest 仅 blob 启用；`Range` 起点 0 的 `bytes=0-` 等价完整 GET（照常续传），**起点 >0 且不超过半截长度时同样复用续传管线**（从半截的起点回放 + 上游剩余拼接，对客户端回 206），起点超出半截（有缺口）才维持旧版 206 透传；上游不回 206 时安全降级，详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）；HEAD 响应天然无 body，content 判据对 HEAD 自动按 status 语义；HTTP 304（内容未变更）在两种模式下均视为成功候选，304 原样透传给客户端、不写缓存
 - **条件请求头不透传**：回源（候选与直连）按请求头白名单透传（含 `Range`），但 `If-Match` / `If-Modified-Since` / `If-None-Match` / `If-Range` / `If-Unmodified-Since` 不透传——回源始终为无条件 GET/HEAD，保证上游返回 200 + 完整 body 以过判据、写缓存；客户端的 304 语义由代理自身缓存 ETag 逻辑（HIT 命中时返回 304）负责
 - **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`insecure-skip-verify`、`timeout`（read-timeout 退化别名）、`http-timeout`、`read-timeout`、`connect-timeout`、`url-redirect-item-error-retry`、`url-redirect-all-error-retry` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
@@ -40,6 +40,7 @@ proxy-cache/
 │   └── manager.go          # 缓存管理器：按目录复用 Cache 实例（规则级独立目录）            # 文件缓存：sha256 键、原子写、过期判定、后台清理
 ├── proxy/
 │   ├── proxy.go            # 核心反代：目标提取（完整 URL / 路径目标）、ACL、回源分发、成功判据、透传
+│   ├── client_range.go     # 客户端 Range 语义：blob 起点 0 = 完整 GET；任意起点本地切片 / 半截对齐续传
 │   ├── candidates.go       # 候选探测提速管线：probe 预算 + 硬失败快切 + 阶梯竞速（hedge）+ 扫描总预算
 │   ├── probe.go            # 探测式上游尝试：响应头可用 + 首块判据即返回（body 保持活体）、探测预算
 │   ├── stream.go           # GET 路径目标流式透传：commit 后边读上游边写客户端与缓存
@@ -117,15 +118,15 @@ docker run -d --name proxy-cache \
 | `timeout` | duration | 不限制（0） | **旧字段，语义已变更**：仅为 `read-timeout` 的退化别名，不再是回源总超时；且不再有旧版的 `60s` 默认兜底（未配置 = 不限制，有意的行为变更） |
 | `url-redirect-item-error-retry` | int | `0`（不重试） | 单个候选的重试次数：某候选一次尝试失败（网络错误/超时/未过 success-check）后原地立即重试 N 次（总尝试 = 1+N，无退避），全部失败才轮到下一候选。硬失败（上游 403 / token dance 后仍 401 / 探测预算耗尽）跳过原地重试直接切下一候选 |
 | `url-redirect-all-error-retry` | int | `0`（不重试） | 整轮全错后的重试轮数：一轮 = 所有候选（含各自 item 重试）都失败；全轮失败后整体重来最多 N 轮（总轮数 = 1+N），重试轮沿用同一候选顺序 |
-| `url-redirect-probe-timeout` | duration | `5s` | **单次候选尝试的探测预算**：从发出请求到「响应头可用（含 401 token dance 的第二次响应）且成功判据可判定（首块读出或 EOF）」的时限，覆盖建连后的等待与 token dance 全程；到期取消该次尝试并硬失败快切下一候选。仅约束探测阶段：探测通过后的 body 读取（流式透传/缓冲排干）不受它约束，仍由 `http-timeout`（整次尝试总超时）与 `read-timeout`（无新增数据）负责；建连本身由 `connect-timeout` 负责。显式 `0` = 不限制 |
-| `url-redirect-hedge-delay` | duration | `2s` | **候选阶梯并发竞速（hedge）的放行间隔**：候选按 round-robin 顺序起步，首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消）；某候选先失败时立即放行下一候选（不等间隔）；第一个通过成功判据的候选胜出，其余全部取消（context 取消，连接及时释放）。`0` = 纯串行禁用竞速（上一候选出结果后才放行下一个）。最坏「选定候选」耗时 ≈ (候选数-1)×该间隔 + 胜者探测耗时；全部候选都失败的极坏情况由内置扫描总预算（20s）兜底，提前终止并 502（docker 客户端会自行重试该层） |
-| `slow-download-speed` | bytes | `1MB` | **慢速升级多源并发续传的判慢阈值**（B/s，字节写法见下方说明）：type=docker 规则的流式回源按 `slow-download-window` 滑动窗口计平均送出速率，低于它判「过慢」，对（候选数>1 的）下载向其余全部候选并发发起 Range 续传并有序合并提速；`<=0`（或 `0`）= **关闭整个特性**。仅 type=docker 规则生效，详见下文「[慢速自动升级多源并发续传](#慢速自动升级多源并发续传)」 |
+| `url-redirect-probe-timeout` | duration | `5s` | **单次候选尝试的探测预算**：从发出请求到「**最终响应头到达**（含 401 token dance 的第二次响应）」的时限，覆盖建连后的等待与 token dance 全程；到期取消该次尝试并硬失败快切下一候选。**响应头到手即算探测成功**——「首块 body 到达」不算进预算（现场 1ms.run 已回 206、dance 花 2.9s，却因为还在等首块被判 `probe-timeout` 硬失败丢弃）；停表后只等首块/body，由 `http-timeout`（整次尝试总超时）与 `read-timeout`（无新增数据）负责；建连本身由 `connect-timeout` 负责。显式 `0` = 不限制。**docker blob 目标（`/v2/<name>/blobs/<digest>`）在候选级/规则级/全局都未显式配置时改用更大的缺省 `30s`**（大 layer 的上游响应头经常 5s 内到不了，5s 预算会把候选全判硬失败直接 502）；内置候选扫描总预算同步按目标放宽（manifest 等 `20s`、blob `60s` 起，见 `url-redirect-hedge-delay` 行）。命中候选仍立即 commit——commit 时刻与预算大小无关 |
+| `url-redirect-hedge-delay` | duration | `2s` | **候选阶梯并发竞速（hedge）的放行间隔**：候选按 round-robin 顺序起步，首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消）；某候选先失败时立即放行下一候选（不等间隔）；第一个通过成功判据的候选胜出，其余全部取消（context 取消，连接及时释放）。`0` = 纯串行禁用竞速（上一候选出结果后才放行下一个）。最坏「选定候选」耗时 ≈ (候选数-1)×该间隔 + 胜者探测耗时；全部候选都失败的极坏情况由内置扫描总预算兜底，提前终止并 502（docker 客户端会自行重试该层）：manifest 等小目标仍为 `20s`，**docker blob 目标 60s 起**（取 `max(60s, (候选数-1)×hedge-delay + 最大候选探测预算 + 20s)`——否则 20s 会在 30s 探测预算用完前先掐死扫描，`url-redirect-all-error-retry` 也形同虚设）。预算只是「放弃阈值」，不影响 commit 时刻 |
+| `slow-download-speed` | bytes | `1MB` | **慢速升级多源并发续传的判慢阈值**（B/s，字节写法见下方说明）：type=docker 规则的流式回源按 `slow-download-window` 滑动窗口计平均送出速率，低于它判「过慢」，对（候选数>1 的）下载向其余全部候选并发发起 Range 续传并有序合并提速；`<=0`（或 `0`）= **关闭整个特性**。仅 type=docker 规则生效——**规则没写 `type: docker` 时本项与其余三个 `slow-download-*` 静默不生效**（不报错），详见下文「[慢速自动升级多源并发续传](#慢速自动升级多源并发续传)」 |
 | `slow-download-window` | duration | `10s` | 判速滑动窗口时长：窗口满按窗口平均速率判慢（启用时 Validate 钳制最小 `1s`，过短窗口会把网络抖动误判为持续过慢）；不满足触发条件零开销（除窗口计时本身） |
 | `slow-download-min-remaining` | bytes | `64MB` | 触发升级所需最小剩余字节数：剩余（已知总长 - 已传）不足不升级（尾巴太小没必要并发拉满）；`0` = 不设门槛；上游总长不可知（无 `Content-Length`/`Content-Range`）则永不触发 |
 | `slow-download-max-behind` | bytes | `8MB` | 多源合并的剪枝阈值：合并中某源落后领先源超过该字节数即被关闭移除（收敛多源并发的带宽放大）；启用时（`slow-download-speed > 0`）必须 `>0`，Validate 拒绝 |
 | `docker-prefetch-enabled` | bool | `true` | **docker 镜像 layer 异步预取开关**：`GET /v2/<name>/manifests/<ref>` 路径目标回源成功（HTTP 200 已写入缓存）且响应为单平台 image manifest 时，异步预取该镜像其余 layer blob 写入缓存，客户端后续 blob 请求直接命中；**预取在途中的层被客户端请求时直接搭车**（`X-Cache: PREFETCH`，上游仅预取一路下载）；HEAD / 206(Range) / 多平台 manifest list 与 OCI index 不触发；预取失败只记日志、绝不影响客户端请求。详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」与「[在途预取层搭车](#在途预取层搭车)」 |
 | `docker-prefetch-concurrency` | int | `4` | docker 层预取的并发数上限（全部预取共享一个 Server 级信号量）；必须为正整数（显式 `<=0` 启动报错——关闭预取请用 `docker-prefetch-enabled: false`，两者语义分离） |
-| `docker-partial-resume-enabled` | bool | `true` | **docker blob 半截保留与无感续传开关**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时把已下载前缀保留为缓存目录半截文件（`.part-<缓存key>`）；客户端无 Range 完整 GET 撞上「缓存 MISS + 半截文件」时从断点 Range 续传，对客户端回一次完整 200（前缀回放 + 剩余实时拼接，docker 无需支持 Range，`X-Cache: RESUME`）；manifest 会变仅 blob 启用；带 Range 维持既有 206 透传；上游不回 206 安全降级全量回源。详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」 |
+| `docker-partial-resume-enabled` | bool | `true` | **docker blob 半截保留与无感续传开关**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时把已下载前缀保留为缓存目录半截文件（`.part-<缓存key>`）；客户端无 Range 完整 GET 撞上「缓存 MISS + 半截文件」时从断点 Range 续传，对客户端回一次完整 200（前缀回放 + 剩余实时拼接，docker 无需支持 Range，`X-Cache: RESUME`）；manifest 会变仅 blob 启用；`Range` 起点 0 的 `bytes=0-` 等价完整 GET（照常缓存/续传）；**起点 >0 且不超过半截长度时复用本续传管线**（从半截的起点位置回放 + 上游剩余区间拼接，对客户端回 206，内部照常写完整缓存），起点超出半截（有缺口）才维持旧版 206 透传并打 Warn；上游不回 206 安全降级全量回源。详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」 |
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://`。三级覆盖（高→低）：**url-redirect 候选对象 `http-proxy`（显式空串 = 该候选强制直连）> 域名规则 > 本全局值**，详见「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」 |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
@@ -164,7 +165,7 @@ docker run -d --name proxy-cache \
 | `name` | string | 规则名（可选，用于日志/`X-Cache` 观测） |
 | `match` | string | **必填**，正则表达式，对「**`http://<入站Host>/<目标URL>`**」整串做非锚定匹配（入站 Host 归一化为小写）。既可按入站域名写（如 `'http://github\.path\..+'`，Host 形如 `github.path.xxx` 时命中），旧的纯目标 URL 写法也兼容（如 `raw\.githubusercontent\.com`、`.*https://[^.]+\.githubusercontent\.com`） |
 | `exclude` | string[] | 排除正则列表（可选，支持多项）。`match` 命中后再逐个检查（同样对整串非锚定匹配），**任一命中即排除该规则**（视为不匹配，继续向下尝试后续规则）；全部不命中才应用本规则 |
-| `type` | string | 请求类型过滤（可选，发生在 `match`/`exclude` 匹配之前）：留空 = 不过滤请求类型（默认，完全兼容旧配置）；`docker` = 仅路径目标请求可命中本规则（如 docker registry 的 `/v2/xxx/manifests/latest`）；`web` = 仅完整 URL 请求可命中本规则（如 `/https://raw.githubusercontent.com/...`）；其他值启动时直接报错。配置自动做 trim + 小写归一化（`"Docker "` 视为 `"docker"`） |
+| `type` | string | 请求类型过滤（可选，发生在 `match`/`exclude` 匹配之前）：留空 = 不过滤请求类型（默认，完全兼容旧配置）；`docker` = 仅路径目标请求可命中本规则（如 docker registry 的 `/v2/xxx/manifests/latest`）；`web` = 仅完整 URL 请求可命中本规则（如 `/https://raw.githubusercontent.com/...`）；其他值启动时直接报错。配置自动做 trim + 小写归一化（`"Docker "` 视为 `"docker"`）。**⚠ 做 docker 镜像加速的规则务必写 `type: docker`**：规则级/全局的 `slow-download-*` 四个参数只在 `type=docker` 时生效，缺 type 时它们**静默不生效**（不报错、不打日志，线上真实踩过） |
 | `cache.enabled` | bool | 覆盖该规则的缓存开关 |
 | `cache.ttl` | duration | 覆盖该规则的缓存时长；未配置沿用全局 `cache.ttl`；`0` = 永不过期；负数非法 |
 | `cache.path` | string | 该规则的**独立缓存目录**（trim 后为空 = 未配置，沿用全局 `cache.path`；同一 URL 永远落同一规则/目录） |
@@ -180,7 +181,7 @@ docker run -d --name proxy-cache \
 | `timeout` | duration | 旧字段：仅当该规则未配置 `read-timeout` 时作为该规则 `read-timeout` 生效（退化别名，不再是总超时） |
 | `url-redirect-item-error-retry` | int | 覆盖该规则单个候选失败后的原地重试次数；未配置沿用全局 |
 | `url-redirect-all-error-retry` | int | 覆盖该规则整轮全败后的重试轮数；未配置沿用全局 |
-| `url-redirect-probe-timeout` | duration | 覆盖该规则单次候选尝试的探测预算（默认 5s，`0` = 不限制）；未配置沿用全局 |
+| `url-redirect-probe-timeout` | duration | 覆盖该规则单次候选尝试的探测预算（默认 5s，`0` = 不限制）；未配置沿用全局。**最终响应头到达即算探测成功**（不把首块 body 算进预算）。规则显式配置即对全部目标（含 blob）生效；未配置时 blob 目标用 30s 缺省、其它目标 5s |
 | `url-redirect-hedge-delay` | duration | 覆盖该规则候选阶梯竞速的放行间隔（默认 2s，`0` = 纯串行禁用竞速）；未配置沿用全局 |
 | `slow-download-speed` | bytes | 覆盖该规则慢速升级多源并发续传的判慢阈值（B/s，`<=0` 关闭特性）；未配置沿用全局。**仅 type=docker 规则生效**，详见下文「[慢速自动升级多源并发续传](#慢速自动升级多源并发续传)」 |
 | `slow-download-window` | duration | 覆盖该规则判速滑动窗口时长（启用时最小 `1s`）；未配置沿用全局 |
@@ -303,7 +304,7 @@ curl "http://127.0.0.1:8080/healthz"
 | 第 3 个请求 | 2 | C2 → C0 → C1 |
 | 第 4 个请求 | 0（回到起点） | C0 → C1 → C2 |
 
-- **阶梯并发竞速（hedge，默认开启）**：候选按轮换后的顺序起步——首个候选立即发出，之后每隔 `url-redirect-hedge-delay`（默认 2s）放行下一个候选并发探测（**前一个不取消**）；某个候选先失败时立即放行下一候选（不等间隔，`hedge-delay: 0` 则退化为纯串行逐个尝试）；**第一个通过 success-check 判据的候选胜出**，其余全部取消（context 取消、连接及时释放）。5 候选最坏情况下「选定候选」耗时 ≈ (5-1)×2s + 胜者探测耗时（探测预算默认 5s），约 10s 量级，远低于 docker 客户端约 30s 的响应头超时；全部候选都失败的极坏情况由内置扫描总预算（20s）兜底——提前终止扫描并返回 502，docker 客户端会自行重试该层
+- **阶梯并发竞速（hedge，默认开启）**：候选按轮换后的顺序起步——首个候选立即发出，之后每隔 `url-redirect-hedge-delay`（默认 2s）放行下一个候选并发探测（**前一个不取消**）；某个候选先失败时立即放行下一候选（不等间隔，`hedge-delay: 0` 则退化为纯串行逐个尝试）；**第一个通过 success-check 判据的候选胜出**，其余全部取消（context 取消、连接及时释放）。5 候选最坏情况下「选定候选」耗时 ≈ (5-1)×2s + 胜者探测耗时（探测预算默认 5s），约 10s 量级，远低于 docker 客户端约 30s 的响应头超时；全部候选都失败的极坏情况由内置扫描总预算兜底——提前终止扫描并返回 502，docker 客户端会自行重试该层（manifest 等 20s、docker blob 60s 起，blob 按「候选数×hedge + 探测预算」动态放大）
 - **命中即返回**：胜出候选的响应即最终返回（并按条件写缓存），响应头 `X-Proxy-Upstream` 标明来源
 - **硬失败快切**：token dance 后仍 401、上游 403、探测预算（`url-redirect-probe-timeout`）耗尽这三类失败，跳过 `url-redirect-item-error-retry` 原地重试直接切下一候选（这类失败重试无意义却各烧数秒，日志会注明 `hard_fail` 原因）
 - **失败切换**：其余候选失败（请求报错、非 200、或 content 模式下 GET 的 body 为空；HEAD 天然无 body 自动按 status 语义）都视为失败并尝试/放行下一个候选，同时记录 warn 日志；HTTP 304（内容未变更）视为成功候选——条件请求头不透传，上游对无条件请求仍回 304 属异常/缓存副本有效语义，此时 304 原样透传给客户端（不写缓存），不再判为失败；带 Range 的请求上游回 206 视为成功（流式透传、不写缓存）
@@ -332,6 +333,8 @@ docker 客户端拉取镜像时，对每个请求只等约 30s 的响应头（`n
 ## 慢速自动升级多源并发续传
 
 竞速胜出的镜像站有时「能连上但下载极慢」（首字节快、速率只有几十 KB/s），docker pull 一个大 blob 会拖几分钟。为此，**type=docker 规则**的 GET 路径目标流式回源默认开启慢速升级：下载过慢时自动向其余全部候选**并发发起 Range 续传**，与胜者既有连接按偏移有序合并，把速率拉到多镜像站的并集。
+
+> **⚠ 前置条件：规则的 `type` 必须是 `docker`**。`slow-download-speed` / `-window` / `-min-remaining` / `-max-behind` 四个参数（全局与规则级）只在 `type: docker` 规则的流式回源上生效；规则留空 type（默认 any）时这四个参数**静默不生效**——请求照样命中规则、缓存与候选照常工作，只是慢速升级永远不会触发，日志里也没有任何报错。
 
 ### 「过慢」的定义与触发条件
 
@@ -420,7 +423,7 @@ url-redirect:
 | `connect-timeout` | duration | 可选：候选级建连超时（TCP 拨号 + TLS 握手共用）。nil = 逐级继承；显式 `0` = 不限制；负数为配置错误 |
 | `http-timeout` | duration | 可选：候选级单次尝试总超时（覆盖建连 + 响应头 + 完整读 body + token dance，按每次尝试独立计时）。nil = 逐级继承；显式 `0` = 不限制；负数为配置错误 |
 | `read-timeout` | duration | 可选：候选级「无新增数据超时」（idle，有进度自动续期）。nil = 逐级继承（规则级含旧 `timeout` 退化别名回落链）；显式 `0` = 不限制；负数为配置错误 |
-| `probe-timeout` | duration | 可选：候选级探测预算（规则/全局 `url-redirect-probe-timeout` 的候选级短名）——响应头/判据未就绪即硬失败快切下一候选，仅约束探测阶段。nil = 逐级继承（全局未配置缺省 `5s`）；显式 `0` = 不限制；负数为配置错误 |
+| `probe-timeout` | duration | 可选：候选级探测预算（规则/全局 `url-redirect-probe-timeout` 的候选级短名）——响应头/判据未就绪即硬失败快切下一候选，仅约束探测阶段。nil = 逐级继承（全局未配置时：blob 目标缺省 `30s`、其它目标缺省 `5s`）；显式 `0` = 不限制；负数为配置错误 |
 
 候选对象做严格字段检查：配置了任何其他字段都会在解析期报错并列出支持字段（绝不静默忽略拼写错误）。
 
@@ -501,8 +504,9 @@ docker daemon 可以把本服务当作 registry 访问：请求路径不是完�
 ```yaml
 domain-rules:
   - name: docker-registry
-    # 请求类型过滤（可选）：仅路径目标请求命中本规则，web 流量不受影响
+    # 请求类型过滤：仅路径目标请求命中本规则，web 流量不受影响
     #（留空 = 不过滤；同一入站域名下可另配 type: web 规则分流 web 流量）
+    # ⚠ 必须写 type: docker —— 缺 type 时规则级/全局的 slow-download-* 四个参数静默不生效
     type: docker
     # 入站域名（解析到本服务）形如 registry-proxy-cache.linkease.net:5480 时命中；
     # 换成自己部署的域名（match 对「http://<入站Host>/<路径目标>」整串非锚定匹配）
@@ -528,13 +532,58 @@ domain-rules:
       - template: https://docker.1ms.run/$http.server.header.full_url_no_server
       - template: https://docker.actima.top/$http.server.header.full_url_no_server
         insecure-skip-verify: true   # 仅这个镜像站证书不受信（x509: unknown authority），候选级精确开启
+      # 内网 kspeeder：地址里的主机名不在它证书的 SAN 里（证书只对 *.linkease.net 有效），
+      # 必须给该候选显式 insecure-skip-verify: true —— 否则每次 TLS 握手都失败、还会按
+      # url-redirect-item-error-retry 反复原地重试（纯噪音，该候选永远不可能胜出）。
+      # 若该服务另有证书匹配的域名，用域名比关校验更安全：
+      #   - template: https://kspeeder.linkease.net:5443/$http.server.header.full_url_no_server
+      - template: https://kspeeder.common-all:5443/$http.server.header.full_url_no_server
+        insecure-skip-verify: true   # 地址主机名与证书不匹配（不是证书链不全），必需
+      # 想让 Docker Hub 官方 registry 也作为候选兜底：写完整模板 + 给该候选配代理
+      - template: https://registry-1.docker.io/$http.server.header.full_url_no_server
+        http-proxy: socks5://127.0.0.1:1080
 ```
+
+> **docker 规则（路径目标）里不要写 `template: $1`**：`$1` 是「不带 scheme 的目标串」，路径目标下它会展开成 `v2/xxx/blobs/sha256:...` 这样的路径串，回源必然报 `unsupported protocol scheme ""` 失败（配合 `url-redirect-item-error-retry` 还会原地反复重试），属于永远失败的噪音候选。`$1` 只在完整 URL 目标（web 规则）下有意义——见上文「[url-redirect 模板变量](#url-redirect-模板变量)」的「原始 URL 独立候选」。
 
 > 候选探测报 `tls: failed to verify certificate: x509: certificate signed by unknown authority`（证书链不全的镜像站，每轮候选的重试会全部烧在同一个证书错误上）时，按上例对该候选配置 `insecure-skip-verify: true` 精确开启；优先级与安全代价见上文「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」。
 
 ### 流式回源（docker pull 必读）
 
-路径目标 GET 的缓存 MISS / BYPASS 回源为**流式透传**（详见「[流式回源与 docker ~30s 响应头超时](#流式回源与-docker-30s-响应头超时)」）：候选竞速选定后立即向 docker 写响应头（commit），再边读上游边写给 docker 与缓存。docker 客户端等响应头约 30s 就超时断开，流式透传保证首字节时间只有「选定候选」的耗时（hedge 竞速下 5 候选最坏约 10s 量级），大 blob 的完整下载时间不再计入首字节。commit 后 docker 断开（broken pipe）时**断开即停**：立即终止上游读取与多源合并流（不再继续读完只填缓存、不再长时间占用上游连接与带宽），blob 缓存可读主路径保留半截（进度不回退），docker 重试该层时从断点无感续传（半截已完整则整体回放写缓存）或直接缓存命中（HIT）。带 `Range` 的断点续传：上游 206 视为成功并流式透传、不写缓存。
+路径目标 GET 的缓存 MISS / BYPASS 回源为**流式透传**（详见「[流式回源与 docker ~30s 响应头超时](#流式回源与-docker-30s-响应头超时)」）：候选竞速选定后立即向 docker 写响应头（commit），再边读上游边写给 docker 与缓存。docker 客户端等响应头约 30s 就超时断开，流式透传保证首字节时间只有「选定候选」的耗时（hedge 竞速下 5 候选最坏约 10s 量级），大 blob 的完整下载时间不再计入首字节。commit 后 docker 断开（broken pipe）时**断开即停**：立即终止上游读取与多源合并流（不再继续读完只填缓存、不再长时间占用上游连接与带宽），blob 缓存可读主路径保留半截（进度不回退），docker 重试该层时从断点无感续传（半截已完整则整体回放写缓存）或直接缓存命中（HIT）。带 `Range` 的断点续传（docker 的 `httpReadSeeker` 无论从哪个偏移都带 Range）：起点 0（`bytes=0-`）等价于完整 GET（见下文「[blob 起点 0 的 Range = 完整 GET](#blob-起点-0-的-range--完整-get)」），缓存 HIT / 半截无感续传 / 预取搭车全部生效；**起点 >0（真·断点续传，现场起点 ≈ 82.8MB）时本地有完整条目就直接切片回 206、只有半截前缀时从起点回放 + 上游续传拼接**（见下文「[起点 >0 的 Range：本地切片秒回 / 半截对齐续传](#起点-0-的-range本地切片秒回--半截对齐续传)」）；非 blob 目标与后缀区间/多区间仍把上游 206 透传、不写缓存。
+
+### blob 起点 0 的 Range = 完整 GET
+
+docker/containerd 的 `httpReadSeeker` **无论从哪个偏移开始都会带** `Range: bytes=<offset>-`：首次拉某个 layer 时 offset=0，即 `Range: bytes=0-`。这条链路（客户端 → 本服务 → 镜像站）不稳时，几百 MB 的单层必然中途断开，能不能拉完完全取决于「断点续传」是否真的生效。
+
+处理规则（只对**路径目标且能解析为 `/v2/<name>/blobs/<digest>`** 的请求生效）：
+
+| 客户端 Range | 本服务的处理 | 客户端看到的 |
+| --- | --- | --- |
+| `bytes=0-` / `bytes=0-<end>`（**起点 0**） | 剥离 Range 后按**完整 GET** 处理：缓存 HIT / 半截无感续传（`X-Cache: RESUME`）/ 在途预取搭车（`X-Cache: PREFETCH`）/ 单飞合并全部生效 | `206` + `Content-Range: bytes 0-<total-1>/<total>` + `Accept-Ranges: bytes` |
+| `bytes=<offset>-`（**起点 >0**） | 本地有完整缓存条目 → 从条目 body 切片回 206（**不发上游**）；无完整条目但有半截前缀且起点 ≤ 半截长度 → 从半截起点回放 + 上游剩余区间续传拼接（见下节） | `206` + `Content-Range: bytes <offset>-<last>/<total>` + `Accept-Ranges: bytes` |
+| 起点 > 半截长度（有缺口）/ 无半截 / `bytes=-N` / 多区间 / 非 blob 目标 | 保持旧版：判 BYPASS，Range 原样透传上游（不写缓存、不做本地拼接）；有缺口时另打一条 Warn 说明缺口大小 | 上游的 `206` 原样透传 |
+
+为什么「起点 0」可以按完整 GET 处理：`bytes=0-` 要的就是整个对象，与无 Range 的完整 GET 语义完全等价；blob 按 digest 寻址、内容不可变，缓存条目与半截文件都是「同一个对象的前缀」，复用与拼接都安全——这也是 docker 完全兼容 206 的语义（它自己发的 Range，本就期望 206）。总长未知（上游没声明 `Content-Length`、走 chunked）时无法构造合法的 `Content-Range`：开区间退回 `200` 全量响应（offset=0 的客户端可接受），带区间终点时按 RFC 7233 用总长未知写法 `bytes 0-<end>/*`。
+
+配套的两点行为：
+
+- **客户端中途断开时同样保留半截**：此前「带 Range 的请求一律不保留半截」，于是 302MB 的层断开一次就白扔已下载的几十 MB；现在起点 0 的 blob 请求断在半路，已下载前缀照样落盘，下次重试从更长前缀接着续（进度不回退）。
+- **`probe-timeout` 对 blob 目标用 `30s` 缺省**（候选级/规则级/全局都未显式配置时；显式配置优先）：大 layer 的上游响应头经常 5s 内到不了，旧版 5s 预算会把候选全判硬失败直接 502。**探测预算的计时终点是「最终响应头到达」**（含 token dance 的第二次响应）：响应头到手即停表，不把首块 body 算进预算——现场 1ms.run 已回 206（dance 花 2.9s），却因为还在等首块被判 `probe-timeout` 硬失败丢弃。
+- **内置候选扫描总预算按目标放宽**：manifest 等仍是 `20s`，**docker blob 目标 `60s` 起**（`max(60s, (候选数-1)×hedge-delay + 最大候选探测预算 + 20s)`）——否则 20s 会在 30s 探测预算用完之前先把扫描掐死（现场日志：探测已拿到 206 却因总预算耗尽收 502），配了 `url-redirect-all-error-retry` 也会形同虚设。预算只是「放弃阈值」，命中候选仍立即 commit，不会把客户端拖过 docker 约 30s 的响应头超时。
+
+### 起点 >0 的 Range：本地切片秒回 / 半截对齐续传
+
+现场真正卡住的不是「首次从 0 开始」，而是**断点续传的重试**：docker 的 `httpReadSeeker` 从已有偏移继续时同样带 `Range: bytes=<offset>-`（现场 content store 里该 layer 已落 311MB，重试请求的起点 ≈ 82.8MB）。旧版把所有 Range 一律判 BYPASS，于是这类重试既不复用本地缓存、也不复用本服务已经下到的半截前缀，每次都重新向上游要一遍（现场上游 13KB/s，慢而不死），每轮重试还要再烧一遍候选探测。
+
+现在的分流（只对 `/v2/<name>/blobs/<digest>` 的单区间 `bytes` Range 生效）：
+
+1. **缓存里有完整 blob 条目 → 直接本地切片回 206，一个字节都不发上游**：`Content-Range: bytes <start>-<last>/<total>`、`Accept-Ranges: bytes`、`Content-Length` 按区间长度算；终点越界按 RFC 收窄到 `total-1`，**起点越界回 416 + `Content-Range: bytes */<total>`**。这是「一次落盘、后续任意起点全秒回」的根治方向（docker 因任何原因重试同一层都不再打镜像站）；
+2. **缓存 MISS 但有半截前缀，且请求起点 ≤ 半截长度** → 复用既有续传管线（不新造下载器）：半截的起点位置直接回放（`part[start:partLen]`）+ 上游从 `partLen` 继续 Range 续传拼接，对客户端回 206；内部仍按**完整 blob** 拼接并写缓存（缓存条目必须完整，后续任意起点才能走第 1 条）；
+3. **有半截但请求起点 > 半截长度（中间缺一段）** → 不能凭空补（拼上去就是损坏内容）：维持旧版 206 透传，并打一条 Warn（`range_start` / `part_bytes` / `gap_bytes`），便于运维看出「半截为什么没帮上忙」；
+4. **无半截 / 半截为空 / 后缀区间 / 多区间 / 非 blob 目标** → 维持旧版 206 透传（语义与旧版完全一致）。
+
+边界与降级：区间请求拿不到对象总长（上游 206 没有可解析的 `Content-Range`）时绝不 commit——半截前缀长度不等于总长，谎报会让客户端从错误偏移继续；此时直接退回旧版 206 透传。区间结束早于总长时仍会继续读完上游填缓存（一次落盘后续全秒回；docker 实际发的基本都是开区间）。
 
 ### 镜像站匿名 401 挑战与自动 token 获取
 
@@ -587,7 +636,7 @@ docker 客户端并发下载 layer 受限（daemon 默认 `max-concurrent-downlo
 - **无感续传（主场景）**：客户端无 Range 完整 GET 撞上「正式缓存 MISS + 半截文件存在」时走**续传执行方**——按既有候选轮询（round-robin 起始下标共用）逐候选发 `Range: bytes=<已存字节>-`（既有候选级超时 / `http-proxy` / insecure TLS / 401 匿名 token dance 全复用，整体 20s 扫描预算兜底），从上游 `206` 响应的 `Content-Range` 取总长，对客户端回**一次完整 200**：`Content-Length=总长`（可得时，拿不到则流式不设），body = 本地半截前缀回放 + 上游剩余区间实时拼接——**docker 客户端无需支持 Range、完全无感知**（`X-Cache: RESUME`）。拼接期间上游剩余数据**边转发边追加写半截文件**；EOF 后半截内容 = 完整 blob，按既有 `cache.Set` 语义原子转为正式缓存条目并立即删除半截文件。
 - **并发合并**：续传执行方登记与预取同一套在途流共享注册表（resume 条目），其余客户端请求/等待超限的重试请求经既有搭车机制订阅「半截前缀 + 实时增量」（`X-Cache: PREFETCH`，上游只一路下载）；同 blob 的预取任务经既有 singleflight（同缓存键）合并到同一路续传流。半截文件的全部写侧操作按缓存键互斥（逐块追加 / 整体保存 / 预取改名），且续传执行方逐块追加前校验文件大小——半截被并发保存方更新为更长前缀时本流立即收尾（更长前缀已保留，进度不回退），绝不产生错位拼接。
 - **安全依据**：blob 按 digest 寻址、**内容不可变**——任意候选源的同 digest 内容一致，半截可从任意候选发 `Range` 续传拼接（续传可跨候选）；客户端/上游侧 `Docker-Content-Digest` 不做本地全量校验（GB 级 blob 成本过高），信任 digest 寻址语义。**commit 前必须先确认上游是 206 且 `Content-Range` 起点匹配半截长度**，确认前绝不向客户端写任何字节——若上游对 Range 回 200 全量响应，回放本地前缀再拼全量会数据错位，因此绝不允许。
-- **边界与降级**：manifest 会变，**仅 blob 启用**；客户端带 Range 的请求维持现状（206 透传不做本地拼接、不写半截——docker 重试时既有 206 机制已兜底）；半截为 0 字节直接丢弃；上游对 Range 回非 206（不支持 / 200 全量回）→ 丢弃半截走既有全量回源路径（安全降级，绝不给客户端错误数据）；纯网络/超时类失败保留半截继续全量回源（全量再失败时失败捕获会把更长前缀存回半截，进度不回退）；上游 416（Range 起点 ≥ 总长，而半截是合法前缀）证明**半截已完整**，直接读回写缓存回放，不再全量下载；续传中途读上游失败 / 长度不符 → 保留更新后的半截、本次响应被截断（docker 重试接着更长前缀续传——进度不回退）；EOF 但累积长度 ≠ 总长 → 不写缓存（绝不缓存短 body）。续传路径不叠加 slowdownload 慢速升级多源并发续传（与预取一路同一取舍）。
+- **边界与降级**：manifest 会变，**仅 blob 启用**；客户端带 Range 的请求按起点分流——起点 0 的 `bytes=0-` 等价完整 GET（照常续传），起点 >0 且不超过半截长度时复用本管线（从半截的起点回放 + 上游剩余拼接、对客户端回 206，内部仍写完整缓存），起点超出半截（有缺口）/ 后缀区间 / 多区间 / 非 blob 目标维持旧版 206 透传；半截为 0 字节直接丢弃；上游对 Range 回非 206（不支持 / 200 全量回）→ 丢弃半截走既有全量回源路径（安全降级，绝不给客户端错误数据）；纯网络/超时类失败保留半截继续全量回源（全量再失败时失败捕获会把更长前缀存回半截，进度不回退）；上游 416（Range 起点 ≥ 总长，而半截是合法前缀）证明**半截已完整**，直接读回写缓存回放，不再全量下载；续传中途读上游失败 / 长度不符 → 保留更新后的半截、本次响应被截断（docker 重试接着更长前缀续传——进度不回退）；EOF 但累积长度 ≠ 总长 → 不写缓存（绝不缓存短 body）。续传路径不叠加 slowdownload 慢速升级多源并发续传（与预取一路同一取舍）。
 - **开关**：`docker-partial-resume-enabled`（全局，默认开启；显式 `false` 关闭后全部路径行为与旧版完全一致——无半截文件的产生、保留与续传）。
 
 ### 用法
@@ -604,7 +653,7 @@ curl -I -H "Host: registry-proxy-cache.linkease.net:5480" \
 ### 路径目标请求的限制与行为说明
 
 - **仅支持 GET / HEAD**：docker registry 拉取只用这两个方法；其他方法（POST/PUT 等）对路径目标返回 400（`路径目标仅支持 GET/HEAD 请求`）。POST/PUT 等对**完整 URL 目标**仍保持直接透传（现状不变）
-- **建议配置 `type: docker`**：请求类型过滤（可选）——`type: docker` 仅承接路径目标请求、`type: web` 仅承接完整 URL 请求、留空不过滤（默认，兼容旧配置）。同一入站域名既做 docker 加速又做 web 加速时，可用两条同 `match` 规则按 `type` 分流，各自的 cache/超时/候选互不影响；过滤发生在 `match`/`exclude` 之前，类型不符的规则直接跳过
+- **建议配置 `type: docker`（做镜像加速时是必须）**：请求类型过滤（可选）——`type: docker` 仅承接路径目标请求、`type: web` 仅承接完整 URL 请求、留空不过滤（默认，兼容旧配置）。同一入站域名既做 docker 加速又做 web 加速时，可用两条同 `match` 规则按 `type` 分流，各自的 cache/超时/候选互不影响；过滤发生在 `match`/`exclude` 之前，类型不符的规则直接跳过。**⚠ 缺 `type: docker` 时，规则级与全局的 `slow-download-speed` / `-window` / `-min-remaining` / `-max-behind` 四个参数静默不生效**（请求照样命中、缓存照样工作，只是慢速升级多源并发续传永远不触发，日志里没有任何报错——线上真实踩过这个坑）
 - **必须命中规则**：路径目标请求必须命中某条 domain-rules 规则且该规则生效 `url-redirect` 非空才能回源，否则 400（错误信息保留「目标 URL 必须是完整的 http/https 地址」语义并说明原因）；全局默认配置（未命中规则）不承接路径目标
 - **HEAD/GET 行为一致**：docker 用 HEAD 探测 manifest/blob——HEAD 与 GET 统一走候选轮询管线：先查缓存（命中回放响应头，无 body，`X-Cache: HIT`）；未命中按候选轮询回源（方法保持 HEAD，success-check 对 HEAD 自动按 status 语义：200 即成功，304 仍视为成功）；HEAD 响应无 body，**不写缓存**；未配置 url-redirect 时回退直连（与旧版 HEAD 行为一致）
 - **缓存 key 含入站 Host**：路径目标的缓存 key 输入为「`http://<入站Host>/<路径目标>`」（再取 sha256），不同入站域名的同路径缓存互不污染；完整 URL 请求的缓存 key 输入仍为目标 URL 原文（兼容已有缓存）

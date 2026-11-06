@@ -71,6 +71,23 @@ const (
 	// 配合 hedge 放行间隔可把「选定候选」耗时控制在 10s 量级内。
 	// 显式配置 0 = 不限制（区分「未配置走缺省」与「显式关闭预算」）。
 	DefaultURLRedirectProbeTimeout = 5 * time.Second
+	// DefaultBlobURLRedirectProbeTimeout docker blob 目标（/v2/<name>/blobs/<digest>）的
+	// 探测预算缺省值：30s。为什么不沿用 5s：大 layer（现场是 302MB 的单层）经镜像站
+	// 回源时，上游「响应头可用」经常 5s 内到不了——现场日志里一轮候选全部因此在
+	// probe-timeout 5s 处被判硬失败，最后「全部 url-redirect 候选失败」收 502，而镜像站
+	// 本身是好的。blob 是 digest 寻址的不可变大对象，重试代价极高（一次重试就是几百 MB），
+	// 值得比 manifest 之类的小响应多等：这里按目标类型给更大缺省，manifest / 其它路径目标
+	// 仍用 5s 快速失败节奏。
+	// 生效优先级不变：候选级 probe-timeout > 规则 url-redirect-probe-timeout > 全局
+	// url-redirect-probe-timeout > 本 blob 缺省；任一层显式配置（含显式 0 = 不限制）都优先。
+	// 探测预算的计时口径（proxy 包 probe.go）：**最终响应头到达（含 token dance 的第二次
+	// 响应）即算探测成功**，不把「首块 body 到达」算进预算——现场 1ms.run 已回 206（dance
+	// 花 2.9s），仍在 probe-timeout 5s 处被判硬失败丢弃。响应头到手即停表，后续首块/body
+	// 读取由 read-timeout（无新增数据）与 http-timeout（整次尝试）兜底。
+	// 命中候选仍立即 commit（commit 时刻 = 首个通过判据的候选，与预算大小无关）；扫描总预算
+	// 对 blob 也同步放大（proxy 包 candidateScanBudgetFor：60s 起，动态覆盖「候选数×hedge +
+	// 探测预算」的单轮最坏），否则 20s 总预算会在 30s 探测预算用完之前先掐死扫描。
+	DefaultBlobURLRedirectProbeTimeout = 30 * time.Second
 	// DefaultURLRedirectHedgeDelay 候选阶梯竞速的放行间隔缺省值：2s。
 	// 显式配置 0 = 纯串行（禁用竞速：上一候选出结果后才放行下一个）。
 	DefaultURLRedirectHedgeDelay = 2 * time.Second
@@ -393,6 +410,8 @@ type DomainRule struct {
 	//    （如 /https://raw.githubusercontent.com/...）。
 	// 典型用途：同一入站域名/同一段 match 下，把 docker 流量与 web 流量分流到
 	// 两条不同规则（各自的 cache / 超时 / url-redirect 候选互不影响）。
+	// 注意：规则级 slow-download-speed / -window / -min-remaining / -max-behind 只在
+	// type=docker 时生效——留空（默认 any）时这四个参数静默不生效（见 SlowDownloadSpeed）。
 	Type string `yaml:"type"`
 	// Match 匹配「http://<入站Host>/<目标URL>」整串的正则表达式（必填，非锚定匹配）。
 	Match string `yaml:"match"`
@@ -458,7 +477,12 @@ type DomainRule struct {
 	URLRedirectHedgeDelay *Duration `yaml:"url-redirect-hedge-delay"`
 	// SlowDownloadSpeed 该规则慢速升级多源并发续传的判慢阈值（B/s，语义同全局
 	// slow-download-speed）。nil（未配置）沿用全局；<=0 = 关闭整个特性；
-	// 负数为配置错误（Validate 拒绝）。仅 type=docker 规则生效。
+	// 负数为配置错误（Validate 拒绝）。**仅 type: docker 规则生效**。
+	// ⚠ 坑：本规则**没写 `type: docker`**（留空 = 不过滤请求类型）时，slow-download-speed /
+	// -window / -min-remaining / -max-behind 这四个参数与全局对应项**静默不生效**（请求照样
+	// 命中规则、缓存与候选照常工作，只是慢速升级多源并发续传不启用，日志里不会有任何报错
+	// ——线上就因此白配了一轮）。原因见 Options.RuleType 与 proxy 包 stream.go 的 slowEnabled
+	// 门控。想用这四个参数，务必给规则显式写 `type: docker`。
 	SlowDownloadSpeed *Bytes `yaml:"slow-download-speed"`
 	// SlowDownloadWindow 该规则判速滑动窗口时长（语义同全局 slow-download-window）。
 	// nil（未配置）沿用全局；启用时（生效 speed>0）小于 1s 被 Validate 钳制为 1s。
@@ -561,20 +585,25 @@ type Config struct {
 	// URLRedirectAllErrorRetry 全局「整轮候选全部失败」后的重试轮数。
 	// nil（未配置）= 0（不重试）；负数为配置错误（Validate 拒绝）。
 	URLRedirectAllErrorRetry *int `yaml:"url-redirect-all-error-retry"`
-	// URLRedirectProbeTimeout 全局单次候选尝试的探测预算：从发出请求到「响应头可用
-	//（含 401 token dance 的第二次响应）且成功判据可判定（首块读出或 EOF）」的时限，
-	// 覆盖建连后的等待与 token dance 全程；到期取消该次尝试并硬失败快切下一候选。
-	// 仅约束探测阶段：探测通过后的 body 读取（流式透传/缓冲排干）不受它约束，
+	// URLRedirectProbeTimeout 全局单次候选尝试的探测预算：从发出请求到「**最终响应头
+	// 到达**（含 401 token dance 的第二次响应）」的时限，覆盖建连后的等待与 token dance
+	// 全程；到期取消该次尝试并硬失败快切下一候选。响应头到达即停表——「首块 body 到达」
+	// 不算进探测预算（现场 1ms.run 已回 206，却因还在等首块被判 probe-timeout 硬失败丢弃）；
+	// 仅约束探测阶段：探测通过后的首块/body 读取（流式透传/缓冲排干）不受它约束，
 	// 仍由 http-timeout（尝试总超时）与 read-timeout（无新增数据）负责；
 	// 建连本身由 connect-timeout 负责。nil（未配置）= 缺省 5s；显式 0 = 不限制；
-	// 负数为配置错误（Validate 拒绝）。
+	// 负数为配置错误（Validate 拒绝）。注意未显式配置时，docker blob 目标改用更大的
+	// 缺省 30s（DefaultBlobURLRedirectProbeTimeout，见 Options.CandidateProbeTimeoutFor）；
+	// 本字段一旦显式配置（含显式 0）就对全部目标生效、不再套用 blob 缺省。
 	URLRedirectProbeTimeout *Duration `yaml:"url-redirect-probe-timeout"`
 	// URLRedirectHedgeDelay 全局候选阶梯竞速（hedge）的放行间隔：候选按 round-robin
 	// 顺序起步，首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消）；
 	// 第一个通过成功判据的候选胜出，其余全部取消（context 取消，连接及时释放）。
 	// 0 = 纯串行禁用竞速（上一候选出结果后才放行下一个）；负数为配置错误（Validate 拒绝）。
 	URLRedirectHedgeDelay *Duration `yaml:"url-redirect-hedge-delay"`
-	// SlowDownloadSpeed 全局慢速升级多源并发续传的判慢阈值（B/s）：流式回源的滑动窗口
+	// SlowDownloadSpeed 全局慢速升级多源并发续传的判慢阈值（B/s）：**仅 type: docker 规则
+	// 的流式回源生效**（规则没写 type: docker 时，规则级/全局的 slow-download-* 都不会启用，
+	// 详见 DomainRule.SlowDownloadSpeed 的「⚠ 坑」说明）。流式回源的滑动窗口
 	// 平均送出速率低于它判「过慢」，对（候选数>1 的）docker 类流式下载向全部其余候选并发
 	// 发起 Range 续传并有序合并。默认 1MB/s；显式 <=0 = 关闭整个特性；负数为配置错误
 	//（Validate 拒绝）。仅 type=docker 规则生效。
@@ -693,9 +722,16 @@ type Options struct {
 	// 总轮数 = 1+N；重试轮沿用同一候选顺序）。
 	URLRedirectAllErrorRetry int
 	// URLRedirectProbeTimeout 单次候选尝试的探测预算（0 = 不限制）：从发出请求到
-	//「响应头可用（含 token dance 的第二次响应）且成功判据可判定」的时限，到期取消
-	// 该次尝试并硬失败快切下一候选；仅约束探测阶段，探测后的 body 读取不受它约束。
+	//「**最终响应头到达**（含 token dance 的第二次响应）」的时限，到期取消该次尝试并
+	// 硬失败快切下一候选。响应头到达即停表——「首块 body 到达」不算进探测预算（现场
+	// 1ms.run 已回 206 却因等首块被判 probe-timeout 硬失败丢弃），后续首块/body 读取由
+	// read-timeout 与 http-timeout 兜底；仅约束探测阶段。
 	URLRedirectProbeTimeout time.Duration
+	// URLRedirectProbeTimeoutExplicit 探测预算是否在候选级/规则级/全局被**显式配置**过
+	//（ResolveOptions 填充，仅供 proxy 层判定「未配置时可否套用 blob 缺省」）：
+	// false 时 docker blob 目标可用更大的 DefaultBlobURLRedirectProbeTimeout，
+	// true 时上面 URLRedirectProbeTimeout 的原值（含显式 0 = 不限制）一律优先。
+	URLRedirectProbeTimeoutExplicit bool
 	// URLRedirectHedgeDelay 候选阶梯竞速的放行间隔（0 = 纯串行禁用竞速）：
 	// 首个候选立即发出，之后每隔该间隔放行下一个候选并发探测（前一个不取消），
 	// 第一个通过成功判据的候选胜出，其余全部取消。
@@ -782,6 +818,26 @@ func (o Options) CandidateReadTimeout(item URLRedirectItem) time.Duration {
 // （GlobalURLRedirectProbeTimeout），显式 0 = 不限制，nil = 逐级继承。
 func (o Options) CandidateProbeTimeout(item URLRedirectItem) time.Duration {
 	return candidateDurationOverride(item.ProbeTimeout, o.URLRedirectProbeTimeout)
+}
+
+// CandidateProbeTimeoutFor 按目标类型返回候选单次探测预算最终生效值：
+// 非 blob 目标 = CandidateProbeTimeout（行为与旧版完全一致）；
+// **docker blob 目标（/v2/<name>/blobs/<digest>）且候选级/规则级/全局都未显式配置**时
+// 改用更大的 blob 缺省 DefaultBlobURLRedirectProbeTimeout（30s）——302MB 级 layer 的上游
+// 响应头经常 5s 内到不了，5s 预算会把候选全判硬失败直接 502（现场故障的直接原因之一）。
+// 显式配置永远优先（含候选级 probe-timeout、规则/全局 url-redirect-probe-timeout，以及
+// 显式 0 = 不限制），语义与 CandidateProbeTimeout 完全一致。
+// 探测预算的计时口径见 Options.URLRedirectProbeTimeout 与 proxy 包 probe.go：最终响应头
+// 到达即算探测成功（不把首块 body 算进预算）。
+// blobTarget 由调用方按目标串解析后传入（proxy 包的 parseDockerBlobTarget 判定）。
+func (o Options) CandidateProbeTimeoutFor(item URLRedirectItem, blobTarget bool) time.Duration {
+	if item.ProbeTimeout != nil || o.URLRedirectProbeTimeoutExplicit {
+		return o.CandidateProbeTimeout(item)
+	}
+	if blobTarget {
+		return DefaultBlobURLRedirectProbeTimeout
+	}
+	return o.CandidateProbeTimeout(item)
 }
 
 // Default 返回内置默认配置（配置文件缺失时兜底，也是 Load 时叠加解析的底版：
@@ -1336,6 +1392,10 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		SlowDownloadWindow:        c.GlobalSlowDownloadWindow(),
 		SlowDownloadMinRemaining:  c.GlobalSlowDownloadMinRemaining(),
 		SlowDownloadMaxBehind:     c.GlobalSlowDownloadMaxBehind(),
+
+		// 全局是否显式配置过探测预算：false 时 docker blob 目标可套用更大的 blob 缺省
+		//（见 Options.CandidateProbeTimeoutFor）
+		URLRedirectProbeTimeoutExplicit: c.URLRedirectProbeTimeout != nil,
 	}
 	// //////////////////  全局默认值  end  ////////////////////////////////////////////////
 
@@ -1425,6 +1485,8 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		}
 		if r.URLRedirectProbeTimeout != nil {
 			o.URLRedirectProbeTimeout = r.URLRedirectProbeTimeout.D()
+			// 规则级显式配置同样优先于 blob 缺省（见 Options.CandidateProbeTimeoutFor）
+			o.URLRedirectProbeTimeoutExplicit = true
 		}
 		if r.URLRedirectHedgeDelay != nil {
 			o.URLRedirectHedgeDelay = r.URLRedirectHedgeDelay.D()

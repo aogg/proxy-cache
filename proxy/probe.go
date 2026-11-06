@@ -3,10 +3,11 @@
 // 即返回，body 保持活体，由调用方决定流式透传（GET 路径目标缓存 MISS）还是
 // 排干成完整 Entry（HEAD / 完整 URL 缓冲回放）。
 //
-// 探测预算（probe-timeout）只覆盖「发出请求 → 响应头可用 → 首块/EOF 判定完成」的
-// 探测阶段（含 token dance 全程），到期取消该次尝试并按硬失败快切下一候选；
-// 探测通过后预算即解除，后续读 body 不受它约束（仍受 http-timeout / read-timeout 约束，
-// 建连本身由 connect-timeout 负责，见 probeCandidateAttempt 注释）。
+// 探测预算（probe-timeout）只覆盖「发出请求 → **最终响应头到达**」的探测阶段（含 token
+// dance 全程）——响应头到手即算探测成功（onHeaders 回调即停表），**不把「首块 body 到达」
+// 算进预算**（现场：1ms.run 已回 206，仍因等首块被 5s 预算判硬失败丢弃）；到期取消该次
+// 尝试并按硬失败快切下一候选。探测通过后预算即解除，后续读 body 不受它约束（仍受
+// http-timeout / read-timeout 约束，建连本身由 connect-timeout 负责，见 probeCandidateAttempt）。
 
 package proxy
 
@@ -158,12 +159,17 @@ func probeHardFailReason(res *probeResult) string {
 //   - read-timeout 看门狗（progressWatchdog）在本函数内创建，onWatchdog 非 nil 时在
 //     「请求发出前」回调（探测管线借此把预算定时器联动到 wd.cancel——到期取消在途请求，
 //     且不连坐 http-timeout 分支，成功路径拆除联动后活体 body 不受影响）；
+//   - onHeaders 非 nil 时在「最终响应头到达」（含 401 token dance 的第二次响应，尚未读
+//     首块）回调一次：探测管线借此把 probe-timeout 计时器停在「响应头到达」这一刻——探测
+//     预算的本意是「别让 docker 等不到响应头」，响应头到手即已达成目的；现场证据：1ms.run
+//     已在 5s 内回 206（token dance 花 2.9s），却因为还在等首块被 probe-timeout 判硬失败
+//     丢弃。其余调用方传 nil（行为不变）；
 //   - 成功时 cancelTimeout 与 wd.Stop 注册进返回结果的 onClose 链（流结束/放弃时统一
 //     释放）；失败时立即回收，防计时器泄漏。
 //
 // 返回 (结果, 错误)：res 非 nil 时资源所有权移交调用方。eff 为该请求「规则 ?? 全局」
 // 合并生效配置，保留在签名中维持调用方语义（尝试级取值已全部随 cand 传入）。
-func (s *Server) startUpstream(parent context.Context, r *http.Request, cand candidate, eff config.Options, rangeHeader string, onWatchdog func(*progressWatchdog)) (res *probeResult, err error) {
+func (s *Server) startUpstream(parent context.Context, r *http.Request, cand candidate, eff config.Options, rangeHeader string, onWatchdog func(*progressWatchdog), onHeaders func()) (res *probeResult, err error) {
 	urlStr := cand.url // 候选最终 URL（占位符展开后）
 	// //////////////////  http-timeout（整次尝试总预算）  start  //////////////////////////////
 	// 与客户端连接解耦由上层 ctx（WithoutCancel）保证；这里的总预算不能 defer cancel——
@@ -224,6 +230,13 @@ func (s *Server) startUpstream(parent context.Context, r *http.Request, cand can
 
 	// //////////////////  探测首块（判据可判定即返回）  start  ////////////////////////////////////
 	res = newProbeResultFromResponse(resp, wd, urlStr)
+	// 「响应头到达」回调：401 会走 token dance，此时探测成功的响应头应是 dance 后的第二次
+	// 响应（见下方 dance 分支）；其余情况首个响应头即最终响应头——立刻通知探测管线停表
+	// （probe-timeout 只覆盖到响应头，不把首块 body 到达算进探测预算）
+	if onHeaders != nil && (res.status != http.StatusUnauthorized ||
+		(r.Method != http.MethodGet && r.Method != http.MethodHead)) {
+		onHeaders()
+	}
 	if res.body != nil {
 		first, eof, ferr := readProbeFirst(res.body, wd)
 		if ferr != nil {
@@ -246,6 +259,11 @@ func (s *Server) startUpstream(parent context.Context, r *http.Request, cand can
 			res.Close() // 首 401 响应已被 dance 排干并关闭，释放其资源引用后改用重试响应
 			res = newProbeResultFromResponse(resp2, wd, urlStr)
 			res.danced = true
+			// dance 后的第二次响应头到达：这才是「探测成功」的时刻（token dance 全程仍在
+			// 探测预算内，dance 完拿到响应头就解除预算，不再等首块）
+			if onHeaders != nil {
+				onHeaders()
+			}
 			if res.body != nil {
 				first, eof, ferr := readProbeFirst(res.body, wd)
 				if ferr != nil {
@@ -282,10 +300,15 @@ func (s *Server) startUpstream(parent context.Context, r *http.Request, cand can
 // 探测预算（probe-timeout）的包装，预算同样取候选级生效值 cand.probeTimeout
 // （候选显式 ?? 规则 ?? 全局，ExpandCandidates 解析——走慢代理的候选可单独放宽
 // 探测预算，其他候选保持快速失败节奏）：
-//   - probe-timeout：从发出请求到「响应头可用（含 token dance 的第二次响应）且成功
-//     判据可判定（首块读出或 EOF）」的时限，覆盖建连后的等待与 token dance 全程；
-//     到期经 AfterFunc 联动取消看门狗 ctx 使在途请求立即失败，硬失败快切下一候选；
-//     探测结束（成败皆然）即拆链停表——探测通过后预算解除，绝不影响后续 body 读取；
+//   - probe-timeout：从发出请求到「**最终响应头到达**（含 token dance 的第二次响应）」
+//     的时限，覆盖建连后的等待与 token dance 全程；到期经 AfterFunc 联动取消看门狗 ctx
+//     使在途请求立即失败，硬失败快切下一候选；
+//     **口径**：响应头到达即算探测成功——计时器在 onHeaders 回调里就地停表/拆链，之后
+//     只等首块不再受它约束（首块由 read-timeout「无新增数据」与 http-timeout「整次尝试」
+//     兜底）。现场证据：1ms.run 已在 5s 内回 206（dance 花 2.9s），却因为还在等首块被
+//     probe-timeout 判硬失败丢弃；把首块从预算判据里摘掉，同时保留「响应头都等不到」时
+//     的快速失败（这才是预算的原始目的：别让 docker 等响应头超过约 30s）；
+//     探测结束（成败皆然）也停表——探测通过后预算解除，绝不影响后续 body 读取；
 //     0 = 不限制。预算 ctx 与 http-timeout 分支平级（联动只取消看门狗），
 //     成功路径拆除联动并回收预算 ctx 后，活体 body 的读取不受任何影响。
 func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, cand candidate, eff config.Options) (res *probeResult, err error, hard bool, hardReason string) {
@@ -320,13 +343,30 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 			stopLink = context.AfterFunc(probeCtx, wd.cancel)
 		}
 	}
+	// onHeaders 在「最终响应头到达」（含 token dance 的第二次响应、尚未读首块）时回调：
+	// 停表并解除与看门狗的联动——响应头到手即已达成探测预算的目的（别让 docker 等不到
+	// 响应头），此后只等首块由 read-timeout / http-timeout 兜底，不再按 probe-timeout 硬砍。
+	// 竞态说明：若定时器恰好已触发，Stop 返回 false，此时取消已经发生（本次尝试会失败），
+	// 不做任何事即可（probeFired 已置位，上层按硬失败处理）。
+	onHeaders := func() {
+		if probeTimer == nil || probeFired.Load() {
+			return
+		}
+		if probeTimer.Stop() {
+			if stopLink != nil {
+				stopLink()
+			}
+			s.log.Debug("候选探测预算已解除（最终响应头已到达，首块读取只受 read-timeout/http-timeout 约束）",
+				"candidate", truncate(cand.url, 300), "probe_timeout", cand.probeTimeout.String())
+		}
+	}
 	// //////////////////  probe-timeout（探测预算，到期硬失败快切）  end  ///////////////////////
 
-	res, err = s.startUpstream(parent, r, cand, eff, "", onWatchdog)
+	res, err = s.startUpstream(parent, r, cand, eff, "", onWatchdog, onHeaders)
 	if err != nil {
 		if probeExpired() {
 			// 探测预算到期：硬失败快切下一候选（跳过 item 原地重试）
-			return nil, fmt.Errorf("probe-timeout（候选探测预算 %s 内响应头/首块未就绪）: %w",
+			return nil, fmt.Errorf("probe-timeout（候选探测预算 %s 内响应头未就绪）: %w",
 				cand.probeTimeout, err), true, "probe-timeout"
 		}
 		return nil, err, false, ""
@@ -337,7 +377,7 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 		// 首次读 body 就会失败，产生半截响应）
 		res.Close()
 		res = nil // 已放弃该结果：置 nil 让出口的释放链立即回收看门狗/超时预算
-		return nil, fmt.Errorf("probe-timeout（候选探测预算 %s 内响应头/判据未就绪）",
+		return nil, fmt.Errorf("probe-timeout（候选探测预算 %s 内响应头未就绪）",
 			cand.probeTimeout), true, "probe-timeout"
 	}
 	return res, nil, false, ""

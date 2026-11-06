@@ -125,10 +125,16 @@ type candidate struct {
 // （候选显式空串 = 强制直连，见 config.Options.CandidateHTTPProxy）与四个超时
 // （connect-timeout / http-timeout / read-timeout / probe-timeout，候选显式 0 = 不限制），
 // 使单个候选可单独走指定代理并放宽/收紧各类超时（慢代理场景），互不影响其他候选。
+//
+// probe-timeout 按目标类型取缺省：docker blob 目标（/v2/<name>/blobs/<digest>）在三级都
+// 未显式配置时用更大的 blob 缺省 30s（见 config.DefaultBlobURLRedirectProbeTimeout），
+// 其余目标沿用 5s 快速失败节奏（见 config.Options.CandidateProbeTimeoutFor）。
 func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff config.Options) []candidate {
 	if len(items) == 0 {
 		return nil
 	}
+	// 目标类型只与目标串有关（完整 URL 目标带 scheme，天然解析不成 blob 路径）
+	_, blobTarget := parseDockerBlobTarget(vars.Target)
 	pairs := vars.pairs()
 	out := make([]candidate, 0, len(items))
 	for _, item := range items {
@@ -143,7 +149,7 @@ func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff conf
 			connectTimeout:     eff.CandidateConnectTimeout(item),
 			httpTimeout:        eff.CandidateHTTPTimeout(item),
 			readTimeout:        eff.CandidateReadTimeout(item),
-			probeTimeout:       eff.CandidateProbeTimeout(item),
+			probeTimeout:       eff.CandidateProbeTimeoutFor(item, blobTarget),
 		})
 	}
 	return out

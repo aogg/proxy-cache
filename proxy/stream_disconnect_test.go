@@ -652,18 +652,25 @@ func TestDockerLogAttrsSmoke(t *testing.T) {
 	}
 	wantLineField(t, hit[0], "source=client", "image="+name)
 
-	// BYPASS：带 Range 的 GET 绕过缓存，日志带 source=client + image
+	// BYPASS：起点 >0 的 Range（本地无缓存、无半截）走旧版 206 透传，日志带 source=client + image。
+	// 注：起点 0 的 blob Range 本轮已按完整 GET 接管（见 client_range.go），不再进 BYPASS，
+	// 因此这里必须用起点 >0 且本地确实没有内容的 digest 才能触发 BYPASS 决策日志。
 	logBufLen = fx.logBuf.Len()
+	bypassDigest := prefetchDigestConfig
+	fx.reg.setContent(bypassDigest, hubBlobContent(0xd7, 4<<10))
 	wBypass := httptest.NewRecorder()
-	rb := prefetchBlobTestRequest(name, digest)
-	rb.Header.Set("Range", "bytes=0-")
+	rb := prefetchBlobTestRequest(name, bypassDigest)
+	rb.Header.Set("Range", "bytes=100-")
 	fx.s.ServeHTTP(wBypass, rb)
+	if wBypass.Code != http.StatusPartialContent {
+		t.Fatalf("BYPASS Code = %d, want %d（起点 >0 且本地无内容维持 206 透传）", wBypass.Code, http.StatusPartialContent)
+	}
 	bypassLog := fx.logBuf.String()[logBufLen:]
 	bypass := logLinesOf(bypassLog, "GET 请求绕过缓存（BYPASS）")
 	if len(bypass) == 0 {
 		t.Fatalf("应输出 BYPASS 决策日志，实际:\n%s", bypassLog)
 	}
-	wantLineField(t, bypass[0], "source=client", "image="+name)
+	wantLineField(t, bypass[0], "source=client", "image="+name, "reason=blob-range")
 
 	// 预取：后台预取完成日志带 source=prefetch + image + digest（与客户端来源区分）
 	logBufLen = fx.logBuf.Len()

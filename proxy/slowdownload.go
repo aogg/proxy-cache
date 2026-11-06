@@ -532,7 +532,7 @@ func (s *Server) escalateSlowSources(r *http.Request, winner *probeResult, winne
 // 由本协程启动该源的 pump。全部状态写入在 m.mu 下进行（与合并循环并发安全）。
 func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerger, cand candidate, eff config.Options, rangeHeader string, offset int64) {
 	// 与客户端断开解耦（WithoutCancel）：docker 已断开也继续填缓存（与胜者流同一语义）
-	res, err := s.startUpstream(context.WithoutCancel(r.Context()), r, cand, eff, rangeHeader, nil)
+	res, err := s.startUpstream(context.WithoutCancel(r.Context()), r, cand, eff, rangeHeader, nil, nil)
 	if err != nil {
 		m.mu.Lock()
 		src.err = err

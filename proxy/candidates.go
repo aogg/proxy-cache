@@ -13,6 +13,9 @@
 //     判定不变：一轮 = 所有候选（含各自 item 重试）都出结果且无胜出；
 //   - 扫描总预算：从首个候选发出到全部候选出结果的整体上限（candidateScanBudget），
 //     到期取消全部在途尝试并按失败返回，调用方尽早 502（docker 客户端会自行重试该层）；
+//     docker blob 目标用放大的预算（candidateScanBudgetFor：60s 起，按候选数×hedge 与
+//     探测预算动态放大），保证 blob 的 30s 探测预算不被总预算腰斩，manifest 等小目标
+//     维持 20s 快速失败节奏；
 //   - 上游明确 4xx 载荷（见 upstream_status.go）：候选判据不过且状态码为 4xx（401 除外）
 //     时把「状态码+响应头+body（探测量级）」装进该候选失败错误；全部候选失败后随最终
 //     错误上浮，由客户端出口透传给 docker（网络/超时类失败与扫描预算耗尽不带载荷，仍 502）。
@@ -30,13 +33,75 @@ import (
 	"proxy-cache/config"
 )
 
-// candidateScanBudget 候选扫描总预算：selectCandidate 从首个候选发出到全部候选出结果
-// 的整体上限，到期取消全部在途尝试并按失败返回（调用方 502，docker 自行重试该层）。
-// 取值依据：docker 客户端等响应头约 30s 就超时断开，留出 commit 与首块写出的余量后取
-// 20s。默认参数（probe 5s / hedge 2s / item 0 / round 0，5 候选）下单轮最坏 ≈
+// candidateScanBudget 候选扫描总预算（非 blob 目标）：selectCandidate 从首个候选发出到
+// 全部候选出结果的整体上限，到期取消全部在途尝试并按失败返回（调用方 502，docker 自行
+// 重试该层）。取值依据：docker 客户端等响应头约 30s 就超时断开，留出 commit 与首块写出
+// 的余量后取 20s。默认参数（probe 5s / hedge 2s / item 0 / round 0，5 候选）下单轮最坏 ≈
 // (5-1)*2s + 5s = 13s，不会被它触发；只有 item/round 重试叠加的极坏情况（理论串行
 // 36s+）才会触顶提前失败。
+// docker blob 目标不用本值（见 candidateScanBudgetFor / candidateScanBudgetBlob）：
+// blob 的探测预算缺省是 30s，20s 总预算会先把扫描掐死，等于 blob 探测预算白加。
 const candidateScanBudget = 20 * time.Second
+
+// candidateScanBudgetBlob docker blob 目标的候选扫描总预算下限：60s。
+// 为什么不沿用 20s：blob 的候选探测预算缺省是 30s（config.DefaultBlobURLRedirectProbeTimeout），
+// 而 20s 的总预算会在探测预算用完之前就把整轮扫描掐死——现场日志正是「1ms.run 已经拿到
+// 206（token dance 花 2.9s），随后仍在 probe-timeout 处被判硬失败」+「候选扫描总预算
+// 耗尽 budget=20s → 502」，配了 url-redirect-all-error-retry: 1 也因预算耗尽形同虚设。
+// 单轮最坏 ≈ (候选数-1)×hedge 放行间隔 + 单个候选探测预算（默认 7 候选 × 2s + 30s = 42s），
+// 再留整轮重试与收尾余量，故取 60s 下限；候选更多 / 候选级探测预算更大时按
+// blobCandidateScanBudget 动态放大。
+//
+// 与「commit 早于 docker 约 30s 响应头超时」的关系（别误读）：扫描总预算只是**放弃阈值**，
+// 不参与 commit 时机——hedge 竞速下「首个通过判据的候选」立即胜出并 commit，commit 时刻
+// 与预算大小无关；放大预算只影响「全都慢时多久放弃」，绝不会把已经就绪的候选拖在预算里。
+const candidateScanBudgetBlob = 60 * time.Second
+
+// blobScanSlack blob 扫描总预算里给「整轮重试 + 收尾」留的余量：单轮最坏之外再给 20s，
+// 让 url-redirect-all-error-retry 在预算内还有机会真正跑一轮（现场配了 1 轮却因 20s
+// 总预算耗尽而形同虚设），同时不至于让失败收场拖得过久。
+const blobScanSlack = 20 * time.Second
+
+// candidateScanBudgetFor 返回本次候选扫描的总预算（见 selectCandidate 的 scanTimer）：
+//   - 非 blob 目标：沿用 candidateScanBudget（20s），manifest / web 等小响应保持既有快速
+//     失败节奏（行为与旧版完全一致）；
+//   - docker blob 目标：max(candidateScanBudgetBlob, 单轮最坏 + blobScanSlack)，其中
+//     「单轮最坏 = (候选数-1)×hedge 放行间隔 + 候选级探测预算的最大值」——保证 blob 的
+//     30s（或候选级显式配置的更大值）探测预算真的能在一次扫描里用完，而不是被总预算腰斩。
+//
+// target 为 ExtractTarget 的目标原文（blob 判定复用 parseDockerBlobTarget）；eff 提供
+// 候选级/规则级/全局解析后的探测预算与 hedge 间隔（与真实扫描用同一套取值）。
+func candidateScanBudgetFor(target string, n int, eff config.Options) time.Duration {
+	if _, ok := parseDockerBlobTarget(target); !ok {
+		return candidateScanBudget
+	}
+	return blobCandidateScanBudget(n, eff)
+}
+
+// blobCandidateScanBudget docker blob 目标的扫描总预算（candidateScanBudgetFor 的 blob
+// 分支；续传扫描 scanResumeCandidate 只服务 blob，同样复用本函数）。
+func blobCandidateScanBudget(n int, eff config.Options) time.Duration {
+	maxProbe := time.Duration(0)
+	for _, item := range eff.URLRedirect {
+		d := eff.CandidateProbeTimeoutFor(item, true)
+		if d <= 0 {
+			// 显式 0 = 不限制：估算时按 blob 缺省代替，否则预算会被算成无穷大（永不放弃）
+			d = config.DefaultBlobURLRedirectProbeTimeout
+		}
+		if d > maxProbe {
+			maxProbe = d
+		}
+	}
+	if maxProbe <= 0 {
+		// 防御：候选列表为空（理论上不会走到扫描）时按 blob 缺省估算
+		maxProbe = config.DefaultBlobURLRedirectProbeTimeout
+	}
+	worstRound := time.Duration(max0(n-1))*eff.URLRedirectHedgeDelay + maxProbe + blobScanSlack
+	if worstRound < candidateScanBudgetBlob {
+		return candidateScanBudgetBlob
+	}
+	return worstRound
+}
 
 // candidateOutcome 是一个候选（含其全部 item 尝试）的最终结果。
 type candidateOutcome struct {
@@ -56,7 +121,10 @@ type candidateOutcome struct {
 //
 // 轮询起始下标沿用全局 rr 计数器（round-robin 语义不变，每个请求 +1）；
 // 请求方法沿用入站方法（GET/HEAD），Range 透传与否由成功判据（probePassed）处理。
-func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff config.Options) (*probeResult, error) {
+//
+// target 为本次回源的目标原文：只用于按目标类型取候选扫描总预算（docker blob 放大，
+// 见 candidateScanBudgetFor）；非 blob 目标的总预算与旧版完全一致。
+func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff config.Options, target string) (*probeResult, error) {
 	n := len(candidates)
 	// //////////////////  轮询起始下标：第 1 次请求从 0 开始，之后逐次 +1  start  ////////
 	start := int(s.rr.Add(1)-1) % n
@@ -81,8 +149,10 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 	// 基础 ctx：与客户端断开解耦（WithoutCancel）——客户端断开不中断候选扫描，
 	// 保证「缓存填充完成」语义与旧版一致。cancelBase 仅由扫描总预算定时器触发；
 	// 胜出即停表，并把 cancelBase 挂到胜出结果的资源链上（流结束后统一释放）。
+	// 总预算按目标类型取：非 blob 20s（旧版一致）、docker blob 放大（见 candidateScanBudgetFor）
+	scanBudget := candidateScanBudgetFor(target, n, eff)
 	base, cancelBase := context.WithCancel(context.WithoutCancel(r.Context()))
-	scanTimer := time.AfterFunc(candidateScanBudget, cancelBase)
+	scanTimer := time.AfterFunc(scanBudget, cancelBase)
 
 	var (
 		schedMu    sync.Mutex
@@ -337,9 +407,9 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 		// 「拿到了明确上游响应」的失败上浮；预算到期属超时类失败，维持 502）
 		lastErr = stripUpstreamStatus(lastErr)
 		s.log.Error("url-redirect 候选扫描总预算耗尽，提前终止候选扫描",
-			"budget", candidateScanBudget.String(), "round", round,
+			"budget", scanBudget.String(), "round", round,
 			"round_total", totalRounds, "last_error", lastErr)
-		return nil, fmt.Errorf("候选扫描总预算（%s）耗尽: %w", candidateScanBudget, lastErr)
+		return nil, fmt.Errorf("候选扫描总预算（%s）耗尽: %w", scanBudget, lastErr)
 	}
 	if lastErr == nil {
 		lastErr = errors.New("全部 url-redirect 候选尝试均未产生结果")

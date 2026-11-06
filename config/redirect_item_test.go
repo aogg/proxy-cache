@@ -569,3 +569,129 @@ func TestValidateCandidateTimeoutsNegativeRejected(t *testing.T) {
 		}
 	})
 }
+
+// TestCandidateProbeTimeoutFor 覆盖 Options.CandidateProbeTimeoutFor 的目标类型缺省：
+// 非 blob 目标等价 CandidateProbeTimeout（行为与旧版完全一致）；docker blob 目标在
+// 「候选级/规则级/全局都未显式配置」时改用更大的 blob 缺省 30s
+// （DefaultBlobURLRedirectProbeTimeout）——302MB 级 layer 的上游响应头经常 5s 内到不了，
+// 5s 预算会把候选全判硬失败直接 502（现场故障的直接原因之一）。
+// 优先级口径与 CandidateProbeTimeout 一致：候选级 > 规则/全局 > blob 缺省；
+// 显式 0 = 不限制，同样优先于 blob 缺省。
+func TestCandidateProbeTimeoutFor(t *testing.T) {
+	blobTarget := "v2/demo/app/blobs/sha256:" + strings.Repeat("ab", 32)
+	manifestTarget := "v2/demo/app/manifests/latest"
+	globalDefault := Options{URLRedirectProbeTimeout: DefaultURLRedirectProbeTimeout}
+	tests := []struct {
+		name string
+		item URLRedirectItem
+		opts Options
+		blob bool
+		want time.Duration
+	}{
+		{
+			name: "非blob未显式_全局缺省5s",
+			opts: globalDefault,
+			blob: false,
+			want: DefaultURLRedirectProbeTimeout,
+		},
+		{
+			name: "blob未显式_改用30s缺省",
+			opts: globalDefault,
+			blob: true,
+			want: DefaultBlobURLRedirectProbeTimeout,
+		},
+		{
+			name: "blob候选级显式7s_覆盖率缺省",
+			item: URLRedirectItem{ProbeTimeout: durPtr(7 * time.Second)},
+			opts: globalDefault,
+			blob: true,
+			want: 7 * time.Second,
+		},
+		{
+			name: "blob候选级显式0不限制",
+			item: URLRedirectItem{ProbeTimeout: durPtr(0)},
+			opts: globalDefault,
+			blob: true,
+			want: 0,
+		},
+		{
+			name: "blob全局显式11s_不再套缺省",
+			opts: Options{URLRedirectProbeTimeout: 11 * time.Second, URLRedirectProbeTimeoutExplicit: true},
+			blob: true,
+			want: 11 * time.Second,
+		},
+		{
+			name: "blob全局显式0不限制",
+			opts: Options{URLRedirectProbeTimeout: 0, URLRedirectProbeTimeoutExplicit: true},
+			blob: true,
+			want: 0,
+		},
+		{
+			name: "非blob全局显式0不限制",
+			opts: Options{URLRedirectProbeTimeout: 0, URLRedirectProbeTimeoutExplicit: true},
+			blob: false,
+			want: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.opts.CandidateProbeTimeoutFor(tt.item, tt.blob); got != tt.want {
+				t.Errorf("CandidateProbeTimeoutFor(blob=%v) = %s, want %s", tt.blob, got, tt.want)
+			}
+			// 非 blob 分支必须与旧函数完全一致（旧行为零变化）
+			if !tt.blob && tt.item.ProbeTimeout == nil && !tt.opts.URLRedirectProbeTimeoutExplicit {
+				if got := tt.opts.CandidateProbeTimeout(tt.item); got != tt.want {
+					t.Errorf("非 blob 分支应与 CandidateProbeTimeout 一致: got %s, want %s", got, tt.want)
+				}
+			}
+		})
+	}
+
+	// ResolveOptions 的接线：规则级显式配置必须置 URLRedirectProbeTimeoutExplicit，
+	// 从而阻止 blob 缺省覆盖；三级都未配置时 blob 目标才套用 30s 缺省。
+	newRuleCfg := func(ruleTimeout *Duration) *Config {
+		cfg := Default()
+		cfg.DomainRules = []DomainRule{{
+			Name:                    "blob-probe-rule",
+			Match:                   `http://reg\.example\.com/`,
+			URLRedirectProbeTimeout: ruleTimeout,
+			URLRedirect:             &[]URLRedirectItem{{Template: "https://mirror.example.com/$1"}},
+		}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() 意外报错: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("规则级显式8s阻止blob缺省", func(t *testing.T) {
+		cfg := newRuleCfg(durPtr(8 * time.Second))
+		o := cfg.ResolveOptions("reg.example.com", blobTarget, false)
+		if !o.URLRedirectProbeTimeoutExplicit {
+			t.Error("规则级显式配置应置 URLRedirectProbeTimeoutExplicit=true")
+		}
+		if len(o.URLRedirect) != 1 {
+			t.Fatalf("生效候选数 = %d, want 1", len(o.URLRedirect))
+		}
+		if got := o.CandidateProbeTimeoutFor(o.URLRedirect[0], true); got != 8*time.Second {
+			t.Errorf("blob 目标规则级显式值 = %s, want 8s（显式配置优先于 blob 缺省）", got)
+		}
+	})
+
+	t.Run("三级未配置blob套用30s而manifest仍5s", func(t *testing.T) {
+		cfg := newRuleCfg(nil)
+		o := cfg.ResolveOptions("reg.example.com", blobTarget, false)
+		if o.URLRedirectProbeTimeoutExplicit {
+			t.Error("三级未配置时不应误标 URLRedirectProbeTimeoutExplicit")
+		}
+		if len(o.URLRedirect) != 1 {
+			t.Fatalf("生效候选数 = %d, want 1", len(o.URLRedirect))
+		}
+		if got := o.CandidateProbeTimeoutFor(o.URLRedirect[0], true); got != DefaultBlobURLRedirectProbeTimeout {
+			t.Errorf("blob 目标未显式配置 = %s, want %s", got, DefaultBlobURLRedirectProbeTimeout)
+		}
+		om := cfg.ResolveOptions("reg.example.com", manifestTarget, false)
+		if got := om.CandidateProbeTimeoutFor(om.URLRedirect[0], false); got != DefaultURLRedirectProbeTimeout {
+			t.Errorf("manifest 目标未显式配置 = %s, want %s", got, DefaultURLRedirectProbeTimeout)
+		}
+	})
+}
