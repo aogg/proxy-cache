@@ -41,6 +41,11 @@
 //     照走既有路径，属低概率退化而非错误；
 //   - 临时文件：预取自管的 body 临时文件用 .tmp- 前缀落在缓存目录（与缓存写入临时
 //     文件同前缀），进程崩溃残留由 cache.Clean 后台清理兜底。
+//
+// 日志规范：搭车侧日志（tryServeFromPrefetchHub 内，客户端请求订阅在途流）统一
+// source=ridealong；预取执行方与写侧 hub 事件（条目登记 / 广播摘除订阅者 / 临时文件
+// 清理）统一 source=prefetch；镜像名统一键 image（hub 条目登记时传入，搭车/广播日志
+// 才能带上）。键名与顺序由 log_attrs.go 统一拼装。
 
 package proxy
 
@@ -109,6 +114,9 @@ type prefetchStreamEntry struct {
 	key string
 	// rule 生效规则名（日志观测，构造后只读）。
 	rule string
+	// image 镜像仓库名（日志统一标签，构造后只读；/v2/<name>/blobs/<digest> 的 name，
+	// 见 log_attrs.go 的统一键规范——登记时传入，搭车/广播日志才能带 image）。
+	image string
 	// digest blob digest（日志观测，构造后只读）。
 	digest string
 	// hub 所属注册表（终态移除 / done 滞留登记用）。
@@ -176,11 +184,13 @@ func (s *Server) prefetchHubOrInit() *prefetchStreamHub {
 
 // register 登记在途条目（预取开始下载时调用；调用方保证同 key 只有一个写者——
 // prefetchInflight 已挡住同 blob 的重复预取）。同 key 的 done 滞留条目被直接覆盖
-// （其 linger 定时器的 removeIf 指针比对不会误删新条目）。
-func (h *prefetchStreamHub) register(key, rule, digest string, log *slog.Logger) *prefetchStreamEntry {
+// （其 linger 定时器的 removeIf 指针比对不会误删新条目）。image 为镜像仓库名
+// （日志统一标签，登记时传入，见 log_attrs.go）。
+func (h *prefetchStreamHub) register(key, rule, image, digest string, log *slog.Logger) *prefetchStreamEntry {
 	ent := &prefetchStreamEntry{
 		key:     key,
 		rule:    rule,
+		image:   image,
 		digest:  digest,
 		hub:     h,
 		log:     log,
@@ -200,10 +210,12 @@ func (h *prefetchStreamHub) register(key, rule, digest string, log *slog.Logger)
 // 「先追加磁盘、后推进 written」的既有契约推进）；resume=true（hub 绝不清理半截文件，
 // 客户端等待超限重试时按续传条目优先搭车）。条目字段在发布（写入注册表）前一次性
 // 填好，保证并发搭车者查到的条目自带正确前缀，无「先注册后补写」的竞态窗口。
-func (h *prefetchStreamHub) registerResume(key, rule, digest string, prefix int64, log *slog.Logger) *prefetchStreamEntry {
+// image 为镜像仓库名（日志统一标签，登记时传入，见 log_attrs.go）。
+func (h *prefetchStreamHub) registerResume(key, rule, image, digest string, prefix int64, log *slog.Logger) *prefetchStreamEntry {
 	ent := &prefetchStreamEntry{
 		key:     key,
 		rule:    rule,
+		image:   image,
 		digest:  digest,
 		hub:     h,
 		log:     log,
@@ -342,7 +354,7 @@ func (e *prefetchStreamEntry) writeBroadcast(p []byte) error {
 			close(sub.ch)
 			e.mu.Unlock()
 			e.log.Warn("搭车订阅者消费过慢已摘除（终止其响应，客户端将以 Range 续传重试；预取继续填缓存不受影响）",
-				"rule", e.rule, "key", e.key, "digest", e.digest)
+				dockerLogAttrs(e.logSourceOf(), e.image, "rule", e.rule, "key", e.key, "digest", e.digest)...)
 			continue
 		}
 		e.mu.Unlock()
@@ -452,7 +464,9 @@ func (e *prefetchStreamEntry) cleanupFile() {
 			return
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			e.log.Debug("删除预取临时文件失败（残留由缓存后台清理兜底）", "file", path, "err", err)
+			// 仅预取条目会走到这里（续传条目上方已跳过）：source=prefetch
+			e.log.Debug("删除预取临时文件失败（残留由缓存后台清理兜底）",
+				dockerLogAttrs(dockerLogSourcePrefetch, e.image, "file", path, "err", err)...)
 		}
 	})
 }
@@ -477,6 +491,9 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	if disk == nil {
 		return false // 防御：缓存不可读时本检查不会被调用（handleGet 已分流）
 	}
+	// docker 日志统一标签：搭车请求必然是 /v2/ 路径目标，按需解析 image/digest
+	//（非 /v2/ 路径目标解析不出时 attrs 原样透传既有键，日志零变化）
+	labels := parseDockerLogInfo(target)
 	ent := s.prefetchHubOrInit().lookup(key)
 	if ent == nil {
 		return false // 无预取 / 无在途条目（docker-prefetch-enabled 关闭恒走此分支）：与旧版行为一致
@@ -505,8 +522,8 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 			return s.servePrefetchHubDoneHit(w, r, key, eff, disk, start)
 		}
 		s.log.Warn("搭车放弃：等待预取响应头快照超时（预取疑似卡死），改走原回源路径",
-			"rule", eff.Rule, "key", key, "digest", ent.digest,
-			"target", truncate(target, 300), "wait", prefetchHubIdleTimeout.String())
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key, "digest", ent.digest,
+				"target", truncate(target, 300), "wait", prefetchHubIdleTimeout.String())...)
 		return false
 	}
 	switch st, terr := ent.terminal(); st {
@@ -516,8 +533,8 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	case prefetchStreamFailed:
 		// 预取失败广播：搭车放弃改走既有原回源路径（客户端自己回源，上游只此一路）
 		s.log.Debug("预取失败广播，搭车放弃改走原回源路径",
-			"rule", eff.Rule, "key", key, "digest", ent.digest,
-			"target", truncate(target, 300), "err", terr)
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key, "digest", ent.digest,
+				"target", truncate(target, 300), "err", terr)...)
 		return false
 	}
 
@@ -528,15 +545,16 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	status, header, source := ent.snapshot()
 	s.commitPrefetchHubHeader(w, status, header, source)
 	s.log.Info("搭车在途预取层（拼接磁盘前缀+实时增量，上游仅预取一路下载）",
-		"rule", eff.Rule, "digest", ent.digest, "key", key,
-		"prefix_bytes", prefixLen, "candidate", truncate(source, 300), "status", status)
+		labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "key", key,
+			"prefix_bytes", prefixLen, "candidate", truncate(source, 300), "status", status)...)
 
 	// 读磁盘前缀（0..prefixLen）：预取写者按「先写文件后推进字节数」推进，读到的字节
 	// 一定是已完整写入的；文件极小竞态窗口（订阅后预取即失败清理）按已 commit 终止处理
 	f, err := os.Open(ent.tmpPathOf())
 	if err != nil {
 		s.log.Warn("搭车读磁盘前缀失败，终止本次响应（客户端将以 Range 续传重试）",
-			"rule", eff.Rule, "digest", ent.digest, "file", ent.tmpPathOf(), "err", err)
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest,
+				"file", ent.tmpPathOf(), "err", err)...)
 		return true
 	}
 	if prefixLen > 0 {
@@ -544,7 +562,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 		if _, err := io.CopyN(w, f, prefixLen); err != nil {
 			_ = f.Close()
 			s.log.Warn("搭车写响应体失败（客户端已断开，预取继续填缓存不受影响）",
-				"target", truncate(r.URL.Path, 200), "err", err)
+				labels.attrs(dockerLogSourceRidealong, "target", truncate(r.URL.Path, 200), "err", err)...)
 			return true
 		}
 	}
@@ -560,36 +578,37 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 				// 订阅结束（预取侧终态广播 close，缓冲内增量已收完）：按终态收尾
 				if ent.subOverflow(sub) {
 					s.log.Warn("搭车增量消费过慢被摘除，终止本次响应（客户端将以 Range 续传重试）",
-						"rule", eff.Rule, "digest", ent.digest, "sent", total)
+						labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "sent", total)...)
 					return true
 				}
 				st, terr := ent.terminal()
 				if st == prefetchStreamFailed {
 					s.log.Warn("预取失败广播，终止本次搭车响应（客户端将以 Range 续传重试）",
-						"rule", eff.Rule, "digest", ent.digest, "sent", total, "err", terr)
+						labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "sent", total, "err", terr)...)
 					return true
 				}
 				// done：磁盘前缀 + 增量恰好拼出完整 body，搭车完成
 				s.log.Info("搭车完成（在途预取层已完整回放）",
-					"rule", eff.Rule, "digest", ent.digest, "bytes", total,
-					"upstream", source, "cost", time.Since(start).Round(time.Millisecond).String())
+					labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "bytes", total,
+						"upstream", source, "cost", time.Since(start).Round(time.Millisecond).String())...)
 				s.log.Info("代理请求完成",
-					"method", r.Method,
-					"target", truncate(r.URL.Path, 300),
-					"status", status,
-					"cache", prefetchCacheStatus,
-					"upstream", source,
-					"rule", eff.Rule,
-					"bytes", total,
-					"cost", time.Since(start).Round(time.Millisecond).String(),
-				)
+					labels.attrs(dockerLogSourceRidealong,
+						"method", r.Method,
+						"target", truncate(r.URL.Path, 300),
+						"status", status,
+						"cache", prefetchCacheStatus,
+						"upstream", source,
+						"rule", eff.Rule,
+						"bytes", total,
+						"cost", time.Since(start).Round(time.Millisecond).String(),
+					)...)
 				return true
 			}
 			if _, werr := w.Write(chunk); werr != nil {
 				// 客户端断开：仅停止读取订阅（defer 注销），预取继续填缓存不受影响
 				//（与既有「客户端写失败继续读上游仅填缓存」语义一致）
 				s.log.Warn("搭车写响应体失败（客户端已断开，预取继续填缓存不受影响）",
-					"target", truncate(r.URL.Path, 200), "err", werr)
+					labels.attrs(dockerLogSourceRidealong, "target", truncate(r.URL.Path, 200), "err", werr)...)
 				return true
 			}
 			total += int64(len(chunk))
@@ -597,8 +616,8 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 			// 预取增量停滞（卡死/过慢）：已 commit，终止本次响应；docker 会以 Range
 			// 断点续传重试（命中已写盘的前缀缓存则 HIT、否则回源 206，都不从 0 拉整层）
 			s.log.Warn("搭车订阅超时（预取增量停滞），终止本次响应（客户端将以 Range 续传重试）",
-				"rule", eff.Rule, "digest", ent.digest, "sent", total,
-				"idle", prefetchHubIdleTimeout.String())
+				labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "digest", ent.digest, "sent", total,
+					"idle", prefetchHubIdleTimeout.String())...)
 			return true
 		}
 	}
@@ -608,8 +627,10 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 // 缓存意外缺失（写盘失败等异常）返回 false 让调用方走既有回源路径。
 func (s *Server) servePrefetchHubDoneHit(w http.ResponseWriter, r *http.Request, key string, eff config.Options, disk *cache.Cache, start time.Time) bool {
 	if e, ok := disk.Get(key); ok {
-		s.log.Info("缓存命中（HIT）", "rule", eff.Rule, "key", key,
-			"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))
+		// done 条目的兜底 HIT 仍是客户端请求触发的缓存命中回放：source=client
+		labels := parseDockerLogInfo(r.URL.Path)
+		s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+			"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
 		s.serveEntry(w, r, e, "HIT", eff, start)
 		return true
 	}
@@ -662,8 +683,10 @@ func (s *Server) commitPrefetchHubHeader(w http.ResponseWriter, status int, head
 // 不叠加 slowdownload 慢速升级多源并发续传：上游速率由预取那一路决定，过慢时靠搭车
 // 订阅超时降级 + 客户端 Range 重试兜底（取舍见文件头注释）。
 func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest string, eff config.Options, disk *cache.Cache) (*cache.Entry, error) {
+	// docker 日志统一标签：blob 目标解析 image/digest（登记 hub 条目与本函数全部日志用）
+	labels := parseDockerLogInfo(target)
 	hub := s.prefetchHubOrInit()
-	ent := hub.register(key, eff.Rule, digest, s.log)
+	ent := hub.register(key, eff.Rule, labels.image, digest, s.log)
 	// panic 防护：flight.DoLimit 对 fn panic 有自身 recover（清理在途记录后 re-panic，
 	// 最终由 prefetchImageLayers 的 goroutine 防护兜住），这里必须先把 hub 条目置
 	// failed——否则 running 条目滞留 hub 会泄漏，后续请求会搭上一条永不推进的死流
@@ -697,7 +720,8 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 	res, serr := s.selectCandidate(req, candidates, eff)
 	if serr != nil {
 		s.log.Warn("预取 blob 回源候选全败（路径目标无直连回退，已广播搭车订阅者降级）",
-			"rule", eff.Rule, "digest", digest, "target", truncate(target, 300), "last_error", serr)
+			dockerLogAttrs(dockerLogSourcePrefetch, labels.image, "rule", eff.Rule, "digest", digest,
+				"target", truncate(target, 300), "last_error", serr)...)
 		werr := fmt.Errorf("全部 url-redirect 候选失败，路径目标无直连回退（无完整原始 URL 可直连）: %w", serr)
 		ent.finishFailed(werr)
 		return nil, werr
@@ -707,9 +731,10 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 	// Docker-Content-Digest 等响应头（res.header 构建后只读，直接共享引用）
 	ent.setSnapshot(res.status, res.header, res.url)
 	s.log.Info("预取 blob 流式下载开始（在途层可搭车）",
-		"rule", eff.Rule, "digest", digest, "candidate", truncate(res.url, 300),
-		"status", res.status, "content_length", res.header.Get("Content-Length"),
-		"check", eff.SuccessCheck)
+		dockerLogAttrs(dockerLogSourcePrefetch, labels.image, "rule", eff.Rule, "digest", digest,
+			"candidate", truncate(res.url, 300),
+			"status", res.status, "content_length", res.header.Get("Content-Length"),
+			"check", eff.SuccessCheck)...)
 
 	// 失败收尾：关闭上游、广播 failed 并移除 hub 条目、清理临时文件
 	fail := func(cause error) (*cache.Entry, error) {
@@ -746,12 +771,13 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 				// 须在 fail（finishFailed 清理临时文件）之前改名——改名后旧临时文件名已
 				// 不存在，finishFailed 的清理按 ErrNotExist 静默跳过，无副作用
 				if s.cfg != nil && s.cfg.GlobalDockerPartialResumeEnabled() {
-					s.keepPrefetchPartial(disk, key, tmp.Name(), ent.writtenOf())
+					s.keepPrefetchPartial(disk, key, tmp.Name(), ent.writtenOf(), labels)
 				}
 				// 读上游失败：广播 failed（半截数据绝不入库），Error 留痕
 				s.log.Error("预取流式回源读上游失败（已广播搭车订阅者终止/降级，半截数据不入库）",
-					"rule", eff.Rule, "digest", digest, "candidate", truncate(res.url, 300),
-					"status", res.status, "bytes", ent.writtenOf(), "err", rerr)
+					dockerLogAttrs(dockerLogSourcePrefetch, labels.image, "rule", eff.Rule, "digest", digest,
+						"candidate", truncate(res.url, 300),
+						"status", res.status, "bytes", ent.writtenOf(), "err", rerr)...)
 				return fail(fmt.Errorf("预取流式回源读上游失败（%s）: %w", res.url, rerr))
 			}
 		}
@@ -759,7 +785,8 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 	res.Close()
 
 	// EOF：读回临时文件构造完整 Entry，复用既有缓存写入语义（判据 / TTL 固化 / 日志 /
-	// 预取触发全复用——blob 目标非 manifest，maybePrefetchImageLayers 内部静默返回）
+	// 预取触发全复用——blob 目标非 manifest，maybePrefetchImageLayers 内部静默返回）；
+	// 写缓存日志按本路来源标注 source=prefetch（预取写者，与客户端主路径区分）
 	data, err := os.ReadFile(tmp.Name())
 	if err != nil {
 		return fail(fmt.Errorf("读回预取临时文件失败: %w", err))
@@ -771,7 +798,7 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 		StoredAt: time.Now(),
 		Source:   res.url,
 	}
-	s.finalizeFetchEntry(req, key, target, entry, eff, disk)
+	s.finalizeFetchEntry(req, key, target, entry, eff, disk, dockerLogSourcePrefetch)
 
 	// 缓存已原子落盘：置 done 并关闭订阅（搭车方收完 channel 缓冲内的最后增量即完整）；
 	// 条目滞留 hub 一小段时间供并发 MISS 兜底检出「done → 直接 HIT」，到期自动移除
@@ -784,4 +811,14 @@ func (e *prefetchStreamEntry) writtenOf() int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.written
+}
+
+// logSourceOf 返回条目所属链路的日志来源：续传条目（resume=true）归 resume，预取条目
+// 归 prefetch——写侧 hub 事件（广播摘除订阅者 / 临时文件清理）由写者（预取/续传执行方）
+// 触发，按写者来源标注；搭车侧的日志由搭车调用点统一标 ridealong（见 tryServeFromPrefetchHub）。
+func (e *prefetchStreamEntry) logSourceOf() string {
+	if e.resume {
+		return dockerLogSourceResume
+	}
+	return dockerLogSourcePrefetch
 }

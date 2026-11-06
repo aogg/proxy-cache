@@ -39,6 +39,10 @@
 // 重试语义），绝不影响客户端主请求；客户端后续请求照走原路径——flight 等待
 // flightWaitLimit（10s）上限后自行回源的既有语义不变。
 //
+// 日志规范：本文件全部日志统一 source=prefetch（后台异步预取，与客户端请求下载区分），
+// 镜像名键统一为 image（原 name 键改名），键名与顺序由 log_attrs.go 的 dockerLogAttrs
+// 统一拼装（见该文件的统一键规范）。
+//
 // 刷新语义：blob 按 digest 寻址、内容不可变，不存在刷新问题；过期由现有 cache.ttl /
 // clean-interval 与 Janitor 管理。预取不改变 manifest 的 TTL/ETag/缓存行为；tag（如
 // :latest）更新后新 manifest 引用相同 digest 的 layer 直接命中缓存，digest 变了才回源
@@ -127,7 +131,7 @@ func (s *Server) maybePrefetchImageLayers(r *http.Request, target string, ent *c
 	if err := json.Unmarshal(ent.Body, &body); err != nil {
 		// body 已在缓存、客户端响应早已完成：解析失败只降级留痕（Debug）
 		s.log.Debug("docker manifest 解析失败，跳过 layer 预取",
-			"rule", eff.Rule, "name", name, "ref", truncate(ref, 128), "err", err)
+			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "ref", truncate(ref, 128), "err", err)...)
 		return
 	}
 	// config blob 在前（体积小、客户端必取），随后 layers；digest 不合法的单项剔除
@@ -146,8 +150,8 @@ func (s *Server) maybePrefetchImageLayers(r *http.Request, target string, ent *c
 	// //////////////////  触发条件逐项判定  end  //////////////////////////////////////////////
 
 	s.log.Info("识别到 docker manifest，异步预取镜像 layer",
-		"rule", eff.Rule, "name", name, "ref", truncate(ref, 128),
-		"blobs", len(digests), "concurrency", s.cfg.GlobalDockerPrefetchConcurrency())
+		dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "ref", truncate(ref, 128),
+			"blobs", len(digests), "concurrency", s.cfg.GlobalDockerPrefetchConcurrency())...)
 
 	// 异步执行：绝不阻塞 manifest 响应（响应此时早已写完，这里只是顺手触发的后台任务）
 	s.prefetchWG.Add(1)
@@ -159,7 +163,7 @@ func (s *Server) maybePrefetchImageLayers(r *http.Request, target string, ent *c
 		defer func() {
 			if rec := recover(); rec != nil {
 				s.log.Error("docker layer 预取任务 panic，已按任务失败处理（不影响客户端请求）",
-					"rule", eff.Rule, "name", name, "panic", rec)
+					dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "panic", rec)...)
 			}
 		}()
 		s.prefetchImageLayers(r, name, ref, digests, eff, disk)
@@ -176,14 +180,14 @@ func (s *Server) prefetchImageLayers(r *http.Request, name, ref string, digests 
 		// 任务级超时兜底：到期放弃剩余 layer（已写入缓存的 layer 保留）
 		if ctx.Err() != nil {
 			s.log.Debug("docker layer 预取任务超时，放弃剩余 blob",
-				"rule", eff.Rule, "name", name, "ref", truncate(ref, 128),
-				"done", i, "total", len(digests), "err", ctx.Err())
+				dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "ref", truncate(ref, 128),
+					"done", i, "total", len(digests), "err", ctx.Err())...)
 			return
 		}
 		s.prefetchOneBlob(ctx, r, name, digest, eff, disk)
 	}
 	s.log.Debug("docker layer 预取任务结束",
-		"rule", eff.Rule, "name", name, "ref", truncate(ref, 128), "blobs", len(digests))
+		dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "ref", truncate(ref, 128), "blobs", len(digests))...)
 }
 
 // prefetchOneBlob 预取单个 blob（/v2/<name>/blobs/<digest>）：
@@ -206,12 +210,12 @@ func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, dig
 
 	// 已有未过期缓存命中 → 跳过（Get 内含过期惰性删除语义，不重复下载）
 	if _, ok := disk.Get(blobKey); ok {
-		s.log.Debug("预取跳过：blob 缓存已命中", "rule", eff.Rule, "name", name, "digest", digest)
+		s.log.Debug("预取跳过：blob 缓存已命中", dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest)...)
 		return
 	}
 	// 该 blob 已在预取在途集合 → 跳过（防止重复排队）
 	if !s.prefetchInflightAdd(blobKey) {
-		s.log.Debug("预取跳过：同 blob 已在预取在途", "rule", eff.Rule, "name", name, "digest", digest)
+		s.log.Debug("预取跳过：同 blob 已在预取在途", dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest)...)
 		return
 	}
 	defer s.prefetchInflightRemove(blobKey)
@@ -223,7 +227,7 @@ func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, dig
 		defer func() { <-slots }()
 	case <-ctx.Done():
 		s.log.Debug("预取放弃：等待并发额度超时",
-			"rule", eff.Rule, "name", name, "digest", digest, "err", ctx.Err())
+			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest, "err", ctx.Err())...)
 		return
 	}
 
@@ -255,24 +259,24 @@ func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, dig
 	case errors.Is(err, errFlightWaitTimeout):
 		// 等待客户端在途回源超限：客户端执行方会自行写缓存，预取让路即可
 		s.log.Debug("预取等待同 blob 单飞回源超限，交由客户端既有回源填缓存",
-			"rule", eff.Rule, "name", name, "digest", digest)
+			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest)...)
 	case err != nil:
 		// 失败降级：仅留痕，绝不影响客户端主请求（客户端后续请求照走原路径）
 		s.log.Warn("预取 blob 回源失败（不影响客户端，客户端请求照走原路径）",
-			"rule", eff.Rule, "name", name, "digest", digest,
-			"target", truncate(blobTarget, 300), "err", err)
+			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest,
+				"target", truncate(blobTarget, 300), "err", err)...)
 	case !executed:
 		// 等待方共享到客户端在途回源的结果：缓存已由客户端执行方写入
 		s.log.Debug("预取合并客户端在途回源完成（缓存由执行方写入）",
-			"rule", eff.Rule, "name", name, "digest", digest)
+			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest)...)
 	default:
 		// 本调用为执行方且回源成功：留痕实际落盘文件（bytes 为 0 的防御分支仅兜 nil）
 		bytes := 0
 		if e != nil {
 			bytes = len(e.Body)
 		}
-		s.log.Info("预取 blob 写入缓存完成", "rule", eff.Rule, "name", name,
-			"digest", digest, "bytes", bytes, "file", disk.FilePath(blobKey))
+		s.log.Info("预取 blob 写入缓存完成", dockerLogAttrs(dockerLogSourcePrefetch, name,
+			"rule", eff.Rule, "digest", digest, "bytes", bytes, "file", disk.FilePath(blobKey))...)
 	}
 }
 

@@ -632,6 +632,34 @@ log:
 | `warn` | 候选请求失败 / 未过成功判据 / 回退直连、等待单飞超限自拔回源（`等待同 key 单飞回源超限，自行走候选回源`）、commit 后客户端断开（`写响应体失败`）、commit 后读上游失败（`流式回源读上游失败...不写缓存`）、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
 | `error` | 仅错误：回源彻底失败（502）、候选扫描总预算耗尽（`url-redirect 候选扫描总预算耗尽，提前终止候选扫描`）、候选尝试 panic 等 |
 
+### 日志字段说明（docker 链路统一标签）
+
+docker 加速链路（`/v2/` 路径目标请求）的全部日志统一附带以下键，用于区分「异步下载」与「客户端请求下载」、并按镜像 grep（键名与附加顺序全仓库统一，由 `proxy/log_attrs.go` 的 helper 拼装；`source` 恒在首位、`image` 次之、`digest`/`ref` 再次，既有键 `rule`/`candidate`/`key`/`target`/`err` 等原样保留在其后）：
+
+| 键 | 含义 |
+| --- | --- |
+| `source` | 本次日志行为的来源，四值枚举：`client`（客户端请求触发的回源：客户端流式主路径、HIT/MISS/BYPASS 回放与等待单飞超限后自行回源）、`ridealong`（搭车订阅在途流的客户端请求，即撞上预取/续传在途层拼接回放的请求，`X-Cache: PREFETCH`）、`resume`（blob 半截续传执行方——候选扫描/拼接/写缓存，`X-Cache: RESUME`）、`prefetch`（后台异步预取，manifest 驱动的 layer 异步下载） |
+| `image` | 镜像仓库名（`/v2/<name>/...` 的 `<name>`，多级原样保留，如 `foxhui/webai-2api`、`library/nvidia/cuda`）；解析不出（异常路径）时省略该键，不填空串 |
+| `digest` | blob digest（blob 目标 `/v2/<name>/blobs/<digest>` 的日志附带，如 `sha256:...`） |
+| `ref` | manifest 的 tag 或 digest 引用（manifest 目标 `/v2/<name>/manifests/<ref>` 的日志附带，如 `latest`） |
+
+判定规则：只有能判定为 `/v2/` 请求的日志才附加这些键；web 完整 URL 目标等非 docker 请求的日志不加，行为与旧版零变化。同一 blob 的完整生命周期串起来看就是：`source=client`（首个请求回源写缓存）→ `source=prefetch`（后台预取其余层）→ `source=ridealong`（后续请求搭上在途预取层）→ 中断时 `source=client`（半截保留）与 `source=resume`（断点续传执行方）。
+
+grep 示例（TextHandler 输出键值按 `k=v` 空格分隔、键序固定 `source` 在前，跨键过滤用管道、与键序无关）：
+
+```bash
+# 某镜像的全部链路日志（预取 + 客户端 + 搭车 + 续传一网打尽）
+grep 'image=foxhui/webai-2api' proxy-cache.log
+
+# 只看某镜像的后台异步预取（等价于 image=xxx source=prefetch 的组合过滤）
+grep 'image=foxhui/webai-2api' proxy-cache.log | grep 'source=prefetch'
+
+# 只看客户端请求触发的下载 / 搭车 / 断点续传
+grep 'source=client' proxy-cache.log
+grep 'source=ridealong' proxy-cache.log
+grep 'source=resume' proxy-cache.log
+```
+
 ### 排障指引
 
 - **规则缓存目录没有生成缓存文件**，按顺序看三处日志：

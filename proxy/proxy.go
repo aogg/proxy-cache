@@ -347,8 +347,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.log.Debug("代理请求开始", "method", r.Method, "remote", r.RemoteAddr,
-		"target", target, "target_kind", targetKind(fullURL))
+	// docker 日志统一标签：客户端请求入口按需解析 image/digest/ref（/v2/ 目标才有值，
+	// web 完整 URL 目标不加新键，日志零变化，见 log_attrs.go）
+	labels := parseDockerLogInfo(target)
+	s.log.Debug("代理请求开始", labels.attrs(dockerLogSourceClient, "method", r.Method, "remote", r.RemoteAddr,
+		"target", target, "target_kind", targetKind(fullURL)))
 	// //////////////////  提取并区分目标类型  end  ////////////////////////////////////////////////
 
 	// //////////////////  allow/deny 访问控制  start  ////////////////////////////////////////////////
@@ -435,6 +438,9 @@ func targetKind(fullURL bool) string {
 // 约 30s 的响应头超时（详见 stream.go）。完整 URL 目标（web）保持整包缓冲回放不变。
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string, fullURL bool, eff config.Options, start time.Time) {
 	key := cache.Key(cacheKeyInput(r, target, fullURL))
+	// docker 日志统一标签：客户端主路径（HIT / BYPASS / 单飞回源）统一 source=client，
+	// /v2/ 目标按需解析 image/digest/ref（见 log_attrs.go）
+	labels := parseDockerLogInfo(target)
 	// 路径目标 GET：流式透传（选定候选立即 commit）；完整 URL GET：缓冲回放（行为不变）
 	streaming := !fullURL
 	// 先判定本请求不走缓存的具体原因（空串表示可缓存），再把原因暴露到日志，
@@ -469,9 +475,11 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	}
 
 	// finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 200 且过判据写缓存，
-	// 304 / 未过判据分别留痕说明原因；条件与日志字段与旧版一致）
+	// 304 / 未过判据分别留痕说明原因；条件与日志字段与旧版一致）：本闭包只承接客户端
+	// 主路径的回源，写缓存日志统一标注 source=client（续传执行方 / 预取写缓存各自
+	// 直调 finalizeFetchEntry 并标注 resume / prefetch）
 	finalize := func(ent *cache.Entry) {
-		s.finalizeFetchEntry(r, key, target, ent, eff, disk)
+		s.finalizeFetchEntry(r, key, target, ent, eff, disk, dockerLogSourceClient)
 	}
 	// streamingError 流式回源错误的一致出口：commit 前失败 502（候选全败且最后失败为
 	// 上游明确 4xx 时透传上游状态码与响应，见 upstream_status.go）；commit 后失败响应已
@@ -490,15 +498,16 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		}
 		if err != nil {
 			s.log.Warn("流式回源失败（响应头已写出，终止本次响应）",
-				"target", truncate(r.URL.Path, 300), "err", err)
+				labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 300), "err", err)...)
 		}
 	}
 
 	if !cacheable {
 		// 不走缓存的决策留痕：Info 级输出原因与生效规则（含未命中任何规则的 global-default），
 		// 让「为什么不写缓存文件」在日志里直接可见
-		s.log.Info("GET 请求绕过缓存（BYPASS）", "rule", eff.Rule, "reason", bypassReason,
-			"target", truncate(target, 300))
+		s.log.Info("GET 请求绕过缓存（BYPASS）", labels.attrs(dockerLogSourceClient,
+			"rule", eff.Rule, "reason", bypassReason,
+			"target", truncate(target, 300))...)
 		// //////////////////  不走缓存：直接按生效配置回源  start  ////////////////////////////////////////////////
 		if streaming {
 			// 路径目标 BYPASS（Range / no-cache / 关缓存等）同样流式透传：
@@ -521,13 +530,13 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	if disk != nil {
 		if e, ok := disk.Get(key); ok {
 			// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径
-			s.log.Info("缓存命中（HIT）", "rule", eff.Rule, "key", key,
-				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))
+			s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
 			s.serveEntry(w, r, e, "HIT", eff, start)
 			return
 		}
 	}
-	s.log.Debug("缓存查询结果", "result", "MISS", "key", key, "dir", eff.CachePath)
+	s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath))
 	// //////////////////  查缓存：命中直接回放  end  ////////////////////////////////////////////////
 
 	// //////////////////  在途预取层搭车检查  start  //////////////////////////////////////////////
@@ -591,7 +600,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		// 等待同 key 单飞回源超限：自行走候选回源（不注册单飞，流式透传 + EOF 写缓存；
 		// partial sink：blob 半截保留同执行方路径）
 		s.log.Warn("等待同 key 单飞回源超限，自行走候选回源",
-			"rule", eff.Rule, "key", key, "wait", waitLimit.String(), "target", truncate(target, 300))
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key, "wait", waitLimit.String(), "target", truncate(target, 300))...)
 		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 		streamingError(ferr, committed)
 	case errors.Is(err, errStreamingCommitted):
@@ -618,22 +627,26 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 
 // finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 GET，条件与日志字段与旧版一致）：
 // 仅缓存满足成功判据的 200 响应（TTL 在写入时固化）；304 与「回源成功但未过判据」
-// 分别留痕说明为什么这次没写缓存文件。写盘成功后按条件尝试 docker 镜像 layer 异步
-// 预取（manifest 驱动，触发条件与失败降级语义见 prefetch.go；条件不满足静默返回）。
-func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache) {
+// 分别留痕说明为什么这次没写缓存文件。logSource 为本路写缓存的日志来源（source 键，
+// 四值枚举见 log_attrs.go）：客户端主路径传 client、预取传 prefetch、续传执行方传
+// resume——同一函数被三条链路复用，按写者区分「异步下载」与「客户端请求下载」。
+// 写盘成功后按条件尝试 docker 镜像 layer 异步预取（manifest 驱动，触发条件与失败降级
+// 语义见 prefetch.go；条件不满足静默返回）。
+func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache, logSource string) {
 	if ent == nil {
 		return
 	}
+	labels := parseDockerLogInfo(target) // 日志统一标签（/v2/ 目标才有 image/digest/ref）
 	if ent.Status == http.StatusOK && checkSuccess(ent, eff.SuccessCheck, http.MethodGet) {
 		ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目（0 = 永不过期）
 		if disk != nil {
 			if serr := disk.Set(key, ent); serr != nil {
-				s.log.Warn("写入缓存失败", "key", key, "target", target, "err", serr)
+				s.log.Warn("写入缓存失败", labels.attrs(logSource, "key", key, "target", target, "err", serr)...)
 			} else {
 				// 写盘成功必须可见：规则名、缓存 key、实际落盘文件路径、body 大小与生效 TTL
 				s.log.Info("写入缓存成功",
-					"rule", eff.Rule, "target", truncate(target, 300), "key", key,
-					"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))
+					labels.attrs(logSource, "rule", eff.Rule, "target", truncate(target, 300), "key", key,
+						"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))...)
 				// blob 正式缓存条目已落盘：立即删除对应半截文件（其内容已完整入库，
 				// 使命完成；非 blob 目标静默跳过，见 partial_resume.go）
 				if _, isBlob := parseDockerBlobTarget(target); isBlob {
@@ -652,13 +665,13 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 		// 客户端用本地缓存副本渲染，属成功语义而非失败（条件头已不透传，
 		// 上游对无条件 GET 仍回 304 属异常/缓存副本有效兜底场景）
 		s.log.Info("回源 304 未变更，不写缓存（客户端缓存副本有效）",
-			"rule", eff.Rule, "status", ent.Status, "target", truncate(target, 300))
+			labels.attrs(logSource, "rule", eff.Rule, "status", ent.Status, "target", truncate(target, 300))...)
 		return
 	}
 	// 回源成功但不满足缓存判据：同样留痕，说明为什么这次没写缓存文件
 	s.log.Info("回源成功但不写缓存（未过成功判据或非 200）",
-		"rule", eff.Rule, "status", ent.Status, "check", eff.SuccessCheck,
-		"body_bytes", len(ent.Body), "target", truncate(target, 300))
+		labels.attrs(logSource, "rule", eff.Rule, "status", ent.Status, "check", eff.SuccessCheck,
+			"body_bytes", len(ent.Body), "target", truncate(target, 300))...)
 }
 
 // handleHead 处理 HEAD 请求（docker registry 用 HEAD 探测 manifest/blob 元信息）：
@@ -668,6 +681,8 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 // 未配置 url-redirect（候选为空）时由 fetchViaCandidates 回退 fetchDirect 直连，与旧版一致。
 func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target string, fullURL bool, eff config.Options, start time.Time) {
 	key := cache.Key(cacheKeyInput(r, target, fullURL))
+	// docker 日志统一标签：HEAD 探测同属客户端主路径（source=client，见 log_attrs.go）
+	labels := parseDockerLogInfo(target)
 	// 缓存不可读（未启用 / no-cache / 实例获取失败）时回源结果按 BYPASS 标注，与 GET 的语义对齐
 	cacheStatus := "MISS"
 
@@ -676,12 +691,12 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 		if e, ok := disk.Get(key); ok {
 			// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径；
 			// serveEntry 的 HEAD 分支只回放状态码与响应头（含 Content-Length），不写 body
-			s.log.Info("缓存命中（HIT）", "rule", eff.Rule, "key", key,
-				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))
+			s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
 			s.serveEntry(w, r, e, "HIT", eff, start)
 			return
 		}
-		s.log.Debug("缓存查询结果", "result", "MISS", "key", key, "dir", eff.CachePath)
+		s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath))
 	} else {
 		cacheStatus = "BYPASS"
 	}
@@ -785,9 +800,11 @@ func (s *Server) candidatesExhaustedFallback(r *http.Request, target string, eff
 	// //////////////////  全部轮次失败：按配置回退直连  start  /////////////////////////////////////////
 	if !isFullURLTarget(target) {
 		// 路径目标没有完整原始 URL 可直连：fallback-direct 不适用，候选全败直接报错
-		//（错误信息注明路径目标无直连回退）
+		//（错误信息注明路径目标无直连回退）。本兜底承接 HEAD 路径目标（docker HEAD
+		// 探测）等客户端主路径：source=client
 		s.log.Warn("url-redirect 全部候选失败，路径目标无直连回退（fallback-direct 不适用）",
-			"target", truncate(target, 300), "last_error", lastErr)
+			parseDockerLogInfo(target).attrs(dockerLogSourceClient,
+				"target", truncate(target, 300), "last_error", lastErr)...)
 		return nil, fmt.Errorf("全部 url-redirect 候选失败，路径目标无直连回退（无完整原始 URL 可直连）: %w", lastErr)
 	}
 	if eff.FallbackDirect {
@@ -1251,6 +1268,14 @@ func maskToken(tok string) string {
 // 透传状态码与响应头（剔除逐跳头）、补 X-Cache / X-Proxy-Upstream 观测头、
 // 缓存命中时支持 If-None-Match/ETag 条件请求（304）。
 func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Entry, cacheStatus string, eff config.Options, start time.Time) {
+	// docker 日志统一标签（source 按回放链路派生）：X-Cache: RESUME 的回放属续传链路
+	//（source=resume），其余 HIT / MISS / BYPASS 回放属客户端请求主路径（source=client）；
+	// /v2/ 目标按需解析 image/digest/ref（见 log_attrs.go）
+	logSource := dockerLogSourceClient
+	if cacheStatus == resumeCacheStatus {
+		logSource = dockerLogSourceResume
+	}
+	labels := parseDockerLogInfo(r.URL.Path)
 	// //////////////////  透传上游响应头  start  ////////////////////////////////////////////////
 	h := w.Header()
 	for k, vv := range e.Header {
@@ -1291,7 +1316,7 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 		w.WriteHeader(status)
 		if len(e.Body) > 0 {
 			if _, err := w.Write(e.Body); err != nil {
-				s.log.Warn("写响应体失败", "target", truncate(r.URL.Path, 200), "err", err)
+				s.log.Warn("写响应体失败", labels.attrs(logSource, "target", truncate(r.URL.Path, 200), "err", err)...)
 			}
 		}
 	}
@@ -1304,24 +1329,25 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 	case status == http.StatusNotModified:
 		// 最终 304（HIT ETag 命中或上游 304 透传）也是成功：客户端用本地缓存副本正常渲染
 		s.log.Info("内容未变更（304），客户端缓存副本有效",
-			"rule", eff.Rule, "upstream", e.Source, "cache", cacheStatus)
+			labels.attrs(logSource, "rule", eff.Rule, "upstream", e.Source, "cache", cacheStatus)...)
 	case status == http.StatusOK && len(e.Body) > 0 && r.Method != http.MethodHead:
 		s.log.Info("成功返回内容",
-			"rule", eff.Rule, "upstream", e.Source, "status", status,
-			"bytes", len(e.Body), "cache", cacheStatus)
+			labels.attrs(logSource, "rule", eff.Rule, "upstream", e.Source, "status", status,
+				"bytes", len(e.Body), "cache", cacheStatus)...)
 	}
 	// //////////////////  成功返回日志  end  ////////////////////////////////////////////////
 
 	s.log.Info("代理请求完成",
-		"method", r.Method,
-		"target", truncate(r.URL.Path, 300),
-		"status", status,
-		"cache", cacheStatus,
-		"upstream", e.Source,
-		"rule", eff.Rule,
-		"bytes", len(e.Body),
-		"cost", time.Since(start).Round(time.Millisecond).String(),
-	)
+		labels.attrs(logSource,
+			"method", r.Method,
+			"target", truncate(r.URL.Path, 300),
+			"status", status,
+			"cache", cacheStatus,
+			"upstream", e.Source,
+			"rule", eff.Rule,
+			"bytes", len(e.Body),
+			"cost", time.Since(start).Round(time.Millisecond).String(),
+		)...)
 }
 
 // writeUpstreamStatus 把「候选全败且最后失败为上游明确 4xx」的上游响应透传给客户端
@@ -1359,8 +1385,9 @@ func (s *Server) writeUpstreamStatus(w http.ResponseWriter, r *http.Request, use
 		}
 	}
 	s.log.Warn("候选全败且最后失败为上游明确 4xx，已透传上游状态码与响应",
-		"status", use.status, "upstream", truncate(use.url, 300),
-		"body_bytes", len(use.body), "target", truncate(r.URL.Path, 300))
+		parseDockerLogInfo(r.URL.Path).attrs(dockerLogSourceClient,
+			"status", use.status, "upstream", truncate(use.url, 300),
+			"body_bytes", len(use.body), "target", truncate(r.URL.Path, 300))...)
 }
 
 // writeError 输出 JSON 格式错误响应并记录日志（502 回源彻底失败升级为 Error，其余保持 Warn）。

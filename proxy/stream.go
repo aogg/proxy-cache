@@ -18,6 +18,9 @@
 // 目的：docker 客户端等响应头约 30s 就超时断开（net/http: timeout awaiting response
 // headers）。旧版「整包读进内存构造 Entry 再 WriteHeader」让首字节时间 = 候选轮询
 // 全部耗时 + 上游完整下载时间，必然超时；流式透传把首字节时间压缩为「选定候选」耗时。
+//
+// 日志规范：本文件全部日志（客户端流式主路径）统一 source=client，镜像名统一键 image
+//（/v2/ 目标按需解析 image/digest/ref，非 docker 请求不加新键，见 log_attrs.go）。
 
 package proxy
 
@@ -88,6 +91,9 @@ func (s *Server) commitStreamingHeader(w http.ResponseWriter, res *probeResult, 
 // 回退，见 captureStreamPartial）；BYPASS（Range / no-cache / 关缓存）不注入，维持既有
 // 「失败即丢弃」行为完全不变。
 func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Request, target string, eff config.Options, cacheStatus string, finalize func(*cache.Entry), start time.Time, partial ...partialSink) (entry *cache.Entry, committed bool, err error) {
+	// docker 日志统一标签：客户端主路径全部日志统一 source=client，/v2/ 目标按需解析
+	// image/digest/ref（纯字符串 split；非 docker 请求 attrs 原样透传既有键，日志零变化）
+	labels := parseDockerLogInfo(target)
 	sink := partialSinkOf(partial)
 	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target), eff)
 	if len(candidates) == 0 {
@@ -101,7 +107,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		// 路径目标没有完整原始 URL 可直连：fallback-direct 不适用，候选全败直接报错
 		//（错误语义与旧版 fetchViaCandidates 的路径目标分支一致）
 		s.log.Warn("url-redirect 全部候选失败，路径目标无直连回退（fallback-direct 不适用）",
-			"target", truncate(target, 300), "last_error", serr)
+			labels.attrs(dockerLogSourceClient, "target", truncate(target, 300), "last_error", serr)...)
 		return nil, false, fmt.Errorf("全部 url-redirect 候选失败，路径目标无直连回退（无完整原始 URL 可直连）: %w", serr)
 	}
 	// //////////////////  竞速选定候选（commit 前，可自由切换）  end  ///////////////////////////
@@ -113,8 +119,8 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	// 首条进度日志的速率为自 commit 起的平均速率
 	committedAt := time.Now()
 	s.log.Info("流式透传开始（已向客户端写出响应头）",
-		"rule", eff.Rule, "candidate", truncate(source, 300), "status", res.status,
-		"content_length", res.header.Get("Content-Length"), "check", eff.SuccessCheck)
+		labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300), "status", res.status,
+			"content_length", res.header.Get("Content-Length"), "check", eff.SuccessCheck)...)
 
 	// 流式透传进度日志开关与基线：eff.ProgressLogInterval <= 0 关闭；lastProgressBytes 为
 	// 上次进度日志时已传字节数（区间速率的分母基线），初始 0 = 首条按自 commit 起平均速率
@@ -152,7 +158,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 				clientOK = false
 				// 与 serveEntry 既有日志文案一致（broken pipe 可辨认）
 				s.log.Warn("写响应体失败（客户端已断开，继续读上游仅填缓存）",
-					"target", truncate(r.URL.Path, 200), "err", werr)
+					labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 200), "err", werr)...)
 			}
 		}
 	}
@@ -165,7 +171,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		if clientOK {
 			if _, werr := w.Write(res.first); werr != nil {
 				clientOK = false
-				s.log.Warn("写响应体失败", "target", truncate(r.URL.Path, 200), "err", werr)
+				s.log.Warn("写响应体失败", labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 200), "err", werr)...)
 			}
 		}
 	}
@@ -178,10 +184,10 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		if !clientOK {
 			clientState = "disconnected"
 		}
-		args := []any{
+		args := labels.attrs(dockerLogSourceClient,
 			"rule", eff.Rule, "candidate", truncate(source, 300), "status", res.status,
 			"bytes", total,
-		}
+		)
 		if contentLength > 0 {
 			// 百分比取 0-100 整数（上游声明值异常偏小时截到 100，不输出越界值）
 			pct := int(float64(total) / float64(contentLength) * 100)
@@ -238,11 +244,11 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 						rangeHeader := resumeRangeHeader(offset, end)
 						others := escalationCandidates(candidates, res.url)
 						s.log.Info("下载过慢，升级多源并发续传",
-							"rule", eff.Rule, "candidate", truncate(source, 300),
-							"bytes", total, "content_length", knownTotal,
-							"window", eff.SlowDownloadWindow.String(),
-							"window_speed", humanBytesPerSec(windowSent, windowElapsed),
-							"sources", len(others)+1)
+							labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
+								"bytes", total, "content_length", knownTotal,
+								"window", eff.SlowDownloadWindow.String(),
+								"window_speed", humanBytesPerSec(windowSent, windowElapsed),
+								"sources", len(others)+1)...)
 						// 升级动作：胜者既有连接不中断并入合并，其余全部候选并发 Range 续传
 						//（每候选一个 goroutine，复用 startUpstream 公共底层）
 						slowMerger = s.escalateSlowSources(r, res, winnerStart, others, eff, rangeHeader, int64(total), knownTotal)
@@ -250,11 +256,11 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 						break // 转入下方有序合并循环（胜者 body 保持活体移交）
 					}
 					s.log.Debug("流式回源判慢但暂不满足升级条件",
-						"rule", eff.Rule, "candidate", truncate(source, 300),
-						"window_speed", humanBytesPerSec(windowSent, windowElapsed),
-						"speed", humanBytesPerSec(eff.SlowDownloadSpeed, time.Second),
-						"known_total", knownTotal, "remaining", remaining,
-						"min_remaining", eff.SlowDownloadMinRemaining, "candidates", len(candidates))
+						labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
+							"window_speed", humanBytesPerSec(windowSent, windowElapsed),
+							"speed", humanBytesPerSec(eff.SlowDownloadSpeed, time.Second),
+							"known_total", knownTotal, "remaining", remaining,
+							"min_remaining", eff.SlowDownloadMinRemaining, "candidates", len(candidates))...)
 				}
 			}
 			if rerr != nil {
@@ -266,8 +272,8 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 				res.Close()
 				s.captureStreamPartial(sink, r, target, accum.Bytes())
 				s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
-					"rule", eff.Rule, "candidate", truncate(source, 300),
-					"status", res.status, "bytes", total, "err", rerr)
+					labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
+						"status", res.status, "bytes", total, "err", rerr)...)
 				return nil, true, fmt.Errorf("流式回源读上游失败（%s）: %w", source, rerr)
 			}
 		}
@@ -289,8 +295,8 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			// 终止本次响应、不写缓存
 			s.captureStreamPartial(sink, r, target, accum.Bytes())
 			s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
-				"rule", eff.Rule, "candidate", truncate(source, 300),
-				"status", res.status, "bytes", total, "err", merr)
+				labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
+					"status", res.status, "bytes", total, "err", merr)...)
 			return nil, true, fmt.Errorf("流式回源读上游失败（%s）: %w", source, merr)
 		}
 	}
@@ -314,26 +320,27 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	switch {
 	case res.status == http.StatusPartialContent:
 		s.log.Info("成功返回内容（Range 206 流式透传，不写缓存）",
-			"rule", eff.Rule, "upstream", source, "status", res.status,
-			"bytes", total, "cache", cacheStatus)
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "upstream", source, "status", res.status,
+				"bytes", total, "cache", cacheStatus)...)
 	case res.status == http.StatusNotModified:
 		s.log.Info("内容未变更（304），客户端缓存副本有效",
-			"rule", eff.Rule, "upstream", source, "cache", cacheStatus)
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "upstream", source, "cache", cacheStatus)...)
 	case res.status == http.StatusOK && total > 0:
 		s.log.Info("成功返回内容",
-			"rule", eff.Rule, "upstream", source, "status", res.status,
-			"bytes", total, "cache", cacheStatus)
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "upstream", source, "status", res.status,
+				"bytes", total, "cache", cacheStatus)...)
 	}
 	s.log.Info("代理请求完成",
-		"method", r.Method,
-		"target", truncate(r.URL.Path, 300),
-		"status", res.status,
-		"cache", cacheStatus,
-		"upstream", source,
-		"rule", eff.Rule,
-		"bytes", total,
-		"cost", time.Since(start).Round(time.Millisecond).String(),
-	)
+		labels.attrs(dockerLogSourceClient,
+			"method", r.Method,
+			"target", truncate(r.URL.Path, 300),
+			"status", res.status,
+			"cache", cacheStatus,
+			"upstream", source,
+			"rule", eff.Rule,
+			"bytes", total,
+			"cost", time.Since(start).Round(time.Millisecond).String(),
+		)...)
 	// //////////////////  成功返回日志（字段与 serveEntry 兼容）  end  ///////////////////////////
 	return entry, true, nil
 }

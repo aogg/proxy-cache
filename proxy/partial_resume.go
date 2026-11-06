@@ -46,6 +46,14 @@
 //   - 删除：对应 blob 正式缓存条目落盘后立即删除（finalizeFetchEntry 钩子）；续传扫描
 //     判定上游明确不支持按断点续传（非 206）时丢弃；cache.Clean 扩展清理空半截与超过
 //     partMaxAge（24h，量级同缓存条目过期 TTL）的孤儿残留（崩溃残留兜底）。
+//
+// 日志规范：续传执行方（scanResumeCandidate / resumeBlobStreaming / serveResumeComplete）
+// 全部日志统一 source=resume（客户端请求触发的执行方）；半截保留日志按产生路径标注
+// 来源——客户端主路径流式失败（savePartialPart）= client、预取流式失败
+// （keepPrefetchPartial）= prefetch。镜像名统一键 image（savePartialPart /
+// keepPrefetchPartial 经 variadic dockerLogInfo 注入，既有定参调用方与既有测试不受影响，
+// 与 fetchViaCandidatesStreaming 的 partial ...partialSink 同款风格）。键名与顺序由
+// log_attrs.go 统一拼装。
 package proxy
 
 import (
@@ -78,8 +86,17 @@ const resumeScanBudget = candidateScanBudget
 // v2/<name>/blobs/<digest>（target 为 ExtractTarget 输出的路径目标原文：不带 scheme
 // 与前导 /，可能带查询串；容忍前导 /）。digest 经 validBlobDigest 宽松校验（路径安全，
 // 与预取同款）。半截保留与续传仅对 blob 启用——blob 按 digest 寻址、内容不可变；
-// manifest 会变，绝不适用。
+// manifest 会变，绝不适用。保持既有 (digest, ok) 签名不变（既有调用方与既有测试的
+// 表驱动用例不受影响）；需要镜像名（日志统一标签 image）时用 parseDockerBlobNameDigest。
 func parseDockerBlobTarget(target string) (digest string, ok bool) {
+	_, d, ok := parseDockerBlobNameDigest(target)
+	return d, ok
+}
+
+// parseDockerBlobNameDigest parseDockerBlobTarget 的完整版：同时拆出仓库名与 digest
+// （v2/<name>/blobs/<digest>，name 支持多级仓库）。拆分逻辑与 parseDockerBlobTarget
+// 同源同语义（digest 校验同款），name 供日志统一标签 image 使用（log_attrs.go）。
+func parseDockerBlobNameDigest(target string) (name, digest string, ok bool) {
 	t := target
 	if i := strings.IndexByte(t, '?'); i >= 0 {
 		t = t[:i] // 去掉查询串
@@ -88,13 +105,14 @@ func parseDockerBlobTarget(target string) (digest string, ok bool) {
 	segs := strings.Split(t, "/")
 	// v2 / <name 至少一段> / blobs / <digest>：至少 4 段，倒数第 2 段必须是 blobs
 	if len(segs) < 4 || segs[0] != "v2" || segs[len(segs)-2] != "blobs" {
-		return "", false
+		return "", "", false
 	}
+	name = strings.Join(segs[1:len(segs)-2], "/")
 	d := segs[len(segs)-1]
 	if !validBlobDigest(d) {
-		return "", false
+		return "", "", false
 	}
-	return d, true
+	return name, d, true
 }
 
 // //////////////////  半截文件的写侧互斥与保留  ////////////////////////////////////////////////
@@ -140,11 +158,14 @@ func (s *Server) partWriter(key string) *sync.Mutex {
 // 仅当待存前缀比现有半截更长时覆盖重写——半截进度只增不减，绝不回退。整体重写用
 // os.WriteFile（truncate + 顺序写）：任意时点中断的残留仍是合法前缀（顺序写的性质），
 // 进程崩溃残留由 cache.Clean 的空文件/孤儿清理规则兜底。data 为空不落盘（0 字节半截
-// 无续传价值，见入口侧的空半截丢弃）。
-func (s *Server) savePartialPart(disk *cache.Cache, key string, data []byte) {
+// 无续传价值，见入口侧的空半截丢弃）。本函数仅在客户端主路径流式失败时被调用
+// （captureStreamPartial），日志统一 source=client；labels 为可选的 docker 日志统一标签
+// （variadic 注入，既有定参调用方与既有测试不受影响，见 dockerLogInfoOf）。
+func (s *Server) savePartialPart(disk *cache.Cache, key string, data []byte, labels ...dockerLogInfo) {
 	if disk == nil || len(data) == 0 {
 		return
 	}
+	lab := dockerLogInfoOf(labels)
 	mu := s.partWriter(key)
 	mu.Lock()
 	defer mu.Unlock()
@@ -153,38 +174,41 @@ func (s *Server) savePartialPart(disk *cache.Cache, key string, data []byte) {
 		return // 已有相同或更长前缀：保持不动（进度不回退）
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
-		s.log.Warn("保留 blob 半截前缀失败", "file", path, "bytes", len(data), "err", err)
+		s.log.Warn("保留 blob 半截前缀失败", lab.attrs(dockerLogSourceClient, "file", path, "bytes", len(data), "err", err)...)
 		return
 	}
 	s.log.Info("blob 半截前缀已保留（下载中断，下次无 Range 请求将从断点无感续传）",
-		"key", key, "bytes", len(data), "file", path)
+		lab.attrs(dockerLogSourceClient, "key", key, "bytes", len(data), "file", path)...)
 }
 
 // keepPrefetchPartial 预取路径的半截保留：预取流式下载读上游失败时，把已下载前缀的
 // 临时文件改名为半截文件（同目录 rename，原子零拷贝）。仅当临时文件比现有半截更长时
 // 改名（进度不回退）；改名后 hub 条目的 tmpPath 仍指向旧临时文件名（已被移走），
 // finishFailed 的临时文件清理对不存在文件按 ErrNotExist 静默跳过，无副作用。写锁内
-// 执行（与续传执行方的半截写侧互斥）。
-func (s *Server) keepPrefetchPartial(disk *cache.Cache, key, tmpPath string, size int64) {
+// 执行（与续传执行方的半截写侧互斥）。本函数仅在预取流式失败时被调用
+// （prefetchBlobStreaming），日志统一 source=prefetch；labels 为可选的 docker 日志统一
+// 标签（variadic 注入，既有定参调用方与既有测试不受影响，见 dockerLogInfoOf）。
+func (s *Server) keepPrefetchPartial(disk *cache.Cache, key, tmpPath string, size int64, labels ...dockerLogInfo) {
 	if disk == nil || tmpPath == "" || size <= 0 {
 		return
 	}
+	lab := dockerLogInfoOf(labels)
 	mu := s.partWriter(key)
 	mu.Lock()
 	defer mu.Unlock()
 	partPath := disk.PartPath(key)
 	if st, err := os.Stat(partPath); err == nil && st.Size() >= size {
 		s.log.Debug("blob 半截已保留更长前缀，预取半截丢弃（进度不回退）",
-			"key", key, "kept", st.Size(), "dropped", size)
+			lab.attrs(dockerLogSourcePrefetch, "key", key, "kept", st.Size(), "dropped", size)...)
 		return
 	}
 	if err := os.Rename(tmpPath, partPath); err != nil {
 		s.log.Warn("保留预取 blob 半截前缀失败（改名失败，残留由缓存后台清理兜底）",
-			"from", tmpPath, "to", partPath, "err", err)
+			lab.attrs(dockerLogSourcePrefetch, "from", tmpPath, "to", partPath, "err", err)...)
 		return
 	}
 	s.log.Info("blob 半截前缀已保留（预取下载中断，下次无 Range 请求将从断点无感续传）",
-		"key", key, "bytes", size, "file", partPath)
+		lab.attrs(dockerLogSourcePrefetch, "key", key, "bytes", size, "file", partPath)...)
 }
 
 // appendPartChunk 续传执行方逐块追加半截文件（写锁内）：追加前校验文件当前大小 == 期望
@@ -222,10 +246,12 @@ func (s *Server) captureStreamPartial(sink *partialSink, r *http.Request, target
 	if r.Header.Get("Range") != "" {
 		return // 防御：带 Range 的请求维持 206 透传不做本地半截（入口分流本不会带 sink）
 	}
-	if _, ok := parseDockerBlobTarget(target); !ok {
+	// 客户端主路径半截保留：解析镜像名与 digest 作为日志统一标签（source=client）
+	name, digest, ok := parseDockerBlobNameDigest(target)
+	if !ok {
 		return // 非 blob（manifest 会变等）：不适用半截保留
 	}
-	s.savePartialPart(sink.disk, sink.key, data)
+	s.savePartialPart(sink.disk, sink.key, data, dockerLogInfo{image: name, digest: digest})
 }
 
 // //////////////////  续传候选扫描  ////////////////////////////////////////////////////////////
@@ -253,6 +279,9 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 	n := len(candidates)
 	start := int(s.rr.Add(1)-1) % n
 	rangeHeader := fmt.Sprintf("bytes=%d-", partSize) // 开区间：从断点到对象末尾
+	// docker 日志统一标签：续传请求必然是 /v2/ 路径目标，按需解析 image/digest
+	//（本函数无 target 参数，从入站请求路径解析——纯字符串 split，与 ExtractTarget 输出同构）
+	labels := parseDockerLogInfo(r.URL.Path)
 
 	// 整体扫描预算：与客户端断开解耦（WithoutCancel，与既有候选管线一致），
 	// 到期按超时类失败收场（半截保留、降级全量回源）。cancel 不走 defer：defer
@@ -274,7 +303,7 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 		if uerr != nil {
 			lastErr = uerr
 			s.log.Debug("blob 半截续传候选请求失败，轮询下一候选",
-				"index", idx, "candidate", truncate(cand.url, 300), "range", rangeHeader, "err", uerr)
+				labels.attrs(dockerLogSourceResume, "index", idx, "candidate", truncate(cand.url, 300), "range", rangeHeader, "err", uerr)...)
 			continue // 网络/超时类失败：半截保留
 		}
 		if upRes.status == http.StatusRequestedRangeNotSatisfiable {
@@ -288,7 +317,8 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 			upRes.Close()
 			cancel() // 416 出口不返回活体 body：ctx 就地回收（重复取消幂等无害）
 			s.log.Info("blob 半截续传发现半截已完整（上游 416 证实起点已达总长）",
-				"candidate", truncate(cand.url, 300), "part_bytes", partSize, "total", t416)
+				labels.attrs(dockerLogSourceResume,
+					"candidate", truncate(cand.url, 300), "part_bytes", partSize, "total", t416)...)
 			return nil, t416, true, false, nil
 		}
 		if verr := validateResumeResponse(upRes.status, upRes.header, partSize); verr != nil {
@@ -296,8 +326,8 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 			invalid = true
 			lastErr = verr
 			s.log.Debug("blob 半截续传响应不合规（上游明确拒绝按断点续传），轮询下一候选",
-				"index", idx, "candidate", truncate(cand.url, 300),
-				"status", upRes.status, "part_bytes", partSize, "err", verr)
+				labels.attrs(dockerLogSourceResume, "index", idx, "candidate", truncate(cand.url, 300),
+					"status", upRes.status, "part_bytes", partSize, "err", verr)...)
 			continue
 		}
 		// 206 且起点匹配：解析对象总长（Content-Range 的 total；拿不到按 -1 →
@@ -307,8 +337,8 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 			t = -1
 		}
 		s.log.Info("blob 半截续传候选命中",
-			"index", idx, "candidate", truncate(cand.url, 300), "status", upRes.status,
-			"part_bytes", partSize, "total", t)
+			labels.attrs(dockerLogSourceResume, "index", idx, "candidate", truncate(cand.url, 300), "status", upRes.status,
+				"part_bytes", partSize, "total", t)...)
 		upRes.onClose(cancel) // 命中出口返回活体 body：扫描 ctx 取消权随流移交调用方（Close 时释放）
 		return upRes, t, false, false, nil
 	}
@@ -345,6 +375,9 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 // 响应头（调用方不得再 writeError）。不叠加 slowdownload 慢速升级多源并发续传
 // （取舍见文件头边界说明）。
 func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key, target, digest string, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry)) (*cache.Entry, bool, error) {
+	// docker 日志统一标签：续传请求必然是 /v2/ blob 目标，按需解析 image/digest
+	//（本函数全部执行方日志统一 source=resume，见 log_attrs.go）
+	labels := parseDockerLogInfo(target)
 	// 重查半截前缀：前置检查与成为执行方之间可能被并发流程消费（前一个执行方完成
 	// 写缓存并删半截等），竞态按既有全量回源兜底（行为与旧版一致）
 	n, ok := disk.PartSize(key)
@@ -356,7 +389,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 预取/续传条目被覆盖属极小竞态窗口，两路内容同源、写缓存原子替换，仅浪费一路
 	// 带宽不产生错误数据）；tmpPath 指向半截文件本体（搭车订阅者读前缀用，无写句柄）
 	hub := s.prefetchHubOrInit()
-	ent := hub.registerResume(key, eff.Rule, digest, n, s.log)
+	ent := hub.registerResume(key, eff.Rule, labels.image, digest, n, s.log)
 	ent.attachFile(nil, disk.PartPath(key))
 	// panic 防护（与 prefetchBlobStreaming 同款理由）：flight 对 fn panic 有自身 recover
 	//（清理在途记录后 re-panic），这里必须先把 hub 条目置 failed——否则 running 条目
@@ -381,8 +414,8 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			disk.RemovePart(key)
 		}
 		s.log.Warn("blob 半截续传候选扫描失败，降级既有全量回源",
-			"rule", eff.Rule, "digest", digest, "part_bytes", n,
-			"invalid", invalid, "err", serr)
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "part_bytes", n,
+				"invalid", invalid, "err", serr)...)
 		// 网络/超时类失败保留半截：下方全量回源若再失败，其失败捕获会把更长前缀存回
 		// 半截（进度不回退）；全量成功则写缓存并删半截，两条路都正确
 		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
@@ -422,8 +455,8 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 下次从更长前缀续传——进度不回退）
 	s.commitResumeHeader(w, hdr, upRes.url, total)
 	s.log.Info("blob 半截续传开始（回放半截前缀+实时拼接剩余区间，上游仅此一路 Range 续传）",
-		"rule", eff.Rule, "digest", digest, "part_bytes", n, "total", total,
-		"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)
+		labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "part_bytes", n, "total", total,
+			"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)...)
 
 	// 回放半截前缀：写锁内一次性整读进累积缓冲（与并发保存方的整体重写互斥，保证读到
 	// 的每个字节来自同一份合法前缀；磁盘顺序读，锁持有时间 = 磁盘读耗时），锁外再写给
@@ -447,7 +480,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		if _, werr := w.Write(prefix[:n]); werr != nil {
 			clientOK = false
 			s.log.Warn("写响应体失败（客户端已断开，续传继续只填缓存）",
-				"target", truncate(r.URL.Path, 200), "err", werr)
+				labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200), "err", werr)...)
 		}
 	}
 
@@ -463,7 +496,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	lastProgressAt := time.Now()
 	lastProgressBytes := int(n) // int64→int 对齐 accum.Len()（int）的差值/赋值运算；语义不变——速率按前缀回放之后的新增量计算
 	emitProgress := func(now time.Time) {
-		args := []any{"rule", eff.Rule, "digest", digest, "bytes", accum.Len()}
+		args := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", accum.Len())
 		if total > 0 {
 			pct := int(float64(accum.Len()) / float64(total) * 100)
 			if pct < 0 {
@@ -501,7 +534,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			if _, werr := w.Write(p); werr != nil {
 				clientOK = false
 				s.log.Warn("写响应体失败（客户端已断开，续传继续只填缓存）",
-					"target", truncate(r.URL.Path, 200), "err", werr)
+					labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200), "err", werr)...)
 			}
 		}
 		return nil
@@ -535,8 +568,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 				// commit 后读上游失败：保留更新后的半截文件（已追加到最新前缀，进度
 				// 不回退），广播 failed 并截断本次响应（docker 重试接着更长前缀续传）
 				s.log.Error("blob 半截续传读上游失败，终止本次响应（半截已保留，进度不回退）",
-					"rule", eff.Rule, "digest", digest, "candidate", truncate(upRes.url, 300),
-					"bytes", accum.Len(), "part_bytes", written, "err", rdErr)
+					labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest,
+						"candidate", truncate(upRes.url, 300),
+						"bytes", accum.Len(), "part_bytes", written, "err", rdErr)...)
 				return fail(fmt.Errorf("blob 半截续传读上游失败（%s）: %w", upRes.url, rdErr))
 			}
 		}
@@ -549,13 +583,16 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 数据）；两者均按失败截断（半截保留已收到的内容，进度不回退）
 	if total > 0 && int64(accum.Len()) != total {
 		s.log.Error("blob 半截续传长度不符，终止本次响应且不写缓存（半截已保留，进度不回退）",
-			"rule", eff.Rule, "digest", digest, "candidate", truncate(upRes.url, 300),
-			"bytes", accum.Len(), "total", total)
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest,
+				"candidate", truncate(upRes.url, 300),
+				"bytes", accum.Len(), "total", total)...)
 		return fail(fmt.Errorf("blob 半截续传长度不符（累计 %d ≠ 总长 %d）", accum.Len(), total))
 	}
 
 	// EOF：半截前缀 + 剩余区间拼出完整 blob，复用既有缓存写入语义（判据 / TTL 固化 /
-	// 日志 / 预取触发全复用——blob 目标在 finalizeFetchEntry 内写盘成功即删半截）
+	// 日志 / 预取触发全复用——blob 目标在 finalizeFetchEntry 内写盘成功即删半截）；
+	// 续传执行方写缓存直接调 finalizeFetchEntry 并标注 source=resume（不经注入的
+	// finalize 回调——该回调按客户端主路径标注 source=client，此处写者实为续传执行方）
 	entry := &cache.Entry{
 		Status:   http.StatusOK,
 		Header:   hdr,
@@ -563,27 +600,26 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		StoredAt: time.Now(),
 		Source:   upRes.url,
 	}
-	if finalize != nil {
-		finalize(entry)
-	}
+	s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume)
 	// 置 done 并关闭订阅（搭车方收完 channel 缓冲内的最后增量即完整）；条目滞留 hub
 	// 一小段时间供并发 MISS 兜底检出「done → 直接 HIT」，到期自动移除（不碰半截文件）
 	ent.finishDone()
 
 	s.log.Info("blob 半截续传完成（半截前缀+剩余区间拼出完整 blob 并已写缓存）",
-		"rule", eff.Rule, "digest", digest, "bytes", accum.Len(),
-		"part_bytes", n, "upstream", upRes.url,
-		"cost", time.Since(start).Round(time.Millisecond).String())
+		labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", accum.Len(),
+			"part_bytes", n, "upstream", upRes.url,
+			"cost", time.Since(start).Round(time.Millisecond).String())...)
 	s.log.Info("代理请求完成",
-		"method", r.Method,
-		"target", truncate(r.URL.Path, 300),
-		"status", http.StatusOK,
-		"cache", resumeCacheStatus,
-		"upstream", upRes.url,
-		"rule", eff.Rule,
-		"bytes", accum.Len(),
-		"cost", time.Since(start).Round(time.Millisecond).String(),
-	)
+		labels.attrs(dockerLogSourceResume,
+			"method", r.Method,
+			"target", truncate(r.URL.Path, 300),
+			"status", http.StatusOK,
+			"cache", resumeCacheStatus,
+			"upstream", upRes.url,
+			"rule", eff.Rule,
+			"bytes", accum.Len(),
+			"cost", time.Since(start).Round(time.Millisecond).String(),
+		)...)
 	return entry, true, nil
 }
 
@@ -592,13 +628,14 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 // 只能 n == total——半截即完整 blob。直接读回半截写缓存并回放（X-Cache: RESUME），
 // 不再全量下载。读回失败降级既有全量回源兜底（半截保留）。
 func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key, target, digest string, ent *prefetchStreamEntry, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry)) (*cache.Entry, bool, error) {
+	labels := parseDockerLogInfo(target) // 日志统一标签（执行方日志统一 source=resume）
 	data, rerr := os.ReadFile(disk.PartPath(key))
 	if rerr != nil {
 		// 广播搭车订阅者降级后走既有全量回源兜底（半截保留；commit 前未向客户端写过字节）
 		cerr := fmt.Errorf("读回完整半截失败: %w", rerr)
 		ent.finishFailed(cerr)
 		s.log.Warn("blob 半截已完整但读回失败，降级既有全量回源",
-			"rule", eff.Rule, "digest", digest, "err", rerr)
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "err", rerr)...)
 		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 	}
 	entry := &cache.Entry{
@@ -608,23 +645,25 @@ func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key
 		StoredAt: time.Now(),
 		Source:   "part-resume", // 观测：内容来自半截文件整体回放（digest 寻址语义可信）
 	}
-	if finalize != nil {
-		finalize(entry) // 既有缓存写入语义全复用；blob 落盘成功即删半截（finalizeFetchEntry 钩子）
-	}
+	// 续传执行方写缓存：直接调 finalizeFetchEntry 并标注 source=resume（不经注入的
+	// finalize 回调——该回调按客户端主路径标注 source=client，此处写者实为续传执行方；
+	// blob 落盘成功即删半截见 finalizeFetchEntry 钩子）
+	s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume)
 	ent.finishDone()
 	s.log.Info("blob 半截续传完成（半截已完整，整体回放写缓存）",
-		"rule", eff.Rule, "digest", digest, "bytes", len(data),
-		"cost", time.Since(start).Round(time.Millisecond).String())
+		labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", len(data),
+			"cost", time.Since(start).Round(time.Millisecond).String())...)
 	s.log.Info("代理请求完成",
-		"method", r.Method,
-		"target", truncate(r.URL.Path, 300),
-		"status", http.StatusOK,
-		"cache", resumeCacheStatus,
-		"upstream", entry.Source,
-		"rule", eff.Rule,
-		"bytes", len(data),
-		"cost", time.Since(start).Round(time.Millisecond).String(),
-	)
+		labels.attrs(dockerLogSourceResume,
+			"method", r.Method,
+			"target", truncate(r.URL.Path, 300),
+			"status", http.StatusOK,
+			"cache", resumeCacheStatus,
+			"upstream", entry.Source,
+			"rule", eff.Rule,
+			"bytes", len(data),
+			"cost", time.Since(start).Round(time.Millisecond).String(),
+		)...)
 	s.serveEntry(w, r, entry, resumeCacheStatus, eff, start)
 	return entry, true, nil
 }
@@ -706,7 +745,9 @@ func (s *Server) tryServeBlobResume(w http.ResponseWriter, r *http.Request, key,
 			return true
 		}
 		s.log.Warn("等待同 blob 半截续传超限且续传已结束，自行走既有全量回源",
-			"rule", eff.Rule, "key", key, "wait", flightWaitLimit.String(), "target", truncate(target, 300))
+			// 本请求自行回源：按客户端请求标注 source=client（非续传执行方）
+			parseDockerLogInfo(target).attrs(dockerLogSourceClient,
+				"rule", eff.Rule, "key", key, "wait", flightWaitLimit.String(), "target", truncate(target, 300))...)
 		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
 		streamingError(ferr, committed)
 	case errors.Is(err, errStreamingCommitted):
