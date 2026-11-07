@@ -1405,3 +1405,46 @@ func TestPartialProgressNeverRegresses(t *testing.T) {
 		}
 	})
 }
+
+// TestBlobResumeStallWatchdogCutsDeadUpstream 覆盖点 12：续传活体流的 read-timeout
+// 看门狗（候选级「无新增数据超时」，与客户端流式路径同一机制）能砍掉「响应头合规但
+// body 停滞」的死上游——上游发出剩余区间首块后不再吐字节，执行方应在 read-timeout
+// 窗口内按既有失败语义收场（半截保留、进度不回退、客户端响应截断待重试），而不是
+// 干等到客户端自身超时。现场背景：docker.1ms.run 曾长期停滞，续传无此保护时每次
+// 重试都要白等客户端读超时。
+func TestBlobResumeStallWatchdogCutsDeadUpstream(t *testing.T) {
+	fx := newResumeFixture(t, nil)
+	rt := config.Duration(300 * time.Millisecond) // 窗口取短值：测试只验证「会砍、砍得快」
+	fx.s.cfg.DomainRules[0].ReadTimeout = &rt
+
+	name, digest := prefetchName, prefetchDigestLayer1
+	content := hubBlobContent(0xc1, 4096)
+	fx.reg.setContent(digest, content)
+	hold := fx.reg.armHold(digest) // 剩余区间首块写出后阻塞在闸门上：模拟上游停滞
+	var once sync.Once
+	releaseHold := func() { once.Do(func() { close(hold) }) }
+	defer releaseHold() // 任何退出路径先放行上游 handler，避免卡死 t.Cleanup 的 Close
+
+	key := prefetchBlobKey(name, digest)
+	fx.s.savePartialPart(fx.disk, key, content[:1000])
+
+	done := make(chan struct{})
+	w := httptest.NewRecorder()
+	go func() { defer close(done); fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest)) }()
+
+	start := time.Now()
+	select {
+	case <-done:
+		if el := time.Since(start); el > 3*time.Second {
+			t.Errorf("执行方 %v 才结束，read-timeout=300ms 应在窗口内砍掉停滞上游", el)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("执行方 5s 内未结束：read-timeout 看门狗没有砍掉停滞上游")
+	}
+	if _, err := os.Stat(fx.disk.PartPath(key)); err != nil {
+		t.Errorf("失败收场后半截文件应保留: %v", err)
+	}
+	if lines := logLinesOf(fx.logBuf.String(), "blob 半截续传读上游失败"); len(lines) == 0 {
+		t.Errorf("应有读上游失败留痕:\n%s", fx.logBuf.String())
+	}
+}
