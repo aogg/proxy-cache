@@ -24,7 +24,11 @@ package proxy
 //      开关关闭不续传不产生半截、manifest 不产生半截；
 //   9. 白盒：parseDockerBlobTarget 表驱动、savePartialPart / keepPrefetchPartial 进度
 //      不回退、captureStreamPartial 门控（开关 / Range 起点 / 非 blob）、appendPartChunk
-//      错位校验终止。
+//      错位校验终止；
+//  10. 防毒缓存：上游对 Range 回「裸 416（无 Content-Range）/ 总长不符 416」→ 绝不把
+//      半截当完整 blob 写缓存（invalid 降级全量回源，缓存内容 = 完整原文）；
+//  11. 断开续传提醒：半截存在且隔了 ≥1s 的重试 → 提醒日志 + isolated_gap（隔离时长），
+//      续传开始日志同样携带。
 
 import (
 	"bytes"
@@ -62,30 +66,34 @@ import (
 //   - manifest 路径回 200 + manifestBody（Content-Type 为单平台 image manifest）；
 //     manifestBr=true 时写一半断连（验证 manifest 绝不产生半截）。
 type resumeUpstream struct {
-	mu         sync.Mutex
-	rec        *prefetchUpstreamRec
-	content    map[string][]byte        // digest -> blob 完整内容
-	ranges     map[string][]string      // digest -> 逐次收到的 Range 头（无 Range 记 ""）
-	ignore     map[string]bool          // digest -> 忽略 Range 一律 200 全量
-	short      map[string]int64         // digest -> 206 只发剩余区间前 N 字节后干净 EOF
-	abort      map[string]int           // digest -> 200 全量写出前 N 字节后断连
-	hold       map[string]chan struct{} // digest -> 首路「首块后阻塞」闸门
-	manifest   []byte                   // manifest 响应 body
-	manifestBr bool                     // manifest 写一半后断连
-	chunkSize  int                      // 分块大小（默认整段一次写出）
-	delay      time.Duration            // 块间隔（拉长续传流窗口）
+	mu           sync.Mutex
+	rec          *prefetchUpstreamRec
+	content      map[string][]byte        // digest -> blob 完整内容
+	ranges       map[string][]string      // digest -> 逐次收到的 Range 头（无 Range 记 ""）
+	ignore       map[string]bool          // digest -> 忽略 Range 一律 200 全量
+	short        map[string]int64         // digest -> 206 只发剩余区间前 N 字节后干净 EOF
+	abort        map[string]int           // digest -> 200 全量写出前 N 字节后断连
+	hold         map[string]chan struct{} // digest -> 首路「首块后阻塞」闸门
+	bad416       map[string]bool          // digest -> Range 探测回 416 且不带 Content-Range（模拟不合规镜像源，防毒缓存回归用）
+	fake416Total map[string]int64         // digest -> Range 探测回 416 且 Content-Range 总长伪造为该值（模拟总长与半截不符）
+	manifest     []byte                   // manifest 响应 body
+	manifestBr   bool                     // manifest 写一半后断连
+	chunkSize    int                      // 分块大小（默认整段一次写出）
+	delay        time.Duration            // 块间隔（拉长续传流窗口）
 }
 
 // newResumeUpstream 构建空假上游。
 func newResumeUpstream() *resumeUpstream {
 	return &resumeUpstream{
-		rec:     newPrefetchUpstreamRec(),
-		content: make(map[string][]byte),
-		ranges:  make(map[string][]string),
-		ignore:  make(map[string]bool),
-		short:   make(map[string]int64),
-		abort:   make(map[string]int),
-		hold:    make(map[string]chan struct{}),
+		rec:          newPrefetchUpstreamRec(),
+		content:      make(map[string][]byte),
+		ranges:       make(map[string][]string),
+		ignore:       make(map[string]bool),
+		short:        make(map[string]int64),
+		abort:        make(map[string]int),
+		hold:         make(map[string]chan struct{}),
+		bad416:       make(map[string]bool),
+		fake416Total: make(map[string]int64),
 	}
 }
 
@@ -117,6 +125,20 @@ func (u *resumeUpstream) setAbort(digest string, n int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.abort[digest] = n
+}
+
+// setBad416 标记某 digest 的 Range 探测一律回不带 Content-Range 的 416（模拟不合规镜像源）。
+func (u *resumeUpstream) setBad416(digest string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.bad416[digest] = true
+}
+
+// setFake416Total 标记某 digest 的 Range 探测回 416 且 Content-Range 总长伪造为 total。
+func (u *resumeUpstream) setFake416Total(digest string, total int64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.fake416Total[digest] = total
 }
 
 func (u *resumeUpstream) setManifest(body []byte, broken bool) {
@@ -197,6 +219,18 @@ func (u *resumeUpstream) serveBlob(w http.ResponseWriter, r *http.Request) {
 
 	// //////////////////  Range 请求：206 / 416（或按 ignore 降级 200 全量）  //////////////
 	if rng := r.Header.Get("Range"); rng != "" && !ig {
+		// bad416 / fake416Total：模拟不合规镜像源（如对任意 Range 一律回 416 且不带
+		// Content-Range，或伪造总长）——供防毒缓存回归测试使用
+		u.mu.Lock()
+		bad, fake := u.bad416[digest], u.fake416Total[digest]
+		u.mu.Unlock()
+		if bad || fake > 0 {
+			if fake > 0 {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", fake))
+			}
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
 		n := resumeParseRangeStart(rng)
 		if n >= total {
 			// 起点 ≥ 总长：上游 416（Content-Range 仅含总长），证明半截已完整
@@ -299,6 +333,7 @@ type resumeFixture struct {
 	reg      *resumeUpstream
 	s        *Server
 	disk     *cache.Cache
+	logBuf   bytes.Buffer // 服务日志捕获（断言提醒/观测日志用）
 }
 
 // newResumeFixture 构建半截续传测试环境（resumeEnabled 传 nil 沿用全局默认开）。
@@ -325,15 +360,18 @@ func newResumeFixture(t *testing.T, resumeEnabled *bool) *resumeFixture {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() 意外报错: %v", err)
 	}
-	s, err := New(cfg, cache.NewManager(context.Background()), quietLogger())
+	fx := &resumeFixture{upstream: upstream, reg: reg}
+	s, err := New(cfg, cache.NewManager(context.Background()), captureLogger(&fx.logBuf))
 	if err != nil {
 		t.Fatalf("New() 意外报错: %v", err)
 	}
+	fx.s = s
 	disk, err := cache.New(cacheDir)
 	if err != nil {
 		t.Fatalf("cache.New() 意外报错: %v", err)
 	}
-	return &resumeFixture{upstream: upstream, reg: reg, s: s, disk: disk}
+	fx.disk = disk
+	return fx
 }
 
 // effFor 返回某路径目标在本环境的生效配置。
@@ -650,6 +688,130 @@ func TestBlobResumeCompleteOn416(t *testing.T) {
 	e, ok := fx.disk.Get(key)
 	if !ok || !bytes.Equal(e.Body, content) {
 		t.Error("416 回放后缓存应命中且内容一致")
+	}
+}
+
+// TestBlobResumeDistrustsUnverifiable416 防毒缓存回归（现场事故：dockerpull.cn 对任意
+// Range 一律回不带合规 Content-Range 的 416，旧逻辑据此把 12875538 字节半截固化为
+// 133611458 字节 blob 的「正式缓存」，此后每次 pull 都命中毒缓存报 short read）：
+// 416 缺合规 `Content-Range: bytes */<total>` 或总长 ≠ 半截长度 → 绝不证实「半截已完整」，
+// 按 invalid 降级全量回源——半截丢弃、缓存内容 = 完整原文、客户端拿到完整 body。
+func TestBlobResumeDistrustsUnverifiable416(t *testing.T) {
+	name, digest := prefetchName, prefetchDigestOther
+	content := hubBlobContent(0xb1, 4096)
+
+	assertFullRefetch := func(t *testing.T, fx *resumeFixture, key string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != http.StatusOK {
+			t.Fatalf("Code = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+		}
+		if got := w.Header().Get("X-Cache"); got == resumeCacheStatus {
+			t.Errorf("X-Cache = %q，不可信 416 绝不能走「半截已完整」整体回放", got)
+		}
+		if got := w.Body.Bytes(); !bytes.Equal(got, content) {
+			t.Errorf("客户端应拿到完整 body（got %d 字节, want %d 字节）", len(got), len(content))
+		}
+		if _, err := os.Stat(fx.disk.PartPath(key)); !errors.Is(err, fs.ErrNotExist) {
+			t.Error("invalid 降级后半截应被丢弃")
+		}
+		e, ok := fx.disk.Get(key)
+		if !ok || !bytes.Equal(e.Body, content) {
+			t.Errorf("降级全量回源后缓存应为完整原文 %d 字节（绝不把半截固化为正式缓存）", len(content))
+		}
+	}
+
+	t.Run("裸416_无ContentRange", func(t *testing.T) {
+		fx := newResumeFixture(t, nil)
+		fx.reg.setContent(digest, content)
+		fx.reg.setBad416(digest) // 对任意 Range 回 416 且不带 Content-Range
+
+		key := prefetchBlobKey(name, digest)
+		fx.s.savePartialPart(fx.disk, key, content[:1000])
+		w := httptest.NewRecorder()
+		fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
+		assertFullRefetch(t, fx, key, w)
+	})
+
+	t.Run("416总长与半截不符", func(t *testing.T) {
+		fx := newResumeFixture(t, nil)
+		fx.reg.setContent(digest, content)
+		fx.reg.setFake416Total(digest, int64(len(content))+1000) // 416 总长伪造为大于半截
+
+		key := prefetchBlobKey(name, digest)
+		fx.s.savePartialPart(fx.disk, key, content[:1000])
+		w := httptest.NewRecorder()
+		fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
+		assertFullRefetch(t, fx, key, w)
+	})
+}
+
+// TestParseContentRangeStarTotal 416 Content-Range 专用解析（`bytes */<total>`）表驱动：
+// 合规头解析出总长；`*` 总长 / 常规区间形式 / 非法值一律 ok=false（绝不误判半截已完整）。
+func TestParseContentRangeStarTotal(t *testing.T) {
+	cases := []struct {
+		in    string
+		total int64
+		ok    bool
+	}{
+		{"bytes */133611458", 133611458, true},
+		{"bytes*/133611458", 133611458, true}, // 无空白容忍
+		{"  bytes */ 42  ", 42, true},         // 空白容忍
+		{"bytes */*", 0, false},               // 总长不可知
+		{"bytes 0-9/100", 0, false},           // 常规区间形式不走本解析
+		{"bytes */0", 0, false},               // 非法总长
+		{"bytes */-3", 0, false},
+		{"bytes */abc", 0, false},
+		{"100", 0, false},
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			got, ok := parseContentRangeStarTotal(c.in)
+			if ok != c.ok || (ok && got != c.total) {
+				t.Fatalf("parseContentRangeStarTotal(%q) = (%d, %v), want (%d, %v)", c.in, got, ok, c.total, c.ok)
+			}
+		})
+	}
+}
+
+// TestBlobResumeReminderLogsIsolatedGap 断开续传提醒：半截存在且「隔离时长」≥1s 的重试
+// → 输出提醒日志（一眼可辨「断点续传」并写明隔了多久），续传开始日志同样携带 isolated_gap。
+func TestBlobResumeReminderLogsIsolatedGap(t *testing.T) {
+	fx := newResumeFixture(t, nil)
+	name, digest := prefetchName, prefetchDigestConfig
+	content := hubBlobContent(0xb2, 4096)
+	fx.reg.setContent(digest, content)
+	fx.reg.setChunkConfig(2048, 0)
+
+	key := prefetchBlobKey(name, digest)
+	fx.s.savePartialPart(fx.disk, key, content[:1000])
+	// 半截 mtime 回拨 90s：模拟「客户端断开 90 秒后才回来重试」（半截 mtime = 上次中断时刻）
+	partPath := fx.disk.PartPath(key)
+	past := time.Now().Add(-90 * time.Second)
+	if err := os.Chtimes(partPath, past, past); err != nil {
+		t.Fatalf("回拨半截 mtime 失败: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
+	if w.Code != http.StatusOK {
+		t.Fatalf("Code = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if got := w.Body.Bytes(); !bytes.Equal(got, content) {
+		t.Errorf("body 与上游原文不一致（got %d 字节, want %d 字节）", len(got), len(content))
+	}
+
+	logs := fx.logBuf.String()
+	if lines := logLinesOf(logs, "blob 断点续传提醒"); len(lines) == 0 {
+		t.Fatalf("应输出断开续传提醒日志，实际:\n%s", logs)
+	}
+	// captureLogger 无双语键改写（生产由 logging.ReplaceAttr 输出 isolated_gap(隔离时长)），
+	// 这里按原始英文键断言取值正确
+	if !strings.Contains(logs, "isolated_gap=1m30s") {
+		t.Errorf("提醒日志应携带隔离时长 isolated_gap=1m30s，实际:\n%s", logs)
+	}
+	if lines := logLinesOf(logs, "blob 半截续传开始"); len(lines) == 0 || !strings.Contains(lines[0], "isolated_gap=1m30s") {
+		t.Errorf("续传开始日志应携带 isolated_gap=1m30s，实际:\n%s", logs)
 	}
 }
 

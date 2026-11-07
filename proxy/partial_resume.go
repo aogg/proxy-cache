@@ -91,7 +91,9 @@ const resumeCacheStatus = "RESUME"
 var errBlobRangeUnavailable = errors.New("本地半截无法满足客户端区间请求")
 
 // resumeScanBudgetFor 续传候选扫描的整体预算（全部候选轮询完的上限，到期按超时类失败
-// 收场并降级既有全量回源；半截保留不受影响）。续传只服务 docker blob，故按 blob 的
+// 收场并降级既有全量回源；半截保留不受影响）。预算只约束「选源」（探测/校验候选直到
+// 首个合规 206 / 416），命中后的活体续传流不受该预算约束——见 scanResumeCandidate 的
+// AfterFunc 门控实现。续传只服务 docker blob，故按 blob 的
 // 放大预算算（candidates.go 的 blobCandidateScanBudget：60s 起，随候选数×hedge 与候选
 // 探测预算动态放大）——旧的固定 20s 会在「7 个候选 × 慢上游」的现场场景里，于某个慢
 // 候选的 206 到手之前就退出扫描（随后降级全量回源 = 又从头下一遍，等于半截白留）。
@@ -286,16 +288,57 @@ func (s *Server) captureStreamPartial(sink *partialSink, r *http.Request, target
 	return s.savePartialPart(sink.disk, sink.key, data, dockerLogInfo{image: name, digest: digest})
 }
 
+// partIdleSince 半截文件自上次写盘（= 上次下载中断时刻）至今的间隔（「隔离时长」）：
+// 断开续传提醒与续传开始日志用它回答「客户端隔了多久才回来续传」。半截文件只在追加写
+// 时更新 mtime，下载中断后不再变动，因此跨进程重启依然准确；搭车/预取路径留下的半截
+// 同样适用（语义泛化为「上次下载中断至今的间隔」）。stat 失败（半截已被并发流程消费/
+// 删除）返回 0，调用方按「无法观测」省略字段，绝不影响主流程。
+func partIdleSince(disk *cache.Cache, key string) time.Duration {
+	st, err := os.Stat(disk.PartPath(key))
+	if err != nil {
+		return 0
+	}
+	return time.Since(st.ModTime())
+}
+
+// parseContentRangeStarTotal 解析 416 响应的 `Content-Range: bytes */<total>`
+// （RFC 7233：对不满足的单区间请求，416 必带此头，total 即对象总长）。常规区间头
+// （`bytes <start>-<end>/<total>`）不走这里——parseContentRange 已覆盖；416 的区间
+// 段恒为 `*`，通用解析器对它返回 ok=false，故需要本专用解析。格式不符、total 为
+// "*" 或非法（≤0）时 ok=false。
+func parseContentRangeStarTotal(v string) (int64, bool) {
+	v = strings.TrimSpace(v)
+	// 去掉 "bytes" scheme 前缀（scheme 名不参与判定）：容忍 "bytes *" 与 "bytes*" 两种写法
+	if i := strings.IndexByte(v, ' '); i >= 0 {
+		v = strings.TrimSpace(v[i+1:])
+	} else if len(v) >= 5 && strings.EqualFold(v[:5], "bytes") {
+		v = strings.TrimSpace(v[5:])
+	}
+	rangePart, totalPart, found := strings.Cut(v, "/")
+	if !found || strings.TrimSpace(rangePart) != "*" {
+		return 0, false
+	}
+	t, err := strconv.ParseInt(strings.TrimSpace(totalPart), 10, 64)
+	if err != nil || t <= 0 {
+		return 0, false
+	}
+	return t, true
+}
+
 // //////////////////  续传候选扫描  ////////////////////////////////////////////////////////////
 
 // scanResumeCandidate 续传候选轮询扫描：按 round-robin 起始下标（共用 s.rr 计数器，
 // 与既有候选管线同一负载轮询语义）逐个候选发 `Range: bytes=<partSize>-`（复用
 // startUpstream 公共底层：候选级超时覆盖 / http-proxy / insecure TLS / 401 匿名
-// token dance 全复用），整体受 resumeScanBudgetFor（blob 放大预算）兜底。逐候选失败不中断轮询（换下一
+// token dance 全复用），整体受 resumeScanBudgetFor（blob 放大预算）兜底——预算只
+// 约束「选源」阶段，命中后的活体续传流不受该预算约束（AfterFunc 门控，见实现内
+// 注释）。逐候选失败不中断轮询（换下一
 // 候选重试语义与既有管线一致）。返回值：
 //   - res：首个通过校验的 206 探测结果（活体 body 所有权移交调用方；complete=true 时为 nil）
 //   - total：对象总长（206 Content-Range 的 total；不可知为 -1，调用方流式不设 Content-Length）
-//   - complete：上游回 416 证实半截已完整（Range 起点 ≥ 总长而半截是合法前缀 → 只可能已完整）
+//   - complete：上游回「合规 416」证实半截已完整——416 必须携带可解析的
+//     `Content-Range: bytes */<total>` 且 total == 半截长度（RFC 7233 语义；不符即
+//     毒缓存风险，按 invalid 处理轮询下一候选，绝不把半截当完整 blob 写缓存）
 //   - invalid：是否存在「上游明确拒绝按断点续传」的失败（非 206 / Content-Range 起点不匹配）——
 //     供调用方按安全降级规则丢弃半截；纯网络/超时失败（含扫描预算耗尽）不算
 //   - err：全部候选失败时的最后一个错误（complete 时为 nil）
@@ -316,14 +359,21 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 	labels := parseDockerLogInfo(r.URL.Path)
 
 	// 整体扫描预算：与客户端断开解耦（WithoutCancel，与既有候选管线一致），
-	// 到期按超时类失败收场（半截保留、降级全量回源）。cancel 不走 defer：defer
-	// 会在本函数返回时立即取消 ctx，杀掉命中候选的在途 body 读取——206 响应是
-	// 活体流，续传收到首块即 context canceled。取消权随结果移交（与 selectCandidate
+	// 到期按超时类失败收场（半截保留、降级全量回源）。预算只约束「选源」阶段
+	//（找到首个合规 206 / 416 为止）——此前用 WithTimeout 把 deadline 直接挂进
+	// ctx，命中候选的活体 body 读取也被同一 deadline 约束，现场观测到「206 命中
+	// 后正常流式约 2 分钟被预算到期杀掉（context deadline exceeded），半截停更、
+	// 客户端响应截断」。故改用 AfterFunc 门控的 cancel：到期且未命中才 cancel
+	//（预算耗尽语义不变）；命中出口先 Stop 再核验 ctx.Err()，命中后的活体流
+	// 只有「调用方放弃 / 流结束」这一个取消来源。cancel 不走 defer：defer 会在
+	// 本函数返回时立即取消 ctx，杀掉命中候选的在途 body 读取——206 响应是活体
+	// 流，续传收到首块即 context canceled。取消权随结果移交（与 selectCandidate
 	// 的 onClose(cancelBase) 同款）：命中 206 的出口把 cancel 挂 upRes.onClose，
 	// 随调用方流结束/放弃的 Close 统一释放；416 / 扫描全败 / 预算耗尽等不返回
-	// 活体 body 的出口显式 cancel()，绝不泄漏。
+	// 活体 body 的出口显式 Stop + cancel()，绝不泄漏。
 	scanBudget := resumeScanBudgetFor(n, eff)
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), scanBudget)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
+	scanTimer := time.AfterFunc(scanBudget, func() { cancel() }) // 预算到期：未命中才生效（命中出口已 Stop）
 
 	var lastErr error
 	for i := 0; i < n; i++ {
@@ -340,16 +390,35 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 			continue // 网络/超时类失败：半截保留
 		}
 		if upRes.status == http.StatusRequestedRangeNotSatisfiable {
-			// 416：Range 起点不小于对象总长，而半截是同 digest 内容的合法前缀
-			//（起点 ≤ 总长）→ 只可能是「半截已完整」。从 416 的 Content-Range:
-			// bytes */<total> 解析总长留痕（解析不出按 -1）
-			_, _, t416, pok := parseContentRange(upRes.header.Get("Content-Range"))
-			if !pok {
-				t416 = -1
+			// 416 的可信性校验（防毒缓存）：合规服务端对「起点已达总长」的单区间请求
+			// 回 416，且 RFC 7233 要求必带 `Content-Range: bytes */<total>`。半截是同
+			// digest 内容的合法前缀（起点 ≤ 总长），只有「总长可解析且 == 半截长度」
+			// 才证实「半截已完整」。总长解析不出或 total ≠ 半截长度，都说明该候选的
+			// 416 不符合语义（实测 dockerpull.cn 对任意 Range 一律回 416）——绝不能
+			// 据此把半截当完整 blob 写缓存：现场曾因此把 12875538 字节的半截固化为
+			// 133611458 字节 blob 的「正式缓存」，此后每次 pull 都命中毒缓存报 short
+			// read。按「明确拒绝按断点续传」处理：invalid 置位轮询下一候选；全部候选
+			// 如此时走既有 invalid 降级（丢弃半截全量回源，进度回零但内容正确）。
+			// 注意 416 的 Content-Range 区间段恒为 `*`（parseContentRange 只认
+			// start-end 形式、对此返回 ok=false），必须用专用解析器拿总长。
+			t416, pok := parseContentRangeStarTotal(upRes.header.Get("Content-Range"))
+			if !pok || t416 != partSize {
+				upRes.Close()
+				invalid = true
+				if !pok {
+					t416 = -1
+				}
+				lastErr = fmt.Errorf("候选 416 不可信（Content-Range 总长 %d 缺失或 ≠ 半截长度 %d）", t416, partSize)
+				s.log.Debug("blob 半截续传 416 缺合规 Content-Range，不可证实半截完整，轮询下一候选",
+					labels.attrs(dockerLogSourceResume, "index", idx,
+						"candidate", truncate(cand.url, 300), "part_bytes", partSize,
+						"total", t416, "err", lastErr)...)
+				continue
 			}
 			upRes.Close()
-			cancel() // 416 出口不返回活体 body：ctx 就地回收（重复取消幂等无害）
-			s.log.Info("blob 半截续传发现半截已完整（上游 416 证实起点已达总长）",
+			scanTimer.Stop() // 命中出口（完整收场）：停掉预算 timer，绝不遗留到期触发
+			cancel()         // 416 出口不返回活体 body：ctx 就地回收（重复取消幂等无害）
+			s.log.Info("blob 半截续传发现半截已完整（上游 416 且 Content-Range 总长与半截一致）",
 				labels.attrs(dockerLogSourceResume,
 					"candidate", truncate(cand.url, 300), "part_bytes", partSize, "total", t416)...)
 			return nil, t416, true, false, nil
@@ -369,6 +438,16 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 		if !pok || t <= 0 {
 			t = -1
 		}
+		// 命中出口：先停预算 timer（命中后的活体流不再受扫描预算约束），再核验
+		// ctx 是否已在停表前被预算到期击穿（并发窗口：206 头到手瞬间 timer 恰好
+		// 触发）——被击穿则本候选按超时类失败收场（活体 body 一读即挂，绝不能移交
+		// 调用方），循环顶的 ctx.Err() 检查随后按预算耗尽收场
+		scanTimer.Stop()
+		if ctx.Err() != nil {
+			upRes.Close()
+			lastErr = errors.New("续传扫描预算到期（206 命中窗口内被预算终止）")
+			continue
+		}
 		s.log.Info("blob 半截续传候选命中",
 			labels.attrs(dockerLogSourceResume, "index", idx, "candidate", truncate(cand.url, 300), "status", upRes.status,
 				"part_bytes", partSize, "total", t)...)
@@ -378,7 +457,8 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 	if lastErr == nil {
 		lastErr = errors.New("全部续传候选均未产生结果")
 	}
-	cancel() // 扫描收场（全败/预算耗尽/不合规轮完）：本出口无活体 body，ctx 就地回收
+	scanTimer.Stop() // 收场出口（全败/预算耗尽/不合规轮完）：停掉预算 timer（幂等）
+	cancel()         // 扫描收场（全败/预算耗尽/不合规轮完）：本出口无活体 body，ctx 就地回收
 	return nil, -1, false, invalid, lastErr
 }
 
@@ -436,6 +516,17 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	n, ok := disk.PartSize(key)
 	if !ok || n <= 0 {
 		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
+	}
+
+	// 断开续传提醒（观测需求：客户端断开后再来续传时，日志要一眼可辨「这是断点续传」，
+	// 且写明「隔离了多久」——上次中断到本次重试的间隔）。半截存在才会走到这里，故本
+	// 提醒即「续传方回场」事件本身；间隔取半截文件 mtime（见 partIdleSince），≥1s 才
+	// 输出（同秒内的并发重试没有提醒价值）。
+	isolatedGap := partIdleSince(disk, key)
+	if isolatedGap >= time.Second {
+		s.log.Info("blob 断点续传提醒：上次下载中断后客户端重新请求（半截保留中，本次将从断点无感续传）",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
+				"part_bytes", n, "isolated_gap", isolatedGap.Round(time.Millisecond).String())...)
 	}
 
 	// 登记续传在途条目（搭车窗口自候选扫描前开始，覆盖整个续传过程；同 key 既有
@@ -525,6 +616,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	s.commitResumeHeader(w, hdr, upRes.url, total, cr...)
 	startArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n, "total", total,
 		"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)
+	if isolatedGap > 0 {
+		startArgs = append(startArgs, "isolated_gap", isolatedGap.Round(time.Millisecond).String())
+	}
 	if hasRange {
 		startArgs = append(startArgs, "range_start", clientStart, "range_end", clientLast)
 	}
