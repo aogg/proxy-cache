@@ -522,7 +522,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		// push / 签名追加而变化，读写缓存都跳过——读旧条目会回放过期
 		// Docker-Content-Digest 让 docker 判「Image is up to date」永远拉不到新推送
 		//（2026-11-07 现场：latest 卡旧 digest）。不可变的 blob / digest manifest 不受影响。
-		bypassReason = "docker-mutable"
+		bypassReason = dockerMutableBypassReason
 	case r.Header.Get("Range") != "":
 		if blobRangeLocal {
 			bypassReason = "blob-range" // blob 起点 >0：不写缓存，但允许本地切片 / 半截续传
@@ -637,6 +637,13 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 			"target", truncate(target, 300))...)
 		// //////////////////  不走缓存：直接按生效配置回源  start  ////////////////////////////////////////////////
 		if streaming {
+			// docker 可变目标多源并发回源（tags 合并 / referrers 合并 / manifest 摘要共识，
+			// 见 docker_multisource.go）：开关开启且条件满足时接管本次响应（含客户端断开
+			// 的低调错误出口）；返回 false（条件不满足或全部源失败）退回下方既有顺序候选
+			// 管线（继承其 4xx 透传 / 502 语义不变）
+			if s.serveDockerMultiSource(w, r, target, eff, bypassReason == dockerMutableBypassReason, start) {
+				return
+			}
 			// 路径目标 BYPASS（Range / no-cache / 关缓存等）同样流式透传：
 			// docker 断点续传走 Range，上游回 206 视为成功并流式透传、不写缓存
 			_, committed, err := s.fetchViaCandidatesStreaming(w, r, target, eff, "BYPASS", nil, start)
@@ -912,6 +919,9 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 	labels := parseDockerLogInfo(target)
 	// 缓存不可读（未启用 / no-cache / 实例获取失败）时回源结果按 BYPASS 标注，与 GET 的语义对齐
 	cacheStatus := "MISS"
+	// headMutableBypass 本次 HEAD 是否为 docker 可变目标 BYPASS：仅该类请求启用多源并发
+	// 回源（开关与边界见 docker_multisource.go），其余 BYPASS / MISS 维持既有顺序管线
+	headMutableBypass := false
 
 	// //////////////////  查缓存：命中直接回放响应头  start  ////////////////////////////////////////////////
 	// docker 可变目标（tag manifest / referrers / tags list，判定见 docker_mutable.go）：
@@ -919,8 +929,9 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 	// Docker-Content-Digest，docker 直接判「Image is up to date」永不更新（2026-11-07 现场）
 	if dockerMutableTarget(target) {
 		s.log.Info("HEAD 请求绕过缓存（BYPASS，docker 可变目标不读缓存）", labels.attrs(dockerLogSourceClient,
-			"rule", eff.Rule, "reason", "docker-mutable", "target", truncate(target, 300))...)
+			"rule", eff.Rule, "reason", dockerMutableBypassReason, "target", truncate(target, 300))...)
 		cacheStatus = "BYPASS"
+		headMutableBypass = true
 	} else if disk := s.readableCache(r, eff); disk != nil {
 		if e, ok := disk.Get(key); ok {
 			if mismatch, actual := s.entryDigestMismatch(target, e); mismatch {
@@ -941,6 +952,15 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 		cacheStatus = "BYPASS"
 	}
 	// //////////////////  查缓存：命中直接回放响应头  end  ////////////////////////////////////////////////
+
+	// //////////////////  docker 可变目标多源并发回源  start  ////////////////////////////////////////////////
+	// 开关开启时并发请求全部候选源并按端点类型合并/共识（tags 并集 / referrers 去重 /
+	// manifest 摘要共识，HEAD 与 GET 同策略保证 pull 流程内判定一致，见 docker_multisource.go）；
+	// 返回 false（条件不满足或全部源失败）退回下方既有顺序候选管线（4xx 透传 / 502 语义不变）
+	if s.serveDockerMultiSource(w, r, target, eff, headMutableBypass, start) {
+		return
+	}
+	// //////////////////  docker 可变目标多源并发回源  end  //////////////////////////////////////////////////
 
 	// //////////////////  未命中：候选轮询回源（HEAD 不写缓存）  start  ////////////////////////////////////////////////
 	e, err := s.fetchViaCandidates(r, target, eff)

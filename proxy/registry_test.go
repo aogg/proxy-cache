@@ -62,6 +62,12 @@ func (rec *upstreamRecord) last() (string, string) {
 func newRegistryServer(t *testing.T, hostRegex, cacheDir string, templates []config.URLRedirectItem, caches *cache.Manager) *Server {
 	t.Helper()
 	cfg := config.Default()
+	// 本夹具服务于顺序候选管线的既有语义回归（4xx 透传 / HTML 反爬页拒判 / 换候选重试 /
+	// 上游轮询次数断言等）：显式关闭 docker 可变目标多源并发回源（docker-multi-source-enabled
+	// 默认开）——避免多源并发阶段在既有断言之外多打上游（次数断言会翻倍）；多源合并与
+	// 摘要共识语义由 docker_multisource_test.go 专测覆盖。
+	multiSourceOff := false
+	cfg.DockerMultiSourceEnabled = &multiSourceOff
 	if cacheDir != "" {
 		cfg.Cache.Path = cacheDir
 	} else {

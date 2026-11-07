@@ -20,6 +20,12 @@ package proxy
 
 import "strings"
 
+// dockerMutableBypassReason docker 可变目标 BYPASS 的原因标识（GET bypassReason 与 HEAD
+// 日志 reason 共用）：多源并发回源（docker_multisource.go）以它为启用闸门——仅该类
+// BYPASS 启用，其余 BYPASS（request-range / request-no-cache / cache-disabled 等）维持
+// 既有顺序管线不变。
+const dockerMutableBypassReason = "docker-mutable"
+
 // dockerMutableTarget 判断路径目标是否为 docker「可变目标」（不得读写缓存）：
 // target 为 ExtractTarget 输出的路径目标原文（不带 scheme 与前导 /，可能带查询串；
 // 容忍前导 /，与 parseDockerBlobNameDigest 同款宽松）。完整 URL（web）目标恒 false，

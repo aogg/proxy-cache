@@ -690,6 +690,20 @@ type Config struct {
 	//（DefaultDockerResumeClientGoneGrace）；显式 <=0 = 关闭宽限终止（完全恢复旧语义）。
 	// 全局配置，无规则级覆盖。
 	DockerResumeClientGoneGrace *Duration `yaml:"docker-resume-client-gone-grace"`
+	// DockerMultiSourceEnabled docker 可变目标（tag manifest / referrers / tags list）
+	// 多源并发回源与合并开关（实现见 proxy 包 docker_multisource.go）：可变目标 BYPASS
+	// 回源时并发请求全部 url-redirect 候选源（成功判据与顺序管线相同），tags/list 合并
+	// 各源 tags（并集去重、字典序排序），referrers/<digest> 合并 descriptors（按
+	// mediaType+digest 去重），manifests/<tag> 按各成功源的 Docker-Content-Digest 取多数
+	// 共识（平票取最快成功者，HEAD 与 GET 同策略）——解决镜像站之间同步快慢不一导致
+	// 先命中源拿到旧数据（漏 tag / 旧 digest）的问题。manifest 摘要共识后无需再做源
+	// pin：blob 按 digest 寻址、内容不可变，共识摘要确定后任意源的同 digest 内容一致。
+	// 边界：tags/list 带分页参数（?n= / ?last=）不做合并（跨源页码语义不一致）；候选数
+	// <2 不启用；其余 BYPASS（request-range / request-no-cache / cache-disabled 等）维持
+	// 既有顺序管线；全部源失败退回既有顺序管线（继承其 4xx 透传 / 502 语义）；并发上限
+	// 8、每候选超时复用现有候选级配置。nil（未配置）= 开启（默认开）；显式 false 关闭。
+	// 全局配置，无规则级覆盖。
+	DockerMultiSourceEnabled *bool `yaml:"docker-multi-source-enabled"`
 	// HTTPProxy 全局上游代理（http/https/socks5 地址，如 http://127.0.0.1:7890），空串表示直连。
 	HTTPProxy string `yaml:"http-proxy"`
 	// SuccessCheck url-redirect 候选成功判据：status 或 content（默认 content）。
@@ -1359,6 +1373,17 @@ func (c *Config) GlobalDockerPartialResumeEnabled() bool {
 		return true
 	}
 	return *c.DockerPartialResumeEnabled
+}
+
+// GlobalDockerMultiSourceEnabled 返回 docker 可变目标多源并发回源开关生效值：
+// nil（未配置）= 开启（默认开）；显式 false 关闭。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底（布尔键无额外校验约束，
+// 与 docker-partial-resume-enabled 同款——布尔键只有开/关两态，无取值范围可校验）。
+func (c *Config) GlobalDockerMultiSourceEnabled() bool {
+	if c.DockerMultiSourceEnabled == nil {
+		return true
+	}
+	return *c.DockerMultiSourceEnabled
 }
 
 // GlobalDockerResumeClientGoneGrace 返回 docker blob 半截续传「客户端断开宽限终止」的

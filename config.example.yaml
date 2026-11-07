@@ -240,6 +240,20 @@ fallback-direct: true
 # docker-partial-resume-enabled blob 半截保留与无感续传开关（默认 true 开启；显式 false 关闭）
 #docker-partial-resume-enabled: true
 
+# docker 可变目标多源并发回源与合并：docker 可变目标（tag manifest / referrers / tags
+# list，不缓存每次回源）BYPASS 时并发请求全部 url-redirect 候选源（成功判据与顺序管线
+# 相同，HTML 反爬页等未过判据的源拒之于合并之外），tags/list 合并各源 tags（并集去重、
+# 字典序排序，慢源漏 tag 不再可能）、referrers/<digest> 合并 descriptors（按
+# mediaType+digest 去重）、manifests/<tag> 按各成功源 Docker-Content-Digest 取多数共识
+# （平票取最快成功者，HEAD 与 GET 同策略保证 docker pull 流程内 HEAD/GET 判定一致）。
+# manifest 摘要共识后无需再做源 pin：blob 按 digest 寻址、内容不可变，共识摘要确定后
+# 任意源的同 digest 内容一致。边界：tags/list 带分页参数（?n= / ?last=）不做合并（跨源
+# 页码语义不一致，退回顺序管线）；候选数 <2 不启用；其余 BYPASS（request-range /
+# request-no-cache / cache-disabled 等）维持既有顺序管线；全部源失败退回既有顺序管线
+# （继承其 4xx 透传 / 502 语义）；并发上限 8、每候选超时复用现有候选级配置。
+# docker-multi-source-enabled docker 可变目标多源并发回源开关（默认 true 开启；显式 false 关闭）
+#docker-multi-source-enabled: true
+
 # url-redirect：回源镜像/上游代理候选列表（对象数组，破坏性变更：不再支持旧版纯字符串写法，
 # 解析期报错并给出迁移示例；候选对象支持字段见下方示例与 README「url-redirect 候选对象」小节）
 # 候选对象字段：

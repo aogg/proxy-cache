@@ -19,6 +19,7 @@ curl -i "http://127.0.0.1:8080/https://raw.githubusercontent.com/dongchengjie/ai
 - **HEAD 走候选轮询管线**：HEAD 与 GET 一致先查缓存（命中回放响应头，无 body），未命中按候选轮询回源（方法保持 HEAD，docker registry 的 HEAD 探测同样打到镜像站）；HEAD 响应无 body 不写缓存；未配置 url-redirect 时回退直连（与旧版一致）
 - **docker 镜像 layer 异步预取（manifest 驱动）**：识别出 `GET /v2/<name>/manifests/<ref>` 路径目标回源成功且响应为单平台 image manifest 后，异步预取该镜像其余 layer blob 写入缓存（`docker-prefetch-enabled` 默认开，并发 `docker-prefetch-concurrency` 默认 4）——docker daemon 默认 `max-concurrent-downloads=3` 逐层下载慢，预取后客户端后续 blob 请求直接 `X-Cache: HIT`；预取复用与客户端完全相同的回源路径（候选轮询/超时覆盖/http-proxy/insecure TLS/token dance/缓存写入），只写缓存不产生客户端响应；同一 blob 在途集合去重 + singleflight 与客户端并发请求合并；**预取在途中的层被客户端请求时直接搭车**（拼接已落盘前缀与实时增量，`X-Cache: PREFETCH`，上游仅预取一路下载、已下载部分直接复用，详见下文「[在途预取层搭车](#在途预取层搭车)」）；失败只记日志绝不影响客户端；blob 按 digest 不可变、不存在刷新问题，详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」
 - **docker blob 半截保留与无感续传**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时，把已下载前缀保留为缓存目录内的半截文件（`.part-<缓存key>`，大小即已下载字节数，`docker-partial-resume-enabled` 默认开）——重 pull 时 docker 客户端是无 Range 的完整 GET（从 0 开始），proxy 撞上「缓存 MISS + 半截文件」时从断点 Range 续传并对客户端回**一次完整 200**（本地前缀回放 + 上游剩余实时拼接，docker 无需支持 Range、完全无感知，`X-Cache: RESUME`）；并发请求经既有搭车机制共享同一路续传流，上游只一路下载；续传中途失败保留更新后的半截（进度不回退）；manifest 仅 blob 启用；`Range` 起点 0 的 `bytes=0-` 等价完整 GET（照常续传），**起点 >0 且不超过半截长度时同样复用续传管线**（从半截的起点回放 + 上游剩余拼接，对客户端回 206），起点超出半截（有缺口）才维持旧版 206 透传；上游不回 206 时安全降级，详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」
+- **docker 可变目标多源并发回源与合并**：docker 可变目标（tag manifest / referrers / tags list，不缓存每次回源）BYPASS 时并发请求全部候选源并按端点类型合并——tags/list 合并各源 tags（并集去重、字典序排序），referrers/<digest> 合并 descriptors（按 mediaType+digest 去重），manifests/<tag> 按各成功源 `Docker-Content-Digest` 取多数共识（平票取最快成功者，HEAD 与 GET 同策略）；解决镜像站之间同步快慢不一导致先命中源漏 tag / 给旧 digest 的问题（`docker-multi-source-enabled` 默认开），详见下文「[docker 可变目标多源并发回源与合并](#docker-可变目标多源并发回源与合并)」
 - **可配置成功判据**：`success-check: status`（HTTP 200 即成功）或 `content`（200 且 body 非空，默认，防止镜像返回空内容/软错误）；HEAD 响应天然无 body，content 判据对 HEAD 自动按 status 语义；HTTP 304（内容未变更）在两种模式下均视为成功候选，304 原样透传给客户端、不写缓存
 - **条件请求头不透传**：回源（候选与直连）按请求头白名单透传（含 `Range`），但 `If-Match` / `If-Modified-Since` / `If-None-Match` / `If-Range` / `If-Unmodified-Since` 不透传——回源始终为无条件 GET/HEAD，保证上游返回 200 + 完整 body 以过判据、写缓存；客户端的 304 语义由代理自身缓存 ETag 逻辑（HIT 命中时返回 304）负责
 - **域名规则（domain-rules）**：正则匹配「`http://<入站Host>/<目标URL>`」整串（入站 Host 归一化小写后参与匹配，非锚定；目标 URL 正则写法仍兼容），命中后覆盖 `cache.enabled`、`cache.ttl`、`cache.path`、`cache.clean-interval`、`http-proxy`、`url-redirect`、`success-check`、`fallback-direct`、`insecure-skip-verify`、`timeout`（read-timeout 退化别名）、`http-timeout`、`read-timeout`、`connect-timeout`、`url-redirect-item-error-retry`、`url-redirect-all-error-retry` 等配置；每条规则还可配置 `exclude` 排除正则列表（支持多个），match 命中后任一 exclude 命中即排除该规则、继续向下尝试后续规则
@@ -127,6 +128,7 @@ docker run -d --name proxy-cache \
 | `docker-prefetch-enabled` | bool | `true` | **docker 镜像 layer 异步预取开关**：`GET /v2/<name>/manifests/<ref>` 路径目标回源成功（HTTP 200 已写入缓存）且响应为单平台 image manifest 时，异步预取该镜像其余 layer blob 写入缓存，客户端后续 blob 请求直接命中；**预取在途中的层被客户端请求时直接搭车**（`X-Cache: PREFETCH`，上游仅预取一路下载）；HEAD / 206(Range) / 多平台 manifest list 与 OCI index 不触发；预取失败只记日志、绝不影响客户端请求。详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」与「[在途预取层搭车](#在途预取层搭车)」 |
 | `docker-prefetch-concurrency` | int | `4` | docker 层预取的并发数上限（全部预取共享一个 Server 级信号量）；必须为正整数（显式 `<=0` 启动报错——关闭预取请用 `docker-prefetch-enabled: false`，两者语义分离） |
 | `docker-partial-resume-enabled` | bool | `true` | **docker blob 半截保留与无感续传开关**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时把已下载前缀保留为缓存目录半截文件（`.part-<缓存key>`）；客户端无 Range 完整 GET 撞上「缓存 MISS + 半截文件」时从断点 Range 续传，对客户端回一次完整 200（前缀回放 + 剩余实时拼接，docker 无需支持 Range，`X-Cache: RESUME`）；manifest 会变仅 blob 启用；`Range` 起点 0 的 `bytes=0-` 等价完整 GET（照常缓存/续传）；**起点 >0 且不超过半截长度时复用本续传管线**（从半截的起点位置回放 + 上游剩余区间拼接，对客户端回 206，内部照常写完整缓存），起点超出半截（有缺口）才维持旧版 206 透传并打 Warn；上游不回 206 安全降级全量回源。详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」 |
+| `docker-multi-source-enabled` | bool | `true` | **docker 可变目标多源并发回源与合并开关**：docker 可变目标（tag manifest / referrers / tags list，不缓存每次回源）BYPASS 时并发请求全部 url-redirect 候选源（成功判据与顺序管线相同，HTML 反爬页等未过判据的源拒之于合并之外），tags/list 合并各源 tags（并集去重、字典序排序），referrers/<digest> 合并 descriptors（按 mediaType+digest 去重），manifests/<tag> 按各成功源 `Docker-Content-Digest` 取多数共识（平票取最快成功者，HEAD 与 GET 同策略）；边界：tags/list 带分页参数（`?n=` / `?last=`）不做合并、候选数 <2 不启用、其余 BYPASS（request-range / request-no-cache / cache-disabled 等）维持既有顺序管线、全部源失败退回既有顺序管线（继承其 4xx 透传 / 502 语义）；并发上限 8、每候选超时复用现有候选级配置。详见下文「[docker 可变目标多源并发回源与合并](#docker-可变目标多源并发回源与合并)」 |
 | `http-proxy` | string | 空（直连） | 全局上游代理，支持 `http://`、`https://`、`socks5://`。三级覆盖（高→低）：**url-redirect 候选对象 `http-proxy`（显式空串 = 该候选强制直连）> 域名规则 > 本全局值**，详见「[url-redirect 候选对象与候选级覆盖](#url-redirect-候选对象与候选级覆盖)」 |
 | `success-check` | string | `content` | 候选成功判据：`status`（200 即成功）/ `content`（200 且 body 非空） |
 | `fallback-direct` | bool | `true` | url-redirect 候选全部失败后是否回退直连原始 URL |
@@ -224,6 +226,8 @@ url-redirect-probe-timeout: 5s     # 单候选探测预算：响应头/判据 5s
 url-redirect-hedge-delay: 2s       # 候选阶梯竞速放行间隔（0=纯串行禁用竞速）
 url-redirect-item-error-retry: 1   # 单候选失败后原地重试（总尝试 = 1+N；0 = 不重试；硬失败跳过）
 url-redirect-all-error-retry: 1    # 整轮全败后整体重试（总轮数 = 1+N；0 = 不重试）
+
+# docker-multi-source-enabled: true   # docker 可变目标多源并发回源与合并（默认开，见下文专节）
 
 cache:
   enabled: true
@@ -638,6 +642,26 @@ docker 客户端并发下载 layer 受限（daemon 默认 `max-concurrent-downlo
 - **安全依据**：blob 按 digest 寻址、**内容不可变**——任意候选源的同 digest 内容一致，半截可从任意候选发 `Range` 续传拼接（续传可跨候选）；客户端/上游侧 `Docker-Content-Digest` 不做本地全量校验（GB 级 blob 成本过高），信任 digest 寻址语义。**commit 前必须先确认上游是 206 且 `Content-Range` 起点匹配半截长度**，确认前绝不向客户端写任何字节——若上游对 Range 回 200 全量响应，回放本地前缀再拼全量会数据错位，因此绝不允许。
 - **边界与降级**：manifest 会变，**仅 blob 启用**；客户端带 Range 的请求按起点分流——起点 0 的 `bytes=0-` 等价完整 GET（照常续传），起点 >0 且不超过半截长度时复用本管线（从半截的起点回放 + 上游剩余拼接、对客户端回 206，内部仍写完整缓存），起点超出半截（有缺口）/ 后缀区间 / 多区间 / 非 blob 目标维持旧版 206 透传；半截为 0 字节直接丢弃；上游对 Range 回非 206（不支持 / 200 全量回）→ 丢弃半截走既有全量回源路径（安全降级，绝不给客户端错误数据）；纯网络/超时类失败保留半截继续全量回源（全量再失败时失败捕获会把更长前缀存回半截，进度不回退）；上游 416（Range 起点 ≥ 总长，而半截是合法前缀）证明**半截已完整**，直接读回写缓存回放，不再全量下载；续传中途读上游失败 / 长度不符 → 保留更新后的半截、本次响应被截断（docker 重试接着更长前缀续传——进度不回退）；EOF 但累积长度 ≠ 总长 → 不写缓存（绝不缓存短 body）。续传路径不叠加 slowdownload 慢速升级多源并发续传（与预取一路同一取舍）。
 - **开关**：`docker-partial-resume-enabled`（全局，默认开启；显式 `false` 关闭后全部路径行为与旧版完全一致——无半截文件的产生、保留与续传）。
+
+### docker 可变目标多源并发回源与合并
+
+用户场景：docker 可变目标（`GET/HEAD /v2/<name>/manifests/<tag>`、`/v2/<name>/referrers/<digest>`、`/v2/<name>/tags/list`，因内容随 push / 签名追加而变化**不缓存、每次回源**，见「docker 可变目标」判定）此前走单候选顺序轮询——先命中的源直接把响应透传给 docker。镜像站之间同步有快慢：先命中的源可能 `tags/list` 还没刷新（docker 拿不到最新 tag）、manifest 还是旧 digest（`Image is up to date` 假象）。`docker-multi-source-enabled`（全局，默认开启）把这类 BYPASS 回源改为**并发请求全部候选源 + 按端点类型合并/共识**：
+
+- **tags/list 合并**：各源 tags 取**并集、去重、按字典序排序**后返回（顶层其余字段如 `name` 取最快成功源原文），任何慢源/快源都漏不了 tag。
+- **referrers 合并**：各源 descriptors 数组按 **mediaType+digest 去重**合并（保留首次出现顺序与描述符未知字段），cosign 签名 / buildx attestation 在任一源上先出现都能及时返回。
+- **manifests 摘要共识（GET 与 HEAD 同策略）**：收集各成功源响应头的 `Docker-Content-Digest` 按**票数取多数**，平票取最快成功者，用该源的 body+响应头整体应答——保证 docker pull 流程内 HEAD/GET 判定一致（不会 HEAD 探到新 digest、GET 又拿到旧 body）。
+- **为什么共识后无需再做源 pin**：tags 与 manifest 由同一 push 事务产生，多数源给出的 `Docker-Content-Digest` 即最新内容寻址结果；**blob 按 digest 寻址、内容不可变**——共识摘要确定后，任意源取同 digest 的 manifest 与 blob 内容都一致，不存在「后续请求漂移到旧源拿旧内容」的问题，因此不需要把共识源固定下来（与半截续传「任意候选同 digest 内容一致可续」是同一条安全依据）。
+- **成功判据复用**：与顺序管线完全相同（`success-check` + HTML 反爬页拒判 `html-error-page`），未过判据的源（如镜像站反爬页）被**拒之于合并之外**；tags/referrers 合并还要求源响应为 200 且 body 可解析为目标端点 JSON，解析失败视同该源失败。
+- **失败语义**：**全部源失败 → 退回现有顺序候选管线**（继承其「上游明确 4xx 透传 / 其余 502」语义，如 referrers 404 透传——docker 对 registry 语义错误自带容错）；**仅 1 源成功 → 直接用该源**（等价旧结果但并发下更快）。
+- **不合并的边界（刻意收窄）**：
+  - 仅 `bypassReason == "docker-mutable"` 的 GET/HEAD 启用多源；其余 BYPASS（`request-range` / `request-no-cache` / `cache-disabled` / `negative-ttl` 等）**维持现有顺序管线不变**；
+  - `tags/list` 带分页参数（`?n=` / `?last=`）**不做多源合并**——各源 tag 集合不同，同一 `(n,last)` 在不同源指向不同窗口，合并会产生错页/丢页，退回顺序管线（单源分页语义自洽）；
+  - 候选数 <2（单候选）无合并/共识意义，维持顺序管线；
+  - GET 可变目标请求带 Range 时（可变判定在 bypass 分流中先于 Range）同样进入多源路径：tags/referrers 合并要求 200，上游 206 全部判为不可合并、退回顺序管线维持既有 206 透传；manifest 共识语义不受 Range 影响。
+- **应答形态与断开**：合并/共识必须收齐各源完整响应，无法边收边发，故本路径为**缓冲应答**（`X-Cache: BYPASS`，经 serveEntry 回放，GET 全量 / HEAD 仅响应头）；可变目标（manifest JSON / tags 列表 / referrers 列表）响应体量级小，可接受。客户端断开（`r.Context()` 取消）时**立即取消全部在途上游（断开即停）**——可变目标不写缓存、没有「继续读完填缓存」的价值可挽救——错误按既有断开语义低调处理（不 502 不刷日志）。
+- **并发与超时**：候选全并发但设上限 **8**（超出排队放行）；每候选超时复用现有候选级配置（`probe-timeout` / `http-timeout` / `read-timeout` / `connect-timeout`，候选 > 规则 > 全局三级覆盖不变）——慢源不会拖过它自己的每源超时。
+- **日志**：每次接管输出一条 Info 汇总（`docker 可变目标多源并发回源完成（tags/list 多源合并返回 | referrers 多源合并返回 | manifest 摘要共识返回）`），键为 `sources(源数量)` / `success(成功源数)` / `merged(合并条数)` / `agree(共识源数)` / `disagree(分歧源数)` / `digest(摘要)` / `upstream(上游)` / `cost(耗时)`（合并类端点的共识键恒 0、共识端点的 merged 恒 0，三键统一输出便于聚合检索）；单源失败为 Debug 级（含 `candidate(候选源)` / `err(错误)` / `hard_fail(硬失败原因)`）；全败退回顺序管线与分页跳过合并各有一条 Debug 留痕。按特性 grep：`grep 'docker 可变目标多源并发回源完成' proxy-cache.log`。
+- **开关**：`docker-multi-source-enabled`（全局，默认开启；显式 `false` 关闭后全部路径行为与旧版顺序管线完全一致）。
 
 ### 用法
 
