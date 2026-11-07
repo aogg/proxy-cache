@@ -99,6 +99,7 @@ var logKeyZh = map[string]string{
 	"realm":            "认证域",
 	"service":          "服务名",
 	"scope":            "权限范围",
+	"account":          "账号",
 	"www_authenticate": "认证头",
 
 	// 传输与进度

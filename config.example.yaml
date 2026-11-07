@@ -293,6 +293,16 @@ url-redirect:
   # $1 不带 scheme 该候选运行期会失败；不想候选全败后再兜底直连可配 fallback-direct: false）
   # - template: $1
   #   http-proxy: http://127.0.0.1:7890
+  # 候选级上游凭据 auth（可选）：该候选 401 token dance 用 Basic 账号密码换 Bearer token
+  #（替代匿名 dance）。典型场景：带鉴权的镜像站（如 HLmirror——mirror.houlang.cloud，
+  # 匿名 token 只有匿名权限，私有仓库 / 登录账号才能拉取）；支持二级路径镜像
+  #（如 template: https://mirror.houlang.cloud/dh/$http.server.header.full_url_no_server
+  #  即 Docker Hub 的 /dh/ 前缀，ghcr 用 /ghcr/，以此类推）。username 必填，password 可留空；
+  #  两级优先级：候选 auth > 规则级 auth（见下方 domain-rules 的 auth），无全局级
+  # - template: https://mirror.houlang.cloud/dh/$http.server.header.full_url_no_server
+  #   auth:
+  #     username: demo@gmail.com
+  #     password: "访问令牌（令牌当密码用）"
 
 # 缓存配置
 # 注意：整块注释掉 cache: 并不等于关闭缓存！未配置时启用内置默认值
@@ -364,6 +374,10 @@ domain-rules:
     # ---- url-redirect 候选探测提速覆盖（规则没配沿用全局；含义见顶部全局说明） ----
     # url-redirect-probe-timeout: 5s         # 该规则单次候选尝试的探测预算（0=不限制）
     # url-redirect-hedge-delay: 2s           # 该规则候选阶梯竞速的放行间隔（0=纯串行）
+    # ---- 规则级上游凭据（可选；仅该规则的所有候选默认使用，候选对象显式 auth 优先） ----
+    # auth:                                  # 401 token dance 用 Basic 账号密码换 Bearer token
+    #   username: demo@gmail.com             #   （带鉴权镜像站如 HLmirror；username 必填，
+    #   password: "访问令牌"                 #    password 可留空；无全局级，避免误泄露）
     # ---- 慢速升级多源并发续传覆盖（仅 type=docker 规则生效；规则没配沿用全局，含义见顶部全局说明） ----
     # slow-download-speed: 1MB               # 该规则判慢阈值（B/s；<=0 关闭特性）
     # slow-download-window: 10s              # 该规则判速滑动窗口（启用时最小 1s）

@@ -9,10 +9,11 @@
 // registry v2 语义：内容寻址 = 不可变，名字寻址 = 可变：
 //   - 不可变（可缓存）：v2/<name>/blobs/<digest>、v2/<name>/manifests/<algo:hex>；
 //   - 可变（不得读写缓存）：
-//       v2/<name>/manifests/<tag>（tag 指向内容随每次 push 变化）；
-//       v2/<name>/referrers/<digest>（列表 append-only：后续 cosign 签名 / buildx
-//       attestation 会向同一 digest 的 referrers 追加，读旧 = 静默丢新签名）；
-//       v2/<name>/tags/list（push / delete tag 都会变）。
+//     v2/<name>/manifests/<tag>（tag 指向内容随每次 push 变化）；
+//     v2/<name>/referrers/<digest>（列表 append-only：后续 cosign 签名 / buildx
+//     attestation 会向同一 digest 的 referrers 追加，读旧 = 静默丢新签名）；
+//     v2/<name>/tags/list（push / delete tag 都会变）。
+//
 // 可变目标读旧缓存比不缓存更糟（静默给出过期数据），故 GET 与 HEAD 一律 BYPASS：
 // 既不读缓存（绝不回放旧条目）也不写缓存（不在磁盘长驻必过期数据）。
 package proxy

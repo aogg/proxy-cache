@@ -302,6 +302,22 @@ const urlRedirectItemReservedFields = "enabled / weight / hedge-delay"
 //
 // 预留字段（本期未实现，配置即报错）：enabled（临时下线候选）、weight（加权轮询）、
 // hedge-delay（候选竞速放行间隔，作用于候选序列调度、非单候选属性，见 urlRedirectItemReservedFields）。
+//
+// CandidateAuth 候选级上游凭据（账号 + 密码）：供 401 token dance 用 Basic 认证换取
+// Bearer token（替代匿名 dance）。典型场景：带鉴权的镜像站（如 HLmirror——匿名 token
+// 只有匿名权限，私有仓库 / 登录限速账号需要登录态才能拉取）。凭据仅内存持有参与
+// Basic 头与 token 缓存 key（密码只取短哈希），绝不落盘、不打日志。
+type CandidateAuth struct {
+	// Username 账号（必填，trim 后非空；Validate 拒绝空账号）。
+	Username string `yaml:"username"`
+	// Password 密码 / 访问令牌（允许空串：个别 registry 支持空密码账号）。
+	Password string `yaml:"password"`
+}
+
+// URLRedirectItem 的 auth 字段（候选级上游凭据）说明：
+//   - auth（可选）：候选级上游凭据（401 token dance 用 Basic 换 Bearer token）；
+//     两级优先级：候选对象显式 auth > 规则级 auth（无全局级——凭据按镜像站配置，
+//     全局默认凭据容易误泄露到无关上游）。生效值经 Options.CandidateAuth 逐候选解析。
 type URLRedirectItem struct {
 	// Template 候选模板（必填，trim 后非空；Validate 阶段校验 http(s):// 前缀与占位符）。
 	Template string `yaml:"template"`
@@ -343,6 +359,11 @@ type URLRedirectItem struct {
 	// 生效值经 Options.CandidateProbeTimeout 解析；显式 0 = 不限制；负数为配置错误（Validate 拒绝）。
 	// 典型场景：走慢代理的候选放宽探测预算（代理握手耗时长，全局 5s 会在代理上全部超时）。
 	ProbeTimeout *Duration `yaml:"probe-timeout"`
+	// Auth 候选级上游凭据（可选）：该候选 401 token dance 用 Basic 认证换 Bearer token
+	//（替代匿名 dance），两级优先级候选 > 规则（无全局级），见 CandidateAuth 与
+	// Options.CandidateAuth。典型场景：带鉴权的镜像站（HLmirror 等）拉私有仓库 /
+	// 用登录账号提速；匿名候选不配 auth 即可，互不影响。
+	Auth *CandidateAuth `yaml:"auth"`
 }
 
 // UnmarshalYAML 自定义解析（yaml.Node 按 Kind 判别形态）：
@@ -369,11 +390,11 @@ func (it *URLRedirectItem) UnmarshalYAML(node *yaml.Node) error {
 		key := node.Content[i]
 		switch strings.ToLower(strings.TrimSpace(key.Value)) {
 		case "template", "insecure-skip-verify", "http-proxy",
-			"connect-timeout", "http-timeout", "read-timeout", "probe-timeout":
+			"connect-timeout", "http-timeout", "read-timeout", "probe-timeout", "auth":
 			// 本期支持的合法字段（http-proxy 与四个超时为候选级三级覆盖，见 URLRedirectItem 字段注释）
 		default:
 			return fmt.Errorf(
-				"第 %d 行: url-redirect 候选对象不支持字段 %q（支持字段: template / insecure-skip-verify / http-proxy / connect-timeout / http-timeout / read-timeout / probe-timeout；预留字段 %s 本期未实现，暂不可配置）",
+				"第 %d 行: url-redirect 候选对象不支持字段 %q（支持字段: template / insecure-skip-verify / http-proxy / connect-timeout / http-timeout / read-timeout / probe-timeout / auth；预留字段 %s 本期未实现，暂不可配置）",
 				key.Line, key.Value, urlRedirectItemReservedFields)
 		}
 	}
@@ -432,6 +453,11 @@ type DomainRule struct {
 	// 服务端身份验证与防窃听保护，仅建议在内网自签/镜像站证书链不全时开启；
 	// 更推荐用候选级（URLRedirectItem.InsecureSkipVerify）对个别镜像站精确开启。
 	InsecureSkipVerify *bool `yaml:"insecure-skip-verify"`
+	// Auth 规则级上游凭据（可选）：本规则全部 url-redirect 候选的 token dance 缺省凭据
+	//（候选对象显式 auth 优先级更高，两级优先级见 URLRedirectItem.Auth 与
+	// Options.CandidateAuth；无全局级——凭据按镜像站配置，全局默认容易误泄露）。
+	// 典型场景：整条规则都指向同一个带鉴权的镜像站（如 HLmirror），规则级配一次即可。
+	Auth *CandidateAuth `yaml:"auth"`
 	// URLRedirect 该规则专用的 url-redirect 候选对象列表（覆盖全局；设为 [] 表示该规则直连回源）。
 	URLRedirect *[]URLRedirectItem `yaml:"url-redirect"`
 	// SuccessCheck 该规则的成功判据（status / content）。
@@ -701,6 +727,10 @@ type Options struct {
 	//（ResolveOptions 解析）。作用于直连回退 / 完整 URL 直连透传路径；
 	// 候选路径按候选对象生效值另行解析（见 CandidateInsecureSkipVerify）。
 	InsecureSkipVerify bool
+	// Auth 该请求生效的规则级上游凭据（token dance 缺省凭据；nil = 规则未配置）：
+	// 仅规则级（无全局级），候选路径按候选对象生效值另行解析（见 CandidateAuth——
+	// 候选显式 auth > 本字段）。
+	Auth *CandidateAuth
 	// URLRedirect 该请求生效的 url-redirect 候选对象列表。
 	URLRedirect []URLRedirectItem
 	// SuccessCheck 该请求生效的成功判据（status / content）。
@@ -786,6 +816,16 @@ func (o Options) CandidateHTTPProxy(item URLRedirectItem) string {
 		return strings.TrimSpace(*item.HTTPProxy)
 	}
 	return o.HTTPProxy
+}
+
+// CandidateAuth 返回候选对象的上游凭据最终生效值（401 token dance 用）——
+// 两级优先级：候选对象显式 auth > 规则级 auth（无全局级：凭据按镜像站配置，
+// 全局默认容易误泄露到无关上游）。返回值只读共享，调用方不得修改。
+func (o Options) CandidateAuth(item URLRedirectItem) *CandidateAuth {
+	if item.Auth != nil {
+		return item.Auth
+	}
+	return o.Auth
 }
 
 // CandidateConnectTimeout 返回候选对象的建连超时最终生效值（TCP 拨号 + TLS 握手共用）——
@@ -1028,6 +1068,10 @@ func (c *Config) Validate() error {
 			if err := validateProxyAddr(*r.HTTPProxy); err != nil {
 				return fmt.Errorf("domain-rules[%d] (%s) 的 http-proxy 无效: %w", i, r.Label(), err)
 			}
+		}
+		// 规则级上游凭据：username 必填（候选级 auth 缺省来源），password 允许空串
+		if err := validateCandidateAuth(r.Auth, fmt.Sprintf("domain-rules[%d] (%s) 的 auth", i, r.Label())); err != nil {
+			return err
 		}
 		if r.URLRedirect != nil {
 			if err := validateRedirectItems(*r.URLRedirect, fmt.Sprintf("domain-rules[%d] (%s) 的 url-redirect", i, r.Label())); err != nil {
@@ -1457,6 +1501,11 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		if r.InsecureSkipVerify != nil {
 			o.InsecureSkipVerify = *r.InsecureSkipVerify
 		}
+		// 规则级上游凭据（token dance 缺省凭据；nil = 未配置，候选路径再按候选对象
+		// 显式 auth 覆盖，在 proxy 层经 Options.CandidateAuth 逐候选解析）
+		if r.Auth != nil {
+			o.Auth = r.Auth
+		}
 		if r.SuccessCheck != nil {
 			o.SuccessCheck = *r.SuccessCheck
 		}
@@ -1588,6 +1637,19 @@ func (c *Config) CheckACL(targetURL string) (matched string, err error) {
 	return "", nil
 }
 
+// validateCandidateAuth 校验候选/规则级上游凭据（token dance 用账号密码）：
+// username 必填（trim 后非空）；password 允许空串（个别 registry 支持空密码账号）。
+// 错误信息只带定位与字段名，绝不回显凭据内容。
+func validateCandidateAuth(auth *CandidateAuth, where string) error {
+	if auth == nil {
+		return nil
+	}
+	if strings.TrimSpace(auth.Username) == "" {
+		return fmt.Errorf("%s 缺少 username（账号必填；密码可留空）", where)
+	}
+	return nil
+}
+
 // validateProxyAddr 校验上游代理地址格式（支持 http/https/socks5）。
 func validateProxyAddr(addr string) error {
 	u, err := url.Parse(strings.TrimSpace(addr))
@@ -1660,6 +1722,11 @@ func validateRedirectItems(list []URLRedirectItem, where string) error {
 			if err := validateProxyAddr(*list[i].HTTPProxy); err != nil {
 				return fmt.Errorf("%s 第 %d 个候选的 http-proxy 无效: %w", where, i, err)
 			}
+		}
+		// 候选级上游凭据：username 必填（trim 后非空）；password 允许空串（个别 registry
+		// 支持空密码账号）。凭据不打印、不进错误信息，避免泄漏
+		if err := validateCandidateAuth(list[i].Auth, fmt.Sprintf("%s 第 %d 个候选的 auth", where, i)); err != nil {
+			return err
 		}
 		// 候选级超时四键：负数为配置错误（复用 validateNonNegativeDuration 的错误文案，
 		// 外层补候选序号定位；显式 0 = 不限制，合法）

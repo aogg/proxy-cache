@@ -242,10 +242,11 @@ func TestUpstreamStatusNetworkFailureStill502(t *testing.T) {
 // TestUpstreamStatusNetworkLastPrefers4xxFallback 覆盖点 9：兜底透传——最终失败为网络/超时
 // 类而扫描期间出现过明确 4xx 时，全败出口改用最近一次 4xx 载荷透传（candidates.go 全败出口）。
 // 现场动机（2026-11-07 opencode-to-openai 拉取失败）：referrers 目标下 1panel.live 明确回 404
-//（docker 客户端本可容忍自行 fallback），其余候选全是 DNS 失败 / dance 后 401 / probe-timeout，
+// （docker 客户端本可容忍自行 fallback），其余候选全是 DNS 失败 / dance 后 401 / probe-timeout，
 // 旧行为最终 lastErr 落在网络类失败上 → docker 收 502 判整次 pull 失败（层其实已全部拉完）。
 //   - 404 在前、死候选（连接拒绝）在后：最终 lastErr 为连接拒绝 → 兜底透传 404；
 //   - 死候选在前、404 在后：同上（载荷兜底与出现顺序无关，记录最后一次出现的 4xx）。
+//
 // 两种顺序都断言：客户端 404 + 上游 body 原样 + X-Proxy-Upstream 指向回 404 的候选。
 func TestUpstreamStatusNetworkLastPrefers4xxFallback(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))

@@ -5,7 +5,10 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1068,7 +1071,7 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	// 每个 doRequest 只 dance 一次，不循环（重试响应即使仍 401 也原样返回）。
 	// dance 全程共用本次尝试的看门狗（wd.ctx 受 http-timeout 与 read-timeout 共同约束）。
 	if resp.StatusCode == http.StatusUnauthorized && (method == http.MethodGet || method == http.MethodHead) {
-		if e2, ok := s.dockerAuthDance(wd, s.client(eff.HTTPProxy, eff.ConnectTimeout, eff.InsecureSkipVerify), req, resp, urlStr); ok {
+		if e2, ok := s.dockerAuthDance(wd, s.client(eff.HTTPProxy, eff.ConnectTimeout, eff.InsecureSkipVerify), req, resp, urlStr, nil); ok { // 无候选上下文（直连回退），无凭据可用，维持匿名 dance
 			entry = e2 // 重试响应作为最终响应，继续既有的返回 Entry 语义
 		}
 	}
@@ -1085,6 +1088,15 @@ const dockerTokenDefaultTTL = 60 * time.Second
 // dockerTokenBodyLimit 匿名 token 响应 body 的读取上限（token JSON 只有几百字节，
 // 限制仅为防异常端点返回超大响应拖爆内存）。
 const dockerTokenBodyLimit = 1 << 20
+
+// accountAttr 返回 dance 凭据的日志展示值（auth 为 nil 时输出「匿名」）：凭据 dance
+// 与匿名 dance 共用日志键，account 字段区分两类 token 来源（密码绝不进日志）。
+func accountAttr(auth *config.CandidateAuth) string {
+	if auth == nil {
+		return "匿名"
+	}
+	return auth.Username
+}
 
 // dockerTokenEntry 是一条进程内缓存的匿名 registry token。
 type dockerTokenEntry struct {
@@ -1114,8 +1126,8 @@ type bearerChallenge struct {
 //   - 挑战不可解析 / 取 token / 构造重试 / 重试失败时返回 ok=false，调用方沿用原始
 //     401 entry（行为与未实现 dance 的版本一致，绝不因 dance 引入新的失败路径）；
 //     看门狗触发（read-timeout）时失败日志经 wd.wrapErr 标注，便于日志辨认。
-func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string) (*cache.Entry, bool) {
-	resp2, _, ok := s.dockerAuthDanceRetry(wd, cl, orig, resp, urlStr)
+func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string, auth *config.CandidateAuth) (*cache.Entry, bool) {
+	resp2, _, ok := s.dockerAuthDanceRetry(wd, cl, orig, resp, urlStr, auth)
 	if !ok {
 		return nil, false
 	}
@@ -1158,7 +1170,7 @@ func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *ht
 // 各阶段失败均按既有语义返回 ok=false（调用方沿用原始 401 响应，绝不因 dance 引入
 // 新的失败路径）；请求 ctx 使用本次尝试的看门狗 ctx（wd.ctx），取 token 与带 token
 // 重试同样受 http-timeout / 探测预算约束，且各阶段响应头/数据到达都会重置 read-timeout。
-func (s *Server) dockerAuthDanceRetry(wd *progressWatchdog, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string) (resp2 *http.Response, consumed, ok bool) {
+func (s *Server) dockerAuthDanceRetry(wd *progressWatchdog, cl *http.Client, orig *http.Request, resp *http.Response, urlStr string, auth *config.CandidateAuth) (resp2 *http.Response, consumed, ok bool) {
 	// //////////////////  解析 Bearer 挑战  start  //////////////////////////////////////////////
 	var ch *bearerChallenge
 	for _, v := range resp.Header.Values("WWW-Authenticate") {
@@ -1180,11 +1192,18 @@ func (s *Server) dockerAuthDanceRetry(wd *progressWatchdog, cl *http.Client, ori
 	_, _ = io.Copy(io.Discard, &progressReader{r: resp.Body, wd: wd}) // body 已废弃，排干错误无补救动作
 	_ = resp.Body.Close()
 
-	s.log.Info("触发 Docker Registry 匿名 token dance",
-		"url", truncate(urlStr, 300), "realm", ch.realm, "service", ch.service, "scope", ch.scope)
+	// dance 触发留痕：带凭据时输出账号（密码绝不进日志），匿名时 account 留空
+	if auth != nil {
+		s.log.Info("触发 Docker Registry token dance（带凭据）",
+			"url", truncate(urlStr, 300), "realm", ch.realm, "service", ch.service,
+			"scope", ch.scope, "account", auth.Username)
+	} else {
+		s.log.Info("触发 Docker Registry 匿名 token dance",
+			"url", truncate(urlStr, 300), "realm", ch.realm, "service", ch.service, "scope", ch.scope)
+	}
 
 	// //////////////////  取匿名 token（进程内缓存优先）  start  ///////////////////////////////
-	token, err := s.dockerToken(wd, cl, ch)
+	token, err := s.dockerToken(wd, cl, ch, auth)
 	if err != nil {
 		s.log.Warn("获取 Docker Registry 匿名 token 失败，按原始 401 响应返回",
 			"url", truncate(urlStr, 300), "realm", ch.realm, "err", wd.wrapErr(err))
@@ -1224,23 +1243,31 @@ func (s *Server) dockerAuthDanceRetry(wd *progressWatchdog, cl *http.Client, ori
 // 未过期直接复用，避免每个 blob 层都打一次 auth 端点），未命中或已过期才请求 realm
 // 换取新 token 并写回缓存（TTL = expires_in，>0 才用，否则缺省 60s）。
 // 请求 ctx 使用本次尝试的看门狗 ctx（wd.ctx）。
-func (s *Server) dockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge) (string, error) {
+func (s *Server) dockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge, auth *config.CandidateAuth) (string, error) {
+	// 缓存 key 必须区分凭据身份：同一 realm/service/scope 下匿名与不同账号的 token
+	// 权限不同，绝不能互相复用；密码不进 key 原文（内存键表不落盘、不打日志），
+	// 只取 sha256 前 16 hex（密码轮换后旧 token 键自然失配，不会误用）
 	key := ch.realm + "|" + ch.service + "|" + ch.scope
+	if auth != nil {
+		sum := sha256.Sum256([]byte(auth.Password))
+		key += "|u:" + auth.Username + "|p:" + hex.EncodeToString(sum[:])[:16]
+	}
 	now := time.Now()
 
 	// 缓存命中（未过期）：Debug 留痕即可
 	s.dockerTokenMu.Lock()
 	if ent, ok := s.dockerTokens[key]; ok && now.Before(ent.expiresAt) {
 		s.dockerTokenMu.Unlock()
-		s.log.Debug("Docker Registry 匿名 token 缓存命中",
+		s.log.Debug("Docker Registry token 缓存命中（匿名/带凭据按 account 区分）",
 			"realm", ch.realm, "service", ch.service, "scope", ch.scope,
+			"account", accountAttr(auth),
 			"token", maskToken(ent.token),
 			"expires_in", ent.expiresAt.Sub(now).Round(time.Second).String())
 		return ent.token, nil
 	}
 	s.dockerTokenMu.Unlock()
 
-	token, ttl, err := fetchDockerToken(wd, cl, ch)
+	token, ttl, err := fetchDockerToken(wd, cl, ch, auth)
 	if err != nil {
 		return "", err
 	}
@@ -1262,7 +1289,7 @@ func (s *Server) dockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerCh
 //     同样向看门狗报告进度（read-timeout 触发时错误标注 read-timeout）；
 //   - 响应 JSON 优先取 "token" 字段、为空再取 "access_token"，两者皆空视为失败；
 //     "expires_in"（秒，整数，>0 才生效）作为缓存 TTL，缺省 60s。
-func fetchDockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge) (string, time.Duration, error) {
+func fetchDockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge, auth *config.CandidateAuth) (string, time.Duration, error) {
 	ctx := wd.ctx // 受本次尝试的 http-timeout 与 read-timeout 共同约束
 	u, err := url.Parse(ch.realm)
 	if err != nil {
@@ -1275,6 +1302,10 @@ func fetchDockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge
 	if ch.scope != "" && q.Get("scope") == "" {
 		q.Set("scope", ch.scope)
 	}
+	// 带凭据 dance：追加 account 参数（Docker Hub token 端点约定，realm 自带同键不覆盖）
+	if auth != nil && q.Get("account") == "" {
+		q.Set("account", auth.Username)
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -1283,6 +1314,13 @@ func fetchDockerToken(wd *progressWatchdog, cl *http.Client, ch *bearerChallenge
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "proxy-cache/"+Version)
+	// 带凭据 dance：Basic base64(user:password) 换登录态 token（匿名 dance 不带此头，
+	// 与既有「token 请求绝不携带客户端 Authorization」语义不冲突——这是代理自身配置
+	// 的候选凭据，不是客户端凭据）
+	if auth != nil {
+		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString(
+			[]byte(auth.Username+":"+auth.Password)))
+	}
 
 	resp, err := cl.Do(req)
 	if err != nil {

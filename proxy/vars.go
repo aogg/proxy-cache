@@ -110,6 +110,10 @@ type candidate struct {
 	//（含 token dance 的第二次响应）且成功判据可判定」的时限，到期硬失败快切下一候选；
 	// 仅约束探测阶段，探测通过后的 body 读取不受它约束。
 	probeTimeout time.Duration
+	// auth 该候选的上游凭据（401 token dance 用 Basic 换 Bearer token；nil = 匿名 dance）：
+	// 候选显式 auth ?? 规则级 auth 的解析结果（ExpandCandidates 经 Options.CandidateAuth）。
+	// 只读共享，随 candidate 值传递进探测/回源管线。
+	auth *config.CandidateAuth
 }
 
 // ExpandCandidates 把 url-redirect 候选对象列表展开为候选列表：
@@ -150,6 +154,7 @@ func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff conf
 			httpTimeout:        eff.CandidateHTTPTimeout(item),
 			readTimeout:        eff.CandidateReadTimeout(item),
 			probeTimeout:       eff.CandidateProbeTimeoutFor(item, blobTarget),
+			auth:               eff.CandidateAuth(item),
 		})
 	}
 	return out

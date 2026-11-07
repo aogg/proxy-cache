@@ -159,10 +159,10 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 	scanTimer := time.AfterFunc(scanBudget, cancelBase)
 
 	var (
-		schedMu    sync.Mutex
-		round      int         // 当前轮次（1 基；轮边界在 schedMu 下自增）
-		released   int         // 本轮已放行候选数（schedMu 下读写）
-		hedgeTimer *time.Timer // 已武装的 hedge 放行定时器（nil = 未武装；schedMu 下读写）
+		schedMu       sync.Mutex
+		round         int         // 当前轮次（1 基；轮边界在 schedMu 下自增）
+		released      int         // 本轮已放行候选数（schedMu 下读写）
+		hedgeTimer    *time.Timer // 已武装的 hedge 放行定时器（nil = 未武装；schedMu 下读写）
 		cancels       = make([]context.CancelFunc, n)
 		lastErr       error // 最近一次候选失败（全败后作为最终错误返回，后写覆盖前写）
 		lastStatusErr error // 最近一次「上游明确 4xx」候选失败（全败出口的网络类最终失败兜底，见下方出口注释）

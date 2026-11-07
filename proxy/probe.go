@@ -142,7 +142,7 @@ func probePassed(res *probeResult, eff config.Options, method string, hasRange b
 // isPathTarget 判断目标是否为路径目标（registry API 的 /v2/... 形态）：
 // 完整 URL 目标带 scheme（含 ://），路径目标不带（ExtractTarget 的输出形态）。
 // 供探测判据区分「registry 语义」（路径目标，HTML 必为反爬页）与「web 语义」
-//（完整 URL 目标，HTML 可以是合法载荷）。
+// （完整 URL 目标，HTML 可以是合法载荷）。
 func isPathTarget(target string) bool {
 	return !strings.Contains(target, "://")
 }
@@ -288,7 +288,9 @@ func (s *Server) startUpstream(parent context.Context, r *http.Request, cand can
 
 	// //////////////////  401 匿名 token dance（探测式）  start  /////////////////////////////////
 	if res.status == http.StatusUnauthorized && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		resp2, consumed, ok := s.dockerAuthDanceRetry(wd, cl, req, resp, urlStr)
+		// 候选带上游凭据（auth != nil，候选显式 ?? 规则级）时 dance 用 Basic 换 Bearer
+		// token（拉私有仓库 / 登录账号提速；匿名候选 auth=nil 维持既有匿名 dance）
+		resp2, consumed, ok := s.dockerAuthDanceRetry(wd, cl, req, resp, urlStr, cand.auth)
 		if ok {
 			res.Close() // 首 401 响应已被 dance 排干并关闭，释放其资源引用后改用重试响应
 			res = newProbeResultFromResponse(resp2, wd, urlStr)
