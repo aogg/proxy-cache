@@ -33,6 +33,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -76,6 +78,7 @@ type resumeUpstream struct {
 	hold         map[string]chan struct{} // digest -> 首路「首块后阻塞」闸门
 	bad416       map[string]bool          // digest -> Range 探测回 416 且不带 Content-Range（模拟不合规镜像源，防毒缓存回归用）
 	fake416Total map[string]int64         // digest -> Range 探测回 416 且 Content-Range 总长伪造为该值（模拟总长与半截不符）
+	poisonTail   map[string][]byte        // digest -> Range 剩余区间回毒内容（长度与原文尾段一致；模拟同一 digest 内容错误的异常镜像源，防毒缓存回归用）
 	manifest     []byte                   // manifest 响应 body
 	manifestBr   bool                     // manifest 写一半后断连
 	chunkSize    int                      // 分块大小（默认整段一次写出）
@@ -94,6 +97,7 @@ func newResumeUpstream() *resumeUpstream {
 		hold:         make(map[string]chan struct{}),
 		bad416:       make(map[string]bool),
 		fake416Total: make(map[string]int64),
+		poisonTail:   make(map[string][]byte),
 	}
 }
 
@@ -139,6 +143,14 @@ func (u *resumeUpstream) setFake416Total(digest string, total int64) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.fake416Total[digest] = total
+}
+
+// setPoisonTail 标记某 digest 的 Range 剩余区间回毒内容（长度须与原文尾段一致；模拟
+// 「同一 digest 但内容错误」的异常镜像源——200 全量路径仍回正确原文，防毒缓存回归用）。
+func (u *resumeUpstream) setPoisonTail(digest string, tail []byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.poisonTail[digest] = tail
 }
 
 func (u *resumeUpstream) setManifest(body []byte, broken bool) {
@@ -239,6 +251,13 @@ func (u *resumeUpstream) serveBlob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		remain := body[n:]
+		u.mu.Lock()
+		if pt := u.poisonTail[digest]; pt != nil {
+			// 防毒缓存回归：Range 剩余区间回毒内容（长度与原文尾段一致；200 全量路径
+			// 仍回正确原文）——拼接出的「完整长度」内容摘要必不符
+			remain = pt
+		}
+		u.mu.Unlock()
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", n, total-1, total))
 		w.WriteHeader(http.StatusPartialContent)
 		if short > 0 && int64(len(remain)) > short {
@@ -365,6 +384,9 @@ func newResumeFixture(t *testing.T, resumeEnabled *bool) *resumeFixture {
 	if err != nil {
 		t.Fatalf("New() 意外报错: %v", err)
 	}
+	// 本夹具的 digest 常量与内容无关（sha256:bbbb... 等伪造值）：关闭写缓存侧的 blob
+	// 摘要强校验，使既有断言维持原语义——防毒缓存校验由真实摘要回归测试覆盖
+	s.blobDigestVerify = func([]byte, string) (string, bool) { return "", true }
 	fx.s = s
 	disk, err := cache.New(cacheDir)
 	if err != nil {
@@ -1446,5 +1468,154 @@ func TestBlobResumeStallWatchdogCutsDeadUpstream(t *testing.T) {
 	}
 	if lines := logLinesOf(fx.logBuf.String(), "blob 半截续传读上游失败"); len(lines) == 0 {
 		t.Errorf("应有读上游失败留痕:\n%s", fx.logBuf.String())
+	}
+}
+
+// //////////////////  防毒缓存：写缓存侧 blob 摘要强校验  //////////////////////////////////////
+
+// realDigestOf 计算内容的真实 blob 摘要（"sha256:<hex>"）——防毒缓存回归测试用：
+// 生产写缓存侧按 digest 强校验内容寻址一致性，测试数据必须使用真实摘要才能入库。
+func realDigestOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// TestFinalizeRejectsBlobDigestMismatch 白盒：finalizeFetchEntry 对 blob 目标做 sha256
+// 强校验——摘要不符拒绝写缓存并留痕（actual_digest），摘要一致正常入库。
+// 夹具默认注入的校验 stub 在本测试还原为 nil（走生产默认真校验）。
+func TestFinalizeRejectsBlobDigestMismatch(t *testing.T) {
+	fx := newResumeFixture(t, nil)
+	fx.s.blobDigestVerify = nil // 还原生产默认校验（夹具 stub 为伪造 digest 常量服务）
+	content := hubBlobContent(0xf1, 4096)
+	digest := realDigestOf(content)
+	target := "v2/" + prefetchName + "/blobs/" + digest
+	key := prefetchBlobKey(prefetchName, digest)
+	r := prefetchBlobTestRequest(prefetchName, digest)
+	eff := fx.effFor(r, target)
+
+	mkEntry := func(body []byte) *cache.Entry {
+		h := http.Header{}
+		h.Set("Content-Type", "application/octet-stream")
+		return &cache.Entry{Status: http.StatusOK, Header: h, Body: body, StoredAt: time.Now()}
+	}
+
+	// 摘要不符（毒内容）：拒绝入库并留痕
+	if cached := fx.s.finalizeFetchEntry(r, key, target, mkEntry(hubBlobContent(0xf2, 4096)), eff, fx.disk, dockerLogSourceClient); cached {
+		t.Fatal("摘要不符的内容不应写缓存")
+	}
+	if _, ok := fx.disk.Get(key); ok {
+		t.Error("毒内容不应入库")
+	}
+	if !strings.Contains(fx.logBuf.String(), "摘要不符") {
+		t.Error("应留痕「blob 回源内容摘要不符」日志")
+	}
+
+	// 摘要一致：正常入库
+	if cached := fx.s.finalizeFetchEntry(r, key, target, mkEntry(content), eff, fx.disk, dockerLogSourceClient); !cached {
+		t.Fatal("摘要一致的正常内容应写缓存")
+	}
+	e, ok := fx.disk.Get(key)
+	if !ok || !bytes.Equal(e.Body, content) {
+		t.Errorf("缓存内容应与原文一致（ok=%v）", ok)
+	}
+}
+
+// TestBlobResumeCompletePoisonPartDiscardedAndRefetched 端到端回归（2026-11-07 现场
+// 2f1083db 事故形态）：毒半截（长度==总长、内容错误）经「416 证实完整」路径回放——
+// finalize 摘要强校验拒绝入库并丢弃毒半截，随后安全降级全量回源：客户端最终拿到
+// 正确原文、缓存=正确原文、无半截残留。
+func TestBlobResumeCompletePoisonPartDiscardedAndRefetched(t *testing.T) {
+	fx := newResumeFixture(t, nil)
+	fx.s.blobDigestVerify = nil
+	content := hubBlobContent(0xf3, 8192)
+	digest := realDigestOf(content)
+	poison := hubBlobContent(0xf4, 8192) // 同长度毒内容
+	fx.reg.setContent(digest, content)
+	key := prefetchBlobKey(prefetchName, digest)
+	// 预置毒半截：长度 == 真实总长（416 的 Content-Range 总长与半截一致、可「证实完整」）
+	if err := os.WriteFile(fx.disk.PartPath(key), poison, 0o644); err != nil {
+		t.Fatalf("预置毒半截失败: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	fx.s.ServeHTTP(w, prefetchBlobTestRequest(prefetchName, digest))
+
+	// 客户端最终拿到正确原文（拒绝入库后降级全量回源）
+	if w.Code != http.StatusOK {
+		t.Fatalf("Code = %d, want %d", w.Code, http.StatusOK)
+	}
+	if !bytes.Equal(w.Body.Bytes(), content) {
+		t.Errorf("客户端应拿到正确原文（got %d 字节, want %d 字节）", len(w.Body.Bytes()), len(content))
+	}
+	// 缓存 = 正确原文（毒内容绝不入库）
+	e, ok := fx.disk.Get(key)
+	if !ok || !bytes.Equal(e.Body, content) {
+		t.Error("缓存应为完整正确原文（毒内容不得入库）")
+	}
+	// 毒半截已丢弃
+	if _, err := os.Stat(fx.disk.PartPath(key)); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("毒半截应已丢弃")
+	}
+	// 留痕：摘要不符拒绝入库
+	if !strings.Contains(fx.logBuf.String(), "摘要不符") {
+		t.Error("应留痕「blob 回源内容摘要不符」日志")
+	}
+	// 上游恰 2 路：1 路 Range 探测（416 证实完整）+ 1 路降级全量回源
+	if n := fx.reg.rec.calls(digest); n != 2 {
+		t.Errorf("上游 blob 回源 %d 次, want 2（Range 探测 + 降级全量）", n)
+	}
+}
+
+// TestBlobResumeStreamingPoisonTailNotCached 端到端回归（另一半事故形态）：合法半截
+// 前缀 + 上游剩余区间回毒内容，拼接长度与总长一致但摘要不符 → 拒绝入库、毒半截丢弃、
+// hub 按 failed 收场（绝不广播 done）、本次响应已 commit（客户端将因摘要不符自行重试，
+// 重试时无半截走全量回源拿到正确内容并入库）。
+func TestBlobResumeStreamingPoisonTailNotCached(t *testing.T) {
+	fx := newResumeFixture(t, nil)
+	fx.s.blobDigestVerify = nil
+	content := hubBlobContent(0xf5, 8192)
+	digest := realDigestOf(content)
+	prefix := content[:4096]
+	poisonTail := hubBlobContent(0xf6, 4096) // 与原文尾段同长度的毒内容
+	fx.reg.setContent(digest, content)
+	fx.reg.setPoisonTail(digest, poisonTail)
+	key := prefetchBlobKey(prefetchName, digest)
+	// 预置合法前缀半截
+	if err := os.WriteFile(fx.disk.PartPath(key), prefix, 0o644); err != nil {
+		t.Fatalf("预置半截前缀失败: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	fx.s.ServeHTTP(w, prefetchBlobTestRequest(prefetchName, digest))
+
+	// 已 commit 一次完整 200，长度 = 总长（拼出了「完整长度的毒内容」）
+	if w.Code != http.StatusOK {
+		t.Fatalf("Code = %d, want %d", w.Code, http.StatusOK)
+	}
+	if w.Body.Len() != len(content) {
+		t.Fatalf("body = %d 字节, want %d（长度与总长一致）", w.Body.Len(), len(content))
+	}
+	if bytes.Equal(w.Body.Bytes(), content) {
+		t.Fatal("毒尾巴场景客户端收到的应是拼接毒内容（测试自检）")
+	}
+	// 拒绝入库；毒半截已丢弃
+	if _, ok := fx.disk.Get(key); ok {
+		t.Error("摘要不符的拼接内容不应写缓存")
+	}
+	if _, err := os.Stat(fx.disk.PartPath(key)); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("毒半截应已丢弃")
+	}
+	if !strings.Contains(fx.logBuf.String(), "未写缓存") {
+		t.Error("应留痕「内容未写缓存」日志")
+	}
+
+	// 客户端重试（docker 语义）：无半截 → 全量回源拿到正确内容并入库（自愈闭环）
+	w2 := httptest.NewRecorder()
+	fx.s.ServeHTTP(w2, prefetchBlobTestRequest(prefetchName, digest))
+	if !bytes.Equal(w2.Body.Bytes(), content) {
+		t.Error("重试后客户端应拿到正确原文")
+	}
+	if e, ok := fx.disk.Get(key); !ok || !bytes.Equal(e.Body, content) {
+		t.Error("重试后缓存应为完整正确原文")
 	}
 }

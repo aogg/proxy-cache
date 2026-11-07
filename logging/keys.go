@@ -93,6 +93,7 @@ var logKeyZh = map[string]string{
 	// docker 链路标签
 	"image":            "镜像",
 	"digest":           "摘要",
+	"actual_digest":    "实际摘要",
 	"ref":              "引用",
 	"blobs":            "层数",
 	"token":            "令牌",

@@ -215,6 +215,10 @@ func newDisconnectFixture(t *testing.T, resumeEnabled *bool) *disconnectFixture 
 	if err != nil {
 		t.Fatalf("New() 意外报错: %v", err)
 	}
+	// 本夹具的 digest 常量与内容无关（sha256:bbbb... 等伪造值）：关闭写缓存侧的
+	// blob 摘要强校验，使既有断言（续传完成后缓存应命中等）维持原语义——防毒缓存
+	// 校验本身由 partial_resume_test.go 的真实摘要回归测试覆盖
+	s.blobDigestVerify = func([]byte, string) (string, bool) { return "", true }
 	disk, err := cache.New(cacheDir)
 	if err != nil {
 		t.Fatalf("cache.New() 意外报错: %v", err)

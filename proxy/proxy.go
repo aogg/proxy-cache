@@ -116,6 +116,11 @@ type Server struct {
 	progressReg *progressRegistry
 	// progressOnce 保证周期汇总 goroutine 只启动一次（StartProgressSummary 幂等）。
 	progressOnce sync.Once
+	// blobDigestVerify blob 写缓存前的内容寻址校验钩子（防毒缓存）：入参 (body 原文,
+	// digest "sha256:<hex>" 原文)，返回 (实际摘要 hex, 是否一致)。nil 时使用默认实现
+	//（sha256 全量比对）——生产恒走默认强校验；仅测试注入 stub（既有夹具的 digest
+	// 常量与内容无关，见各 *_test.go 构造器；防毒缓存回归测试还原 nil 走真校验）。
+	blobDigestVerify func(body []byte, digest string) (string, bool)
 }
 
 // New 创建 Server：预编译全局/各域名规则及其 url-redirect 候选对象用到的上游代理客户端
@@ -733,6 +738,18 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	// //////////////////  未命中：单飞回源并写缓存  end  ////////////////////////////////////////////////
 }
 
+// blobDigestMatches blob 内容寻址校验的默认实现：sha256(body) 与 digest（"sha256:<hex>"
+// 形态）的 hex 全量比对。digest 不带 sha256: 前缀时无法本地校验，按一致放行（不拦截）。
+func blobDigestMatches(body []byte, digest string) (string, bool) {
+	hexdig := strings.TrimPrefix(digest, "sha256:")
+	if hexdig == digest {
+		return "", true // 非 sha256 digest：跳过校验（仅 sha256 算法可本地验证）
+	}
+	sum := sha256.Sum256(body)
+	actual := hex.EncodeToString(sum[:])
+	return actual, actual == hexdig
+}
+
 // finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 GET，条件与日志字段与旧版一致）：
 // 仅缓存满足成功判据的 200 响应（TTL 在写入时固化）；304 与「回源成功但未过判据」
 // 分别留痕说明为什么这次没写缓存文件。logSource 为本路写缓存的日志来源（source 键，
@@ -740,9 +757,23 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 // resume——同一函数被三条链路复用，按写者区分「异步下载」与「客户端请求下载」。
 // 写盘成功后按条件尝试 docker 镜像 layer 异步预取（manifest 驱动，触发条件与失败降级
 // 语义见 prefetch.go；条件不满足静默返回）。
-func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache, logSource string) {
+//
+// 返回值 cached：true = 已写入正式缓存（各项守卫全过且 disk.Set 成功）。续传执行方
+// （partial_resume.go）以它决定「完成」广播与失败收场——拒绝入库时绝不能向搭车订阅者
+// 广播 done（并发 MISS 会按 done 直接 HIT 到不存在/毒性的条目）。
+//
+// blob 摘要强校验（写缓存侧兜底，防毒缓存）：blob 按 digest 寻址、内容不可变，入库前
+// 必须 sha256 全量比对——2026-11-07 现场：2f1083db 的毒半截（前缀混入异常镜像源的
+// 错误字节）被拼接固化成正式缓存后，客户端每次 pull 都以「unexpected commit digest」
+// 确定性失败（重试 10 次同一错误哈希）。流式中途不做逐块校验（GB 级成本不可接受，
+// 见 partial_resume.go 边界说明），写缓存是最后的兜底闸口：三条写链路（client /
+// prefetch / resume）全部经过这里。校验失败 = 毒内容：拒绝入库，且续传写入者
+// （logSource=resume）的半截文件正是本次拼接的数据源，必须一并丢弃——否则每次续传
+// 都撞同一毒前缀；client / prefetch 写入者的字节全部来自上游响应本身，与既有半截
+// 无关，不动。
+func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache, logSource string) bool {
 	if ent == nil {
-		return
+		return false
 	}
 	labels := parseDockerLogInfo(target) // 日志统一标签（/v2/ 目标才有 image/digest/ref）
 	if ent.Status == http.StatusOK && checkSuccess(ent, eff.SuccessCheck, http.MethodGet) {
@@ -752,33 +783,57 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 		// HTML 候选；这里是「绕过探针判据的直调写缓存路径」（预取 / 半截续传执行方）的
 		// 兜底：registry 路径目标下合法 200 载荷只会是 manifest JSON / blob 二进制，
 		// 绝不可能是 HTML；完整 URL 目标（web / github raw）HTML 是合法载荷，不受影响。
+		poisonSkip := false
 		if isPathTarget(target) && htmlPageContentType(ent.Header.Get("Content-Type")) {
 			s.log.Warn("回源 200 但 Content-Type 为 HTML 页面，拒绝写缓存（防镜像站反爬页毒化缓存）",
 				labels.attrs(logSource, "rule", eff.Rule, "target", truncate(target, 300),
 					"content_type", ent.Header.Get("Content-Type"), "body_bytes", len(ent.Body))...)
-			return
+			poisonSkip = true
+		}
+		if !poisonSkip {
+			if dgst, isBlob := parseDockerBlobTarget(target); isBlob {
+				verify := s.blobDigestVerify
+				if verify == nil {
+					verify = blobDigestMatches
+				}
+				if actual, ok := verify(ent.Body, dgst); !ok {
+					s.log.Error("blob 回源内容摘要不符，拒绝写缓存（防毒缓存：上游返回了错误内容）",
+						labels.attrs(logSource, "rule", eff.Rule, "digest", dgst,
+							"actual_digest", "sha256:"+actual, "body_bytes", len(ent.Body),
+							"target", truncate(target, 300))...)
+					poisonSkip = true
+				}
+			}
+		}
+		if poisonSkip {
+			// 毒内容绝不入库；续传写入者的毒半截一并丢弃（理由见上方函数注释）
+			if logSource == dockerLogSourceResume && disk != nil {
+				disk.RemovePart(key)
+			}
+			return false
 		}
 		ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目（0 = 永不过期）
 		if disk != nil {
 			if serr := disk.Set(key, ent); serr != nil {
 				s.log.Warn("写入缓存失败", labels.attrs(logSource, "key", key, "target", target, "err", serr)...)
-			} else {
-				// 写盘成功必须可见：规则名、缓存 key、实际落盘文件路径、body 大小与生效 TTL
-				s.log.Info("写入缓存成功",
-					labels.attrs(logSource, "rule", eff.Rule, "target", truncate(target, 300), "key", key,
-						"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))...)
-				// blob 正式缓存条目已落盘：立即删除对应半截文件（其内容已完整入库，
-				// 使命完成；非 blob 目标静默跳过，见 partial_resume.go）
-				if _, isBlob := parseDockerBlobTarget(target); isBlob {
-					disk.RemovePart(key)
-				}
-				// docker 镜像 layer 异步预取：manifest GET 回源成功且已写入缓存时触发
-				//（触发条件在内部逐项判定，不满足静默返回；预取只写缓存，异步执行，
-				// 绝不影响本次客户端响应）
-				s.maybePrefetchImageLayers(r, target, ent, eff, disk)
+				return false
 			}
+			// 写盘成功必须可见：规则名、缓存 key、实际落盘文件路径、body 大小与生效 TTL
+			s.log.Info("写入缓存成功",
+				labels.attrs(logSource, "rule", eff.Rule, "target", truncate(target, 300), "key", key,
+					"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))...)
+			// blob 正式缓存条目已落盘：立即删除对应半截文件（其内容已完整入库，
+			// 使命完成；非 blob 目标静默跳过，见 partial_resume.go）
+			if _, isBlob := parseDockerBlobTarget(target); isBlob {
+				disk.RemovePart(key)
+			}
+			// docker 镜像 layer 异步预取：manifest GET 回源成功且已写入缓存时触发
+			//（触发条件在内部逐项判定，不满足静默返回；预取只写缓存，异步执行，
+			// 绝不影响本次客户端响应）
+			s.maybePrefetchImageLayers(r, target, ent, eff, disk)
+			return true
 		}
-		return
+		return false
 	}
 	if ent.Status == http.StatusNotModified {
 		// 回源 304（内容未变更）：条目无实体不可缓存，304 原样透传给客户端，
@@ -786,12 +841,13 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 		// 上游对无条件 GET 仍回 304 属异常/缓存副本有效兜底场景）
 		s.log.Info("回源 304 未变更，不写缓存（客户端缓存副本有效）",
 			labels.attrs(logSource, "rule", eff.Rule, "status", ent.Status, "target", truncate(target, 300))...)
-		return
+		return false
 	}
 	// 回源成功但不满足缓存判据：同样留痕，说明为什么这次没写缓存文件
 	s.log.Info("回源成功但不写缓存（未过成功判据或非 200）",
 		labels.attrs(logSource, "rule", eff.Rule, "status", ent.Status, "check", eff.SuccessCheck,
 			"body_bytes", len(ent.Body), "target", truncate(target, 300))...)
+	return false
 }
 
 // handleHead 处理 HEAD 请求（docker registry 用 HEAD 探测 manifest/blob 元信息）：

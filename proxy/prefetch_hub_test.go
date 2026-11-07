@@ -218,6 +218,9 @@ func newHubFixture(t *testing.T, enabled *bool) *hubFixture {
 	if err != nil {
 		t.Fatalf("cache.New() 意外报错: %v", err)
 	}
+	// 本夹具的 digest 常量与内容无关（sha256:bbbb... 等伪造值）：关闭写缓存侧的 blob
+	// 摘要强校验，使既有断言维持原语义——防毒缓存校验由真实摘要回归测试覆盖
+	s.blobDigestVerify = func([]byte, string) (string, bool) { return "", true }
 	return &hubFixture{upstream: upstream, reg: reg, s: s, disk: disk}
 }
 

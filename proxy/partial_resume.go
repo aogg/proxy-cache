@@ -26,9 +26,11 @@
 // 安全依据与边界：
 //   - blob 按 digest 寻址、内容不可变：任意候选源的同 digest 内容一致，续传可从任意
 //     候选发 `Range: bytes=<n>-` 拼到本地前缀后面（这是半截可跨候选拼接的安全前提）；
-//   - 客户端/上游侧 Docker-Content-Digest 不做本地全量校验（对 GB 级 blob 成本过高）：
-//     信任 digest 寻址语义（前缀 + 断点剩余拼出的即完整 blob），与「206 透传不校验」
-//     的既有取舍一致；
+//   - 客户端/上游侧流式传输不做逐块摘要校验（对 GB 级 blob 成本过高）：信任 digest
+//     寻址语义（前缀 + 断点剩余拼出的即完整 blob），与「206 透传不校验」的既有取舍一致；
+//     但写缓存前由 finalizeFetchEntry 统一做 sha256 强校验（防毒缓存兜底）——2026-11-07
+//     现场：毒半截（前缀混入异常镜像源的错误字节）被固化为正式缓存后客户端每次 pull 都
+//     确定性失败，故校验失败拒绝入库并丢弃毒半截（下次全量回源自愈）；
 //   - commit 前必须先确认上游是 206 且 Content-Range 起点匹配半截长度：确认前绝不向
 //     客户端写任何字节——若上游对 Range 回 200 全量响应，回放本地前缀再拼全量会数据
 //     错位，因此非 206 一律安全降级（丢弃半截走既有全量回源路径，绝不给客户端错误数据）；
@@ -786,7 +788,18 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		StoredAt: time.Now(),
 		Source:   upRes.url,
 	}
-	s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume)
+	if cached := s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume); !cached {
+		// 拼接完成但拒绝入库（防毒缓存守卫 / 写盘失败）：本路响应已 commit（客户端将因
+		// 摘要不符自行重试；守卫拒绝时毒半截已随 finalize 丢弃，下次全量回源从干净状态
+		// 开始），hub 条目按 failed 收场——绝不广播 done（搭车订阅者的增量拼不出可入库
+		// 的完整内容，广播 done 会让并发 MISS 直接 HIT 到不存在/毒性的条目）
+		ferr := fmt.Errorf("blob 拼接内容未写入缓存（digest %s，摘要校验/守卫拒绝或写盘失败）", digest)
+		s.log.Error("blob 半截续传完成但内容未写缓存（防毒缓存守卫拒绝或写盘失败；守卫拒绝时毒半截已丢弃，下次全量回源）",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest,
+				"bytes", accum.Len(), "candidate", truncate(upRes.url, 300))...)
+		ent.finishFailed(ferr)
+		return nil, true, ferr
+	}
 	// 置 done 并关闭订阅（搭车方收完 channel 缓冲内的最后增量即完整）；条目滞留 hub
 	// 一小段时间供并发 MISS 兜底检出「done → 直接 HIT」，到期自动移除（不碰半截文件）
 	ent.finishDone()
@@ -840,12 +853,22 @@ func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key
 		Header:   http.Header{},
 		Body:     data,
 		StoredAt: time.Now(),
-		Source:   "part-resume", // 观测：内容来自半截文件整体回放（digest 寻址语义可信）
+		Source:   "part-resume", // 观测：内容来自半截文件整体回放（写缓存前由 finalize 强校验摘要）
 	}
 	// 续传执行方写缓存：直接调 finalizeFetchEntry 并标注 source=resume（不经注入的
 	// finalize 回调——该回调按客户端主路径标注 source=client，此处写者实为续传执行方；
 	// blob 落盘成功即删半截见 finalizeFetchEntry 钩子）
-	s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume)
+	if cached := s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume); !cached {
+		// 半截整体回放被拒入库（防毒缓存守卫 / 写盘失败）：客户端尚未收到任何字节
+		//（commit 在写缓存之后），此刻降级既有全量回源仍能给出正确内容；守卫拒绝时
+		// 毒半截已随 finalize 丢弃（logSource=resume），降级路径失败时其 partial sink
+		// 从零保留新前缀，绝不复用毒半截
+		ferr := fmt.Errorf("blob 半截整体回放未写入缓存（digest %s，摘要校验/守卫拒绝或写盘失败）", digest)
+		s.log.Warn("blob 半截已完整但内容未写缓存（防毒缓存守卫拒绝或写盘失败），丢弃半截降级全量回源",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", len(data))...)
+		ent.finishFailed(ferr)
+		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
+	}
 	ent.finishDone()
 	// 回放方式按请求语义定：区间请求（起点 >0）切片回 206，其余保持完整 200 回放；
 	// 起点越界按 RFC 回 416（serveEntryBlobRange 内部同样按 416 处理），日志字节数为 0
