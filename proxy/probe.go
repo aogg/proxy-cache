@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,26 +116,59 @@ func readProbeFirst(body io.Reader, wd *progressWatchdog) ([]byte, bool, error) 
 }
 
 // probePassed 判定探测结果是否已满足成功判据（可选定该候选并立即 commit）：
+//   - HTML 页面防误判（pathTarget 且 200/206，见 htmlPageContentType）：现场动机
+//     2026-11-07 deepseek-harness:my 拉取失败——dockerpull.cn 对 registry API 路径一律
+//     回 200 + text/html 中文反爬页，content 判据只看状态码与非空首块被判成功并写入缓存
+//     → docker 把 text/html 当 manifest →「unexpected media type text/html」整次拉取
+//     失败，且毒缓存 TTL 内所有重试全部命中。registry 路径目标下合法 200/206 载荷只会是
+//     manifest JSON / blob 二进制，绝不可能是 HTML；完整 URL 目标（web / github raw）下
+//     HTML 是合法载荷，不受本判据影响（pathTarget=false）；
 //   - 请求带 Range 且上游回 206：视为成功（docker 断点续传必需；旧判据会把 206
 //     全部拒掉导致 Range 拉取全挂。缓存写入条件不变——206 仍不写缓存）；
 //   - 其余沿用 checkSuccess 既有语义：304 视为成功；content 判据对已缓冲首块判非空
 //     （首块为空必然伴随 EOF/错误，等价于旧版「完整 body 为空」的失败判定）；
 //     HEAD 响应无 body，自动按 status 语义。
-func probePassed(res *probeResult, eff config.Options, method string, hasRange bool) bool {
+func probePassed(res *probeResult, eff config.Options, method string, hasRange bool, pathTarget bool) bool {
+	if pathTarget && (res.status == http.StatusOK || res.status == http.StatusPartialContent) &&
+		htmlPageContentType(res.header.Get("Content-Type")) {
+		return false
+	}
 	if hasRange && res.status == http.StatusPartialContent {
 		return true
 	}
 	return checkSuccess(&cache.Entry{Status: res.status, Body: res.first}, eff.SuccessCheck, method)
 }
 
+// isPathTarget 判断目标是否为路径目标（registry API 的 /v2/... 形态）：
+// 完整 URL 目标带 scheme（含 ://），路径目标不带（ExtractTarget 的输出形态）。
+// 供探测判据区分「registry 语义」（路径目标，HTML 必为反爬页）与「web 语义」
+//（完整 URL 目标，HTML 可以是合法载荷）。
+func isPathTarget(target string) bool {
+	return !strings.Contains(target, "://")
+}
+
+// htmlPageContentType 判断响应 Content-Type 是否为 HTML 页面（容忍 charset / 前导空白 /
+// 大小写差异）：registry 路径目标下出现即反爬/错误页（如 dockerpull.cn 的 text/html
+// 中文页），绝不能判成功、透传或写缓存。用 Content-Type 而非 body 嗅探：上游可能带
+// Content-Encoding: gzip，body 嗅探会失配，Content-Type 不受压缩影响。
+func htmlPageContentType(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	return strings.HasPrefix(ct, "text/html") || strings.HasPrefix(ct, "application/xhtml+xml")
+}
+
 // probeHardFailReason 返回探测结果的硬失败原因（空串 = 非硬失败）：
+//   - registry 路径目标上游回 HTML 页：该镜像站对本代理不可用（反爬页，原地重试只会
+//     再次命中同一页面），直接切下一候选；
 //   - 上游 403：镜像站限流/拒绝，原地重试同样 403；
 //   - token dance 后仍 401：该镜像站对本代理不可用，dance 已带对 token 仍被拒，
 //     原地重试无意义却各烧数秒。
 //
 // 硬失败候选跳过 url-redirect-item-error-retry 原地重试，直接切换下一候选。
-func probeHardFailReason(res *probeResult) string {
+func probeHardFailReason(res *probeResult, pathTarget bool) string {
 	switch {
+	case pathTarget && (res.status == http.StatusOK || res.status == http.StatusPartialContent) &&
+		htmlPageContentType(res.header.Get("Content-Type")):
+		return "html-error-page"
 	case res.status == http.StatusForbidden:
 		return "upstream-403"
 	case res.status == http.StatusUnauthorized && res.danced:

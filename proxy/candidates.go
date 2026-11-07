@@ -130,6 +130,10 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 	start := int(s.rr.Add(1)-1) % n
 	// //////////////////  轮询起始下标：第 1 次请求从 0 开始，之后逐次 +1  end  ////////
 	hasRange := r.Header.Get("Range") != ""
+	// 路径目标（registry API 语义）标志：探测判据与硬失败判定用——路径目标下上游回
+	// text/html 必为反爬/错误页，直接判失败并硬失败切下一候选（见 probePassed /
+	// probeHardFailReason / htmlPageContentType 的现场动机注释）
+	pathTarget := isPathTarget(target)
 
 	// //////////////////  轮询展开明细日志  start  ////////////////////////////////////////////////
 	// 与旧版一致：按「本轮实际尝试顺序」输出每个候选的模板与展开后 URL，并给出本轮
@@ -225,8 +229,8 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 				}
 				continue // 软失败：按 url-redirect-item-error-retry 原地立即重试
 			}
-			if !probePassed(res, eff, r.Method, hasRange) {
-				if hr := probeHardFailReason(res); hr != "" {
+			if !probePassed(res, eff, r.Method, hasRange, pathTarget) {
+				if hr := probeHardFailReason(res, pathTarget); hr != "" {
 					hard, hardReason = true, hr
 				}
 				candLast = fmt.Errorf("候选 %s 未通过 success-check=%s（状态码 %d，body %d 字节）",

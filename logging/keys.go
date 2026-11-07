@@ -105,6 +105,7 @@ var logKeyZh = map[string]string{
 	"bytes":          "字节数",
 	"body_bytes":     "响应体字节",
 	"content_length": "声明长度",
+	"content_type":   "内容类型",
 	"total":          "总长",
 	"known_total":    "已知总长",
 	"remaining":      "剩余字节",

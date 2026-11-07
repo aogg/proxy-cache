@@ -30,8 +30,10 @@ import (
 // match 正则只写「http://<Host>/」前缀，对路径目标与完整 URL 两类请求串恒命中，
 // 从而让「命中哪条规则」只由 type 过滤决定。
 const (
-	hostRuleType    = "registry-proxy-cache.example.com:5480"    // 入站 Host（docker registry 场景）
-	pathManifestRT  = "v2/adockero/proxy-cache/manifests/latest" // 路径目标（无前导斜杠，ExtractTarget 语义）
+	hostRuleType = "registry-proxy-cache.example.com:5480"    // 入站 Host（docker registry 场景）
+	// pathManifestRT 路径目标（无前导斜杠，ExtractTarget 语义）。用 digest manifest：
+	// 不可变、可缓存；latest 是 tag（可变目标一律 BYPASS，见 docker_mutable.go），不适合当缓存语义的测试目标
+	pathManifestRT = "v2/adockero/proxy-cache/manifests/sha256:rtabababababababababababababababababab"
 	fullTargetRT    = "https://example.com/some/file.yaml"       // 完整 URL 请求的目标
 	ruleTypeRegexRT = `http://registry-proxy-cache\.example\.com:5480/`
 )

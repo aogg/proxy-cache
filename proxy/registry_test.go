@@ -278,7 +278,9 @@ func TestServeHTTPRegistryPathTargetNoDirectFallback(t *testing.T) {
 // 换入站 Host 同路径不共享缓存（再次 MISS 回源），证明 Host 参与缓存 key；
 // GET 写下的条目可被同 Host 的 HEAD 复用（读缓存回放响应头，无 body）。
 func TestServeHTTPRegistryCacheKeyIncludesHost(t *testing.T) {
-	const path = "/v2/adockero/proxy-cache/manifests/latest"
+	// 目标用 digest manifest（不可变、可缓存）：latest 是 tag（可变目标一律 BYPASS，
+	// 见 docker_mutable.go），用它测 key 语义会在可变目标改造后失真
+	const path = "/v2/adockero/proxy-cache/manifests/sha256:abc123def456"
 	var rec upstreamRecord
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path

@@ -428,8 +428,12 @@ func TestMaybePrefetchImageLayersTriggersAndCaches(t *testing.T) {
 	fx.reg.ct = prefetchCTSchema2
 	fx.reg.body = prefetchManifestJSON(prefetchDigestConfig, prefetchDigestLayer1, prefetchDigestLayer2)
 
+	// 入站用 digest manifest（真实 docker 流程：HEAD latest 拿 digest 后按 digest GET；
+	// tag latest 属可变目标一律 BYPASS 不写缓存，见 docker_mutable.go，不能作预取触发入口）
+	manifestDigest := "sha256:pf" + strings.Repeat("ab", 16)
+	manifestTarget := "v2/" + prefetchName + "/manifests/" + manifestDigest
 	r := httptest.NewRequest(http.MethodGet,
-		"http://"+hostDockerRegistry+"/v2/"+prefetchName+"/manifests/latest", nil)
+		"http://"+hostDockerRegistry+"/"+manifestTarget, nil)
 	w := httptest.NewRecorder()
 	fx.s.ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -438,7 +442,7 @@ func TestMaybePrefetchImageLayersTriggersAndCaches(t *testing.T) {
 	fx.s.waitPrefetchIdle()
 
 	// manifest 自身已写缓存（预取是写盘成功后的顺带触发，前置条件即已落盘）
-	manifestKey := cache.Key(config.BuildMatchStr(hostDockerRegistry, "v2/"+prefetchName+"/manifests/latest"))
+	manifestKey := cache.Key(config.BuildMatchStr(hostDockerRegistry, manifestTarget))
 	e, ok := fx.disk.Get(manifestKey)
 	if !ok {
 		t.Fatal("manifest 应已写入缓存，disk.Get 未命中")

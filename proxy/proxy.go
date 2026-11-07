@@ -509,6 +509,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 		bypassReason = "cache-disabled" // 全局或命中规则显式关闭缓存
 	case eff.CacheTTL < 0:
 		bypassReason = "negative-ttl" // 防御分支：Validate 已拦截负 TTL
+	case dockerMutableTarget(target):
+		// docker 可变目标（tag manifest / referrers / tags list）：名字寻址、内容随
+		// push / 签名追加而变化，读写缓存都跳过——读旧条目会回放过期
+		// Docker-Content-Digest 让 docker 判「Image is up to date」永远拉不到新推送
+		//（2026-11-07 现场：latest 卡旧 digest）。不可变的 blob / digest manifest 不受影响。
+		bypassReason = "docker-mutable"
 	case r.Header.Get("Range") != "":
 		if blobRangeLocal {
 			bypassReason = "blob-range" // blob 起点 >0：不写缓存，但允许本地切片 / 半截续传
@@ -737,6 +743,18 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 	}
 	labels := parseDockerLogInfo(target) // 日志统一标签（/v2/ 目标才有 image/digest/ref）
 	if ent.Status == http.StatusOK && checkSuccess(ent, eff.SuccessCheck, http.MethodGet) {
+		// HTML 页面防毒化（写缓存侧兜底，现场动机同 probePassed：2026-11-07
+		// deepseek-harness:my——dockerpull.cn 对 registry 路径目标回 200 text/html 反爬页，
+		// 旧版写入缓存后 TTL 666h 内所有重试全部命中毒缓存）。探测判据已在竞速侧拒绝
+		// HTML 候选；这里是「绕过探针判据的直调写缓存路径」（预取 / 半截续传执行方）的
+		// 兜底：registry 路径目标下合法 200 载荷只会是 manifest JSON / blob 二进制，
+		// 绝不可能是 HTML；完整 URL 目标（web / github raw）HTML 是合法载荷，不受影响。
+		if isPathTarget(target) && htmlPageContentType(ent.Header.Get("Content-Type")) {
+			s.log.Warn("回源 200 但 Content-Type 为 HTML 页面，拒绝写缓存（防镜像站反爬页毒化缓存）",
+				labels.attrs(logSource, "rule", eff.Rule, "target", truncate(target, 300),
+					"content_type", ent.Header.Get("Content-Type"), "body_bytes", len(ent.Body))...)
+			return
+		}
 		ent.TTL = eff.CacheTTL // TTL 在写入时固化到条目（0 = 永不过期）
 		if disk != nil {
 			if serr := disk.Set(key, ent); serr != nil {
@@ -786,7 +804,14 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 	cacheStatus := "MISS"
 
 	// //////////////////  查缓存：命中直接回放响应头  start  ////////////////////////////////////////////////
-	if disk := s.readableCache(r, eff); disk != nil {
+	// docker 可变目标（tag manifest / referrers / tags list，判定见 docker_mutable.go）：
+	// HEAD 不读缓存——HEAD manifests/latest 复用 GET 写下的旧条目会回放过期
+	// Docker-Content-Digest，docker 直接判「Image is up to date」永不更新（2026-11-07 现场）
+	if dockerMutableTarget(target) {
+		s.log.Info("HEAD 请求绕过缓存（BYPASS，docker 可变目标不读缓存）", labels.attrs(dockerLogSourceClient,
+			"rule", eff.Rule, "reason", "docker-mutable", "target", truncate(target, 300))...)
+		cacheStatus = "BYPASS"
+	} else if disk := s.readableCache(r, eff); disk != nil {
 		if e, ok := disk.Get(key); ok {
 			// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径；
 			// serveEntry 的 HEAD 分支只回放状态码与响应头（含 Content-Length），不写 body
