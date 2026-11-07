@@ -240,6 +240,16 @@ fallback-direct: true
 # docker-partial-resume-enabled blob 半截保留与无感续传开关（默认 true 开启；显式 false 关闭）
 #docker-partial-resume-enabled: true
 
+# docker 半截续传宽限终止：续传执行方向客户端写响应体失败（docker 已断开）且在途条目
+# 无搭车订阅者时按本宽限计时——到期仍无订阅者则终止上游读取、保留半截（进度不回退）、
+# 移除在途条目，不再「继续读完只填缓存」长时间占用上游带宽（现场 261MB blob 断开后旧
+# 语义又拉了 3m44s 才写完）；宽限期内有订阅者搭车则放弃终止继续拉，断开时已有订阅者
+# 直接维持现状（不宽限）。语义分工：仅作用于客户端驱动的续传执行方（source=resume）；
+# 客户端主路径是断开即停（立即终止）；异步预取（source=prefetch）无客户端概念，保持
+# 「继续填缓存」语义不变，绝不受本项影响。全局配置，无规则级覆盖。
+# docker-resume-client-gone-grace blob 半截续传「客户端断开宽限终止」宽限时长（默认 2s；显式 <=0 关闭宽限终止，完全恢复旧「继续读完填缓存」语义）
+#docker-resume-client-gone-grace: 2s
+
 # docker 可变目标多源并发回源与合并：docker 可变目标（tag manifest / referrers / tags
 # list，不缓存每次回源）BYPASS 时并发请求全部 url-redirect 候选源（成功判据与顺序管线
 # 相同，HTML 反爬页等未过判据的源拒之于合并之外），tags/list 合并各源 tags（并集去重、
