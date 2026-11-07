@@ -21,7 +21,18 @@
 //     订阅「半截前缀 + 实时增量」，X-Cache: PREFETCH；同 blob 的预取任务经既有
 //     flightGroup（同缓存键）合并到同一路续传流——上游对该 blob 只有一路 Range 续传下载；
 //   - 失败语义：续传中途失败时保留更新后的半截文件（已追加到最新前缀），客户端本次响应
-//     被截断——docker 会重试，下次从更长前缀接着续传（进度不回退）。
+//     被截断——docker 会重试，下次从更长前缀接着续传（进度不回退）；
+//   - 宽限终止（仅续传执行方）：续传中客户端断开（写响应体失败）且 hub 条目无搭车订阅者
+//     时，按 docker-resume-client-gone-grace（默认 2s，<=0 关闭恢复旧语义）宽限计时——
+//     到期仍无订阅者则终止上游读取（errResumeGraceAborted：从计时器 goroutine 关闭上游
+//     body 让阻塞的 Read 返回）、保留半截（进度不回退）、finishFailed 移除在途条目，
+//     不再「继续读完只填缓存」长时间占用上游带宽（现场 261MB blob 断开后旧语义又拉了
+//     3m44s 才写完）；宽限期内有新订阅者搭车（subscribe）则放弃终止维持现状继续拉，
+//     断开时已有订阅者直接不宽限。语义分工必须遵守：docker 客户端驱动的链路
+//     （source=client / ridealong / resume）客户端没了就该停——主路径是断开即停
+//     （b251149，立即终止）、续传执行方是宽限终止（给搭车订阅者留上车窗口）；搭车读侧
+//     断开仅停读取订阅；异步预取（source=prefetch）没有客户端概念，保持「继续填缓存」
+//     语义不变，绝不改。
 //
 // 安全依据与边界：
 //   - blob 按 digest 寻址、内容不可变：任意候选源的同 digest 内容一致，续传可从任意
@@ -91,6 +102,13 @@ const resumeCacheStatus = "RESUME"
 // Content-Range / Content-Length，绝不 commit（半截前缀长度 ≠ 对象总长）。此刻未向客户端
 // 写出任何字节，调用方按旧版 206 透传兜底（语义与旧版完全一致）。
 var errBlobRangeUnavailable = errors.New("本地半截无法满足客户端区间请求")
+
+// errResumeGraceAborted 续传宽限终止哨兵（errors.Is 判定）：客户端断开（写响应体失败）
+// 且宽限期内无搭车订阅者，宽限到期主动终止上游读取——正常运维事件而非故障（见
+// proxy.go streamingError 的低调出口：绝不 502 / 不再向客户端写任何字节，不产生
+// Error 级日志）；半截保留（进度不回退）、hub 条目 finishFailed 移除，docker 重试
+// 将从当前断点再续。
+var errResumeGraceAborted = errors.New("blob 半截续传宽限终止（客户端断开且宽限期内无搭车订阅者）")
 
 // resumeScanBudgetFor 续传候选扫描的整体预算（全部候选轮询完的上限，到期按超时类失败
 // 收场并降级既有全量回源；半截保留不受影响）。预算只约束「选源」（探测/校验候选直到
@@ -486,7 +504,10 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 //     语义）原子写缓存（blob 落盘成功即删半截，见 finalizeFetchEntry 钩子），置 done
 //     关闭订阅（搭车方收完缓冲内增量即完整）；
 //  8. 任何失败：保留更新后的半截文件、广播 failed 并移除条目、本次响应被截断（docker
-//     以 Range 断点续传重试，下次从更长前缀接着续传——进度不回退）。
+//     以 Range 断点续传重试，下次从更长前缀接着续传——进度不回退）。其中「客户端断开
+//     且无搭车订阅者」在宽限配置 >0 时经宽限计时后主动终止（宽限终止，errResumeGraceAborted，
+//     Info 级运维事件；<=0 或宽限期内订阅者加入则维持「继续读完填缓存」）——见文件头
+//     「宽限终止」与本函数内的宽限状态块；
 //
 // 可选参数 cr（variadic，既有调用方不受影响）：客户端区间请求（起点 >0 的 blob Range，
 // 见 client_range.go）。非空时对客户端回 206 且只发区间内字节，内部仍按完整 blob 拼接
@@ -599,10 +620,57 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	}
 	ent.setSnapshot(http.StatusOK, hdr, upRes.url) // 搭车订阅者的响应头快照（预取侧 commit 点同语义）
 
+	// 宽限终止状态（graceMu 保护，语义分工见文件头）：客户端写失败（docker 已断开）且
+	// hub 条目无搭车订阅者时启动宽限计时器——到期仍无订阅者则置位 graceAborted 并从
+	// 计时器 goroutine 关闭上游 body（让阻塞在 Read 上的读循环立即返回错误终止读取，
+	// 读循环查 graceAborted 按宽限终止收场）；宽限期内有订阅者加入则放弃终止维持现状。
+	// 与 EOF 的竞态以先到者为准：EOF 先到则 break 出循环经 stopGrace 停表正常写缓存
+	//（计时器已停；恰已触发的回调最多做一次幂等 upRes.Close，无害），宽限先到则读循环
+	// 按 errResumeGraceAborted 收场——两条路的半截（只增不减）与缓存（仅完整 EOF 后
+	// 写入）数据都一致。
+	graceLimit := config.DefaultDockerResumeClientGoneGrace
+	if s.cfg != nil {
+		graceLimit = s.cfg.GlobalDockerResumeClientGoneGrace()
+	}
+	var (
+		graceMu      sync.Mutex
+		graceTimer   *time.Timer
+		graceAborted bool
+	)
+	// stopGrace 停掉宽限计时器（幂等）：读循环与 fail 的每个收场出口调用，防止计时器
+	// 在收场后误触发，timer goroutine 不泄漏。
+	stopGrace := func() {
+		graceMu.Lock()
+		defer graceMu.Unlock()
+		if graceTimer != nil {
+			graceTimer.Stop()
+			graceTimer = nil
+		}
+	}
+	// onGraceExpired 宽限到期回调（计时器 goroutine）：到期复查订阅者数——仍无订阅者
+	// 才终止（宽限期内 subscribe() 加入即放弃终止，等价取消计时，订阅者还要收增量）；
+	// 置位后关闭上游 body，阻塞中的上游 Read 立即返回。upRes.Close 幂等，与本函数、
+	// 读循环收场出口的 Close 竞态安全；绝不在此向客户端写任何字节（客户端已断开）。
+	onGraceExpired := func() {
+		graceMu.Lock()
+		if graceAborted {
+			graceMu.Unlock()
+			return // 防御：Stop 与触发的竞态窗口，已终止过则幂等返回
+		}
+		if ent.subscriberCount() > 0 {
+			graceMu.Unlock()
+			return // 宽限期内来了订阅者：放弃终止，继续拉（订阅者还要收增量）
+		}
+		graceAborted = true
+		graceMu.Unlock()
+		upRes.Close()
+	}
+
 	// 失败收尾：关闭上游与半截写句柄、广播 failed 并移除条目（半截文件已随流追加到
 	// 最新前缀，进度不回退；本次响应被截断，docker 重试从更长前缀续传）
 	var paf *os.File // 半截文件追加写句柄（O_APPEND）
 	fail := func(cause error) (*cache.Entry, bool, error) {
+		stopGrace()   // 宽限计时器随任一失败收场停掉（幂等；goroutine 不泄漏）
 		upRes.Close() // 幂等：关闭连接、停看门狗、取消超时预算链
 		if paf != nil {
 			_ = paf.Close()
@@ -648,7 +716,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		return fail(fmt.Errorf("半截文件短于注册快照（实读 %d / 期望 %d 字节），终止本次续传", len(prefix), n))
 	}
 	accum := bytes.NewBuffer(make([]byte, 0, int(n)+streamChunkSize))
-	clientOK := true // 客户端写失败（docker 已断开）后置 false：继续读完上游只填缓存（与既有语义一致）
+	clientOK := true // 客户端写失败（docker 已断开）后置 false：按宽限语义处置（见下方宽限终止判定与读循环出口）
 	// writeClient 按客户端区间窗口把「完整 blob 中偏移 off 起的 p」写给客户端：起点之前的
 	// 字节跳过、终点之后的字节不再写；内部累积（accum 与半截文件）始终是完整 blob——缓存
 	// 条目必须完整，后续任意起点才能直接本地切片秒回（客户端只收区间内字节）。
@@ -669,8 +737,24 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		}
 		if _, werr := w.Write(p[lo-off : hi-off]); werr != nil {
 			clientOK = false
-			s.log.Warn("写响应体失败（客户端已断开，续传继续只填缓存）",
-				labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200), "err", werr)...)
+			// 客户端断开（docker 已断）的宽限终止判定（本闭包此后不再进入，仅此一次）：
+			//   - hub 条目已有搭车订阅者：不宽限，维持现状继续拉（订阅者还要收增量）；
+			//   - 宽限配置 <=0（graceLimit<=0）：关闭宽限终止，维持旧版「继续读完只填
+			//     缓存」语义不变；
+			//   - 无订阅者且宽限 >0：启动宽限计时器——到期仍无订阅者则终止上游读取
+			//    （errResumeGraceAborted，见读循环的宽限终止出口；预取路径与搭车读侧
+			//     不受影响），宽限期内有订阅者加入则到点自动放弃（见 onGraceExpired）。
+			subs := ent.subscriberCount()
+			if graceLimit > 0 && subs == 0 {
+				graceMu.Lock()
+				if graceTimer == nil { // 防御：仅启动一次（clientOK 已拦住重复进入）
+					graceTimer = time.AfterFunc(graceLimit, onGraceExpired)
+				}
+				graceMu.Unlock()
+			}
+			s.log.Warn("写响应体失败（客户端已断开，续传按宽限语义处置）",
+				labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200),
+					"grace", graceLimit.String(), "subscribers", subs, "err", werr)...)
 		}
 	}
 	accum.Write(prefix[:n])
@@ -734,8 +818,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	}
 
 	// 上游剩余区间流式读取：经 progressReader 记入看门狗（read-timeout「无新增数据」
-	// 语义与客户端流式路径一致）；客户端写失败（已断开）保持既有行为——继续读完上游
-	// 只填缓存（半截与广播照常推进，等待中的搭车订阅者不受影响）
+	// 语义与客户端流式路径一致）；客户端写失败（已断开）按宽限语义处置——宽限到期仍无
+	// 搭车订阅者则终止上游读取（下方宽限终止出口），其余情况维持「继续读完只填缓存」
+	//（半截与广播照常推进，等待中的搭车订阅者不受影响）
 	if upRes.body != nil {
 		pr := &progressReader{r: upRes.body, wd: upRes.wd}
 		buf := make([]byte, streamChunkSize)
@@ -753,6 +838,22 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 				if errors.Is(rdErr, io.EOF) {
 					break // 剩余区间读完：半截文件 = 完整 blob，前缀+增量恰好拼出完整 body
 				}
+				// 宽限终止判定（先查宽限标志再按普通读失败处理）：宽限到期回调已置位
+				// ——客户端断开且无搭车订阅者的正常运维事件而非故障，Info 级留痕
+				//（绝不 Error），半截保留（进度不回退）、hub 条目经下方 fail 的
+				// finishFailed 移除；上游已由回调关闭（fail 的 Close 幂等兜底）。
+				// 响应已 commit 且客户端已断，绝不再向客户端写任何字节。
+				graceMu.Lock()
+				aborted := graceAborted
+				graceMu.Unlock()
+				if aborted {
+					stopGrace() // 计时器已触发：Stop 幂等收表（timer goroutine 不泄漏）
+					s.log.Info("blob 半截续传客户端断开且无搭车订阅者，宽限终止续传（半截保留，下次从断点再续）",
+						labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
+							"bytes", accum.Len(), "part_bytes", written,
+							"grace", graceLimit.String(), "subscribers", ent.subscriberCount())...)
+					return fail(errResumeGraceAborted)
+				}
 				// commit 后读上游失败：保留更新后的半截文件（已追加到最新前缀，进度
 				// 不回退），广播 failed 并截断本次响应（docker 重试接着更长前缀续传）
 				s.log.Error("blob 半截续传读上游失败，终止本次响应（半截已保留，进度不回退）",
@@ -763,6 +864,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			}
 		}
 	}
+	stopGrace() // 正常 EOF 收场：停掉宽限计时器（幂等；宽限终止与 EOF 竞态以先到者为准）
 	_ = paf.Close() // 追加完毕；磁盘写为直写（无用户态缓冲），无需 Sync（断电丢失由 Clean 兜底）
 	upRes.Close()   // 幂等：关闭连接、停看门狗、取消超时预算链
 

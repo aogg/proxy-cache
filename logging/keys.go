@@ -129,6 +129,8 @@ var logKeyZh = map[string]string{
 	// blob 半截与续传
 	"part_bytes":    "半截字节",
 	"isolated_gap":  "隔离时长",
+	"grace":         "宽限时长",
+	"subscribers":   "搭车订阅数",
 	"prefix_bytes":  "前缀字节",
 	"gap_bytes":     "缺口字节",
 	"kept":          "保留字节",

@@ -582,6 +582,16 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 					labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 300))...)
 				return
 			}
+			if errors.Is(err, errResumeGraceAborted) {
+				// 续传宽限终止（客户端断开且宽限到期仍无搭车订阅者，正常运维事件而非
+				// 失败）：与 errClientDisconnected 同款低调处理——响应已 commit 且客户端
+				// 已断，绝不再向客户端写任何字节（不 502 不 writeError）；宽限终止事件
+				// 已由续传执行方 Info 留痕（半截保留、条目移除），此处 Debug 简记即可。
+				// 客户端将以断点续传重试，从半截断点接着拉。
+				s.log.Debug("blob 半截续传宽限终止，本次响应终止（流内部已留痕，客户端将以断点续传重试）",
+					labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 300))...)
+				return
+			}
 			s.log.Warn("流式回源失败（响应头已写出，终止本次响应）",
 				labels.attrs(dockerLogSourceClient, "target", truncate(r.URL.Path, 300), "err", err)...)
 		}
@@ -600,12 +610,17 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	if blobRangeLocal && disk != nil {
 		// A) 正式缓存 HIT：条目 body 即完整 blob，任意起点本地切片回 206（不发上游）
 		if e, ok := disk.Get(key); ok && e.Status == http.StatusOK && len(e.Body) > 0 {
-			s.log.Info("缓存命中（HIT）并按客户端区间本地切片回 206（不发上游）",
-				labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
-					"file", disk.FilePath(key), "range_start", rangeSpec.start,
-					"range_has_end", rangeSpec.hasEnd, "bytes", len(e.Body))...)
-			s.serveEntryBlobRange(w, r, e, rangeSpec, "HIT", eff, start)
-			return
+			if mismatch, actual := s.entryDigestMismatch(target, e); mismatch {
+				// 毒条目：删除后继续走下方未命中链路（同请求内回源自愈），绝不回放毒字节
+				s.purgePoisonEntry(disk, key, target, eff.Rule, actual)
+			} else {
+				s.log.Info("缓存命中（HIT）并按客户端区间本地切片回 206（不发上游）",
+					labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+						"file", disk.FilePath(key), "range_start", rangeSpec.start,
+						"range_has_end", rangeSpec.hasEnd, "bytes", len(e.Body))...)
+				s.serveEntryBlobRange(w, r, e, rangeSpec, "HIT", eff, start)
+				return
+			}
 		}
 		// B) 本地半截对齐：起点 <= 半截长度时走续传管线（前缀从起点切片回放 + 上游续传拼接）
 		if streaming && s.tryServeBlobResume(w, r, key, target, eff, disk, start, finalize, streamingError, rangeSpec) {
@@ -641,11 +656,16 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	// //////////////////  查缓存：命中直接回放  start  ////////////////////////////////////////////////
 	if disk != nil {
 		if e, ok := disk.Get(key); ok {
-			// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径
-			s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
-				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
-			s.serveEntry(w, r, e, "HIT", eff, start, zeroArgs...)
-			return
+			if mismatch, actual := s.entryDigestMismatch(target, e); mismatch {
+				// 毒条目：删除后按未命中继续（下方链路同请求内回源自愈），绝不回放毒字节
+				s.purgePoisonEntry(disk, key, target, eff.Rule, actual)
+			} else {
+				// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径
+				s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+					"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
+				s.serveEntry(w, r, e, "HIT", eff, start, zeroArgs...)
+				return
+			}
 		}
 	}
 	s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath)...)
@@ -748,6 +768,37 @@ func blobDigestMatches(body []byte, digest string) (string, bool) {
 	sum := sha256.Sum256(body)
 	actual := hex.EncodeToString(sum[:])
 	return actual, actual == hexdig
+}
+
+// entryDigestMismatch 缓存条目的 blob 摘要复核（HIT 侧兜底，与 finalizeFetchEntry 的
+// 写入侧强校验同一校验器）：blob 目标条目在回放给客户端前必须再次通过 sha256 比对——
+// 写入守卫部署之前落盘的历史条目无法追溯验证（2026-11-07 现场：镜像 18 个 blob 中
+// 7 个为毒，连 1-5KB 的 config 小文件都中招，证明普通全量 GET 路径同样投毒过），
+// 只有回放前复核才能拦住。返回 (是否不符, 实际摘要 hex)；非 blob 目标恒 false。
+func (s *Server) entryDigestMismatch(target string, e *cache.Entry) (bool, string) {
+	dgst, isBlob := parseDockerBlobTarget(target)
+	if !isBlob {
+		return false, ""
+	}
+	verify := s.blobDigestVerify
+	if verify == nil {
+		verify = blobDigestMatches
+	}
+	actual, ok := verify(e.Body, dgst)
+	return !ok, actual
+}
+
+// purgePoisonEntry 毒条目处置：删除磁盘文件并留痕（Error）。删除失败仅 Warn——后台
+// 清理不感知摘要，残留毒文件会在下次命中时再次被发现并重试删除；调用方随后按未命中
+// 回源（同请求内自愈，绝不把毒字节回放给客户端）。
+func (s *Server) purgePoisonEntry(disk *cache.Cache, key, target, rule, actual string) {
+	disk.Remove(key)
+	labels := parseDockerLogInfo(target)
+	dgst, _ := parseDockerBlobTarget(target)
+	s.log.Error("缓存条目内容摘要不符，已删除毒条目并按未命中回源（防毒缓存：HIT 侧复核）",
+		labels.attrs(dockerLogSourceClient, "rule", rule, "key", key,
+			"digest", dgst, "actual_digest", "sha256:"+actual,
+			"file", disk.FilePath(key))...)
 }
 
 // finalizeFetchEntry 回源完成后的缓存写入与留痕（仅 GET，条件与日志字段与旧版一致）：
@@ -872,12 +923,18 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 		cacheStatus = "BYPASS"
 	} else if disk := s.readableCache(r, eff); disk != nil {
 		if e, ok := disk.Get(key); ok {
-			// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径；
-			// serveEntry 的 HEAD 分支只回放状态码与响应头（含 Content-Length），不写 body
-			s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
-				"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
-			s.serveEntry(w, r, e, "HIT", eff, start)
-			return
+			if mismatch, actual := s.entryDigestMismatch(target, e); mismatch {
+				// 毒条目：删除后按未命中回源（HEAD 探测同样绝不放行毒条目——错误的
+				// Content-Length / Docker-Content-Digest 会把 docker 引向错误决策）
+				s.purgePoisonEntry(disk, key, target, eff.Rule, actual)
+			} else {
+				// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径；
+				// serveEntry 的 HEAD 分支只回放状态码与响应头（含 Content-Length），不写 body
+				s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+					"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
+				s.serveEntry(w, r, e, "HIT", eff, start)
+				return
+			}
 		}
 		s.log.Debug("缓存查询结果", labels.attrs(dockerLogSourceClient, "result", "MISS", "key", key, "dir", eff.CachePath)...)
 	} else {

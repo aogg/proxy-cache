@@ -29,6 +29,10 @@ package proxy
 //      半截当完整 blob 写缓存（invalid 降级全量回源，缓存内容 = 完整原文）；
 //  11. 断开续传提醒：半截存在且隔了 ≥1s 的重试 → 提醒日志 + isolated_gap（隔离时长），
 //      续传开始日志同样携带。
+//  13. 宽限终止（续传执行方专属，见 partial_resume.go）：客户端断开且无搭车订阅者 →
+//      宽限到期终止上游读取（半截保留、无 Error 级日志、宽限终止 Info 日志、上游连接
+//      被关闭写出停在断开点）；断开时已有订阅者 / 宽限期内订阅者加入 → 不终止继续到
+//      完成写缓存；宽限配置 <=0 → 旧语义「继续读完填缓存」不变。
 
 import (
 	"bytes"
@@ -79,6 +83,7 @@ type resumeUpstream struct {
 	bad416       map[string]bool          // digest -> Range 探测回 416 且不带 Content-Range（模拟不合规镜像源，防毒缓存回归用）
 	fake416Total map[string]int64         // digest -> Range 探测回 416 且 Content-Range 总长伪造为该值（模拟总长与半截不符）
 	poisonTail   map[string][]byte        // digest -> Range 剩余区间回毒内容（长度与原文尾段一致；模拟同一 digest 内容错误的异常镜像源，防毒缓存回归用）
+	sent         map[string]int64         // digest -> 累计成功写出的字节数（宽限终止断言用：代理关闭上游连接后 handler 写失败退出，写出停在断开点）
 	manifest     []byte                   // manifest 响应 body
 	manifestBr   bool                     // manifest 写一半后断连
 	chunkSize    int                      // 分块大小（默认整段一次写出）
@@ -98,6 +103,7 @@ func newResumeUpstream() *resumeUpstream {
 		bad416:       make(map[string]bool),
 		fake416Total: make(map[string]int64),
 		poisonTail:   make(map[string][]byte),
+		sent:         make(map[string]int64),
 	}
 }
 
@@ -173,6 +179,22 @@ func (u *resumeUpstream) rangesOf(digest string) []string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return append([]string(nil), u.ranges[digest]...)
+}
+
+// addSent 累计某 digest 成功写出的字节数（resumeWriteChunks 返回值；并发安全）。
+func (u *resumeUpstream) addSent(digest string, n int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.sent[digest] += int64(n)
+}
+
+// sentOf 返回某 digest 累计成功写出的字节数快照（并发安全）。宽限终止断言用：代理侧
+// 关闭上游连接后 handler 下一次 Write 即失败退出，写出停在断开点（不再逼近总长）；
+// 连接未被关闭（旧语义继续读完）则写出直抵总长。
+func (u *resumeUpstream) sentOf(digest string) int64 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.sent[digest]
 }
 
 // ServeHTTP 按 manifest / blob 分流（其余路径 404）。
@@ -263,11 +285,11 @@ func (u *resumeUpstream) serveBlob(w http.ResponseWriter, r *http.Request) {
 		if short > 0 && int64(len(remain)) > short {
 			// 声明完整总长但提前干净 EOF：不设 Content-Length（chunked 正常收尾），
 			// 命中续传的「EOF 长度不符」分支（而非连接异常断开）
-			resumeWriteChunks(w, remain[:short], nil, chunk, 0)
+			u.addSent(digest, resumeWriteChunks(w, remain[:short], nil, chunk, 0))
 			return
 		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(remain)))
-		resumeWriteChunks(w, remain, holdAt(hold, nth), chunk, delay)
+		u.addSent(digest, resumeWriteChunks(w, remain, holdAt(hold, nth), chunk, delay))
 		return
 	}
 
@@ -283,7 +305,7 @@ func (u *resumeUpstream) serveBlob(w http.ResponseWriter, r *http.Request) {
 		hubFlush(w)
 		panic(http.ErrAbortHandler)
 	}
-	resumeWriteChunks(w, body, holdAt(hold, nth), chunk, delay)
+	u.addSent(digest, resumeWriteChunks(w, body, holdAt(hold, nth), chunk, delay))
 }
 
 func (u *resumeUpstream) addRange(digest, rng string) {
@@ -301,15 +323,19 @@ func holdAt(hold chan struct{}, nth int) chan struct{} {
 }
 
 // resumeWriteChunks 分块写出 data：首块写出后若 hold 非 nil 则阻塞在闸门上（测试放行
-// 后继续）；其余逐块 hubFlush + delay，拉长流式窗口供时序观察。
-func resumeWriteChunks(w http.ResponseWriter, data []byte, hold chan struct{}, chunk int, delay time.Duration) {
+// 后继续）；其余逐块 hubFlush + delay，拉长流式窗口供时序观察。返回成功写出的字节数
+// （写失败即停——代理已 Close 上游连接时 handler 在下一块写失败退出，供断言「上游连接
+// 被关闭、写出停在断开点」；调用方经 resumeUpstream.addSent 按 digest 累加）。
+func resumeWriteChunks(w http.ResponseWriter, data []byte, hold chan struct{}, chunk int, delay time.Duration) int {
+	sent := 0
 	first := chunk
 	if first <= 0 || first > len(data) {
 		first = len(data)
 	}
 	if _, err := w.Write(data[:first]); err != nil {
-		return
+		return sent
 	}
+	sent += first
 	hubFlush(w)
 	if hold != nil {
 		<-hold
@@ -320,13 +346,15 @@ func resumeWriteChunks(w http.ResponseWriter, data []byte, hold chan struct{}, c
 			end = len(data)
 		}
 		if _, err := w.Write(data[off:end]); err != nil {
-			return
+			return sent
 		}
+		sent += end - off
 		hubFlush(w)
 		if delay > 0 {
 			time.Sleep(delay)
 		}
 	}
+	return sent
 }
 
 // resumeParseRangeStart 解析 "bytes=N-" 形态的 Range 起点（非法按 0，仅测试辅助）。
@@ -1617,5 +1645,36 @@ func TestBlobResumeStreamingPoisonTailNotCached(t *testing.T) {
 	}
 	if e, ok := fx.disk.Get(key); !ok || !bytes.Equal(e.Body, content) {
 		t.Error("重试后缓存应为完整正确原文")
+	}
+}
+
+// TestCacheHitPoisonEntrySelfHeals 端到端回归（HIT 侧复核）：写守卫部署前落盘的历史
+// 毒条目（键=真实 digest 对应缓存键、body=毒内容）在命中回放前被摘要复核拦下——删除
+// 毒条目、同请求回源自愈：客户端拿到正确原文、缓存被正确内容覆盖。
+func TestCacheHitPoisonEntrySelfHeals(t *testing.T) {
+	fx := newResumeFixture(t, nil)
+	fx.s.blobDigestVerify = nil
+	content := hubBlobContent(0xf7, 4096)
+	digest := realDigestOf(content)
+	poison := hubBlobContent(0xf8, 4096)
+	fx.reg.setContent(digest, content)
+	key := prefetchBlobKey(prefetchName, digest)
+	h := http.Header{}
+	h.Set("Content-Type", "application/octet-stream")
+	if err := fx.disk.Set(key, &cache.Entry{Status: http.StatusOK, Header: h, Body: poison, StoredAt: time.Now()}); err != nil {
+		t.Fatalf("预置毒条目失败: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	fx.s.ServeHTTP(w, prefetchBlobTestRequest(prefetchName, digest))
+	if w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), content) {
+		t.Fatalf("客户端应拿到正确原文（code=%d bytes=%d）", w.Code, w.Body.Len())
+	}
+	e, ok := fx.disk.Get(key)
+	if !ok || !bytes.Equal(e.Body, content) {
+		t.Error("自愈后缓存应为正确原文")
+	}
+	if !strings.Contains(fx.logBuf.String(), "已删除毒条目") {
+		t.Error("应留痕「已删除毒条目」日志")
 	}
 }

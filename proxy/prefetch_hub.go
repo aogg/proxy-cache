@@ -834,6 +834,15 @@ func (e *prefetchStreamEntry) writtenOf() int64 {
 	return e.written
 }
 
+// subscriberCount 返回当前搭车订阅者数（e.mu 下 len(e.subs)）：续传执行方的宽限终止
+// 判定用（见 partial_resume.go）——客户端断开且此刻无订阅者才启动宽限计时，到期仍无
+// 订阅者才终止上游读取；宽限期内本数变正（新订阅者 subscribe 加入）即放弃终止。
+func (e *prefetchStreamEntry) subscriberCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.subs)
+}
+
 // logSourceOf 返回条目所属链路的日志来源：续传条目（resume=true）归 resume，预取条目
 // 归 prefetch——写侧 hub 事件（广播摘除订阅者 / 临时文件清理）由写者（预取/续传执行方）
 // 触发，按写者来源标注；搭车侧的日志由搭车调用点统一标 ridealong（见 tryServeFromPrefetchHub）。

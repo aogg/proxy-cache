@@ -145,6 +145,15 @@ func (c *Cache) RemovePart(key string) {
 	}
 }
 
+// Remove 删除缓存条目（幂等；不存在静默成功）。调用方：HIT 侧 blob 摘要复核失败时
+// 清除毒条目（防毒缓存，proxy 包 entryDigestMismatch/purgePoisonEntry），与 Get 的
+// 惰性过期删除同语义。
+func (c *Cache) Remove(key string) {
+	if err := os.Remove(c.path(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("删除缓存条目失败", "file", c.path(key), "err", err)
+	}
+}
+
 // Get 读取缓存；未命中、已过期或损坏时返回 (nil, false)。
 // 过期条目会被惰性删除（删除失败不影响本次按未命中处理的结果）。
 func (c *Cache) Get(key string) (*Entry, bool) {

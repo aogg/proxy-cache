@@ -48,6 +48,13 @@ const DefaultProgressSummaryInterval = 3 * time.Minute
 // 请求前把 layer 备好，同时不与客户端请求争抢过多上游带宽。
 const DefaultDockerPrefetchConcurrency = 4
 
+// DefaultDockerResumeClientGoneGrace docker-resume-client-gone-grace 未配置时的缺省值：
+// blob 半截续传「客户端断开宽限终止」的宽限时长（实现见 proxy 包 partial_resume.go）。
+// 取 2s 的量级依据：覆盖「docker 客户端闪断重连 / 同 blob 并发层请求稍后到达」的搭车
+// 上车窗口，又不至于断开后长时间占用上游带宽（现场 261MB blob 断开后按旧语义「继续
+// 读完填缓存」又拉了 3m44s 才写完）。显式 <=0 = 关闭宽限终止（完全恢复旧语义）。
+const DefaultDockerResumeClientGoneGrace = 2 * time.Second
+
 // 慢速升级多源并发续传（slow-download escalation，仅 type=docker 规则的 GET 路径目标
 // 流式回源生效）的缺省值。
 const (
@@ -672,6 +679,17 @@ type Config struct {
 	// 缓存；上游对 Range 不回 206 时安全降级走既有全量回源。nil（未配置）= 开启（默认
 	// 开）；显式 false 关闭。全局配置，无规则级覆盖。
 	DockerPartialResumeEnabled *bool `yaml:"docker-partial-resume-enabled"`
+	// DockerResumeClientGoneGrace docker blob 半截续传「客户端断开宽限终止」的宽限时长
+	//（实现见 proxy 包 partial_resume.go）：续传执行方向客户端写响应体失败（docker 已
+	// 断开）且在途条目无搭车订阅者时启动本宽限计时——到期仍无订阅者则终止上游读取、
+	// 保留半截（进度不回退）、移除在途条目，不再「继续读完只填缓存」长时间占用上游带宽；
+	// 宽限期内新订阅者搭车则继续拉（订阅者还要收增量），断开时已有订阅者直接维持现状
+	//（不宽限）。语义分工：仅作用于客户端驱动的续传执行方（source=resume）；客户端主
+	// 路径是断开即停（b251149，立即终止）；异步预取（source=prefetch）无客户端概念，
+	// 保持「继续填缓存」语义不变，绝不受本项影响。nil（未配置）= 缺省 2s
+	//（DefaultDockerResumeClientGoneGrace）；显式 <=0 = 关闭宽限终止（完全恢复旧语义）。
+	// 全局配置，无规则级覆盖。
+	DockerResumeClientGoneGrace *Duration `yaml:"docker-resume-client-gone-grace"`
 	// HTTPProxy 全局上游代理（http/https/socks5 地址，如 http://127.0.0.1:7890），空串表示直连。
 	HTTPProxy string `yaml:"http-proxy"`
 	// SuccessCheck url-redirect 候选成功判据：status 或 content（默认 content）。
@@ -1341,6 +1359,18 @@ func (c *Config) GlobalDockerPartialResumeEnabled() bool {
 		return true
 	}
 	return *c.DockerPartialResumeEnabled
+}
+
+// GlobalDockerResumeClientGoneGrace 返回 docker blob 半截续传「客户端断开宽限终止」的
+// 宽限时长生效值：nil（未配置）= 缺省 2s（DefaultDockerResumeClientGoneGrace）；
+// 显式 <=0 = 0（关闭宽限终止，维持旧版「继续读完填缓存」语义——<=0 是合法的关闭写法，
+// 负数同样按关闭处理，Validate 不拒绝）。
+// 方法内做 nil 防御，供未经过 Validate 的构造场景兜底。
+func (c *Config) GlobalDockerResumeClientGoneGrace() time.Duration {
+	if c.DockerResumeClientGoneGrace == nil {
+		return DefaultDockerResumeClientGoneGrace
+	}
+	return c.DockerResumeClientGoneGrace.D()
 }
 
 // ProgressLogInterval 返回全局流式透传进度日志的输出间隔生效值：
