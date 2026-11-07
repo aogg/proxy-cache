@@ -15,7 +15,10 @@ package proxy
 //   6. HEAD 的 404 透传：无 body、Content-Length 沿用上游声明值；
 //   7. 完整 URL（web）目标全败不受影响：不透传 4xx，仍 502；
 //   8. 白盒：newUpstreamStatusError 载荷边界（399/400/401/499/500、nil 防御）、
-//      asUpstreamStatusError 经多层 %w 包装穿透、stripUpstreamStatus 剥离与原样返回。
+//      asUpstreamStatusError 经多层 %w 包装穿透、stripUpstreamStatus 剥离与原样返回；
+//   9. 兜底透传（2026-11-07 opencode-to-openai 拉取现场动机）：最终失败为网络/超时类而
+//      扫描期间出现过明确 4xx → 全败出口改用最近一次 4xx 载荷透传（404 在前 + 死候选
+//      在后 / 死候选在前 + 404 在后两种顺序都透传 404）；纯网络失败（无任何 4xx）仍 502。
 
 import (
 	"errors"
@@ -234,6 +237,72 @@ func TestUpstreamStatusNetworkFailureStill502(t *testing.T) {
 			t.Error("上游迟到响应不应透传给客户端（探测预算到期已放弃该候选）")
 		}
 	})
+}
+
+// TestUpstreamStatusNetworkLastPrefers4xxFallback 覆盖点 9：兜底透传——最终失败为网络/超时
+// 类而扫描期间出现过明确 4xx 时，全败出口改用最近一次 4xx 载荷透传（candidates.go 全败出口）。
+// 现场动机（2026-11-07 opencode-to-openai 拉取失败）：referrers 目标下 1panel.live 明确回 404
+//（docker 客户端本可容忍自行 fallback），其余候选全是 DNS 失败 / dance 后 401 / probe-timeout，
+// 旧行为最终 lastErr 落在网络类失败上 → docker 收 502 判整次 pull 失败（层其实已全部拉完）。
+//   - 404 在前、死候选（连接拒绝）在后：最终 lastErr 为连接拒绝 → 兜底透传 404；
+//   - 死候选在前、404 在后：同上（载荷兜底与出现顺序无关，记录最后一次出现的 4xx）。
+// 两种顺序都断言：客户端 404 + 上游 body 原样 + X-Proxy-Upstream 指向回 404 的候选。
+func TestUpstreamStatusNetworkLastPrefers4xxFallback(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // 关闭监听：对 deadURL 的请求必然连接拒绝（网络类失败，无载荷）
+
+	notFound := statusUpstream(t, http.StatusNotFound,
+		`{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known to registry"}]}`, nil)
+	wantUpstream := notFound.URL + "/" + referrersTarget()
+
+	for _, tt := range []struct {
+		name     string
+		first    string // 排在前面的候选模板（start=0 首发）
+		second   string // 排在后面的候选模板（失败快切随后发出）
+		upstream *httptest.Server
+	}{
+		{
+			name:     "404在前_死候选在后",
+			first:    notFound.URL,
+			second:   deadURL,
+			upstream: notFound,
+		},
+		{
+			name:     "死候选在前_404在后",
+			first:    deadURL,
+			second:   notFound.URL,
+			upstream: notFound,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newRegistryServer(t,
+				`http://registry-proxy-cache\.linkease\.net:5480/`,
+				"", // 缓存关闭：聚焦全败出口，避免缓存写入干扰断言
+				[]config.URLRedirectItem{
+					{Template: tt.first + "/$http.server.header.full_url_no_server"},
+					{Template: tt.second + "/$http.server.header.full_url_no_server"},
+				},
+				nil)
+
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, referrersRequest())
+
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("Code = %d, want 兜底透传上游 404（而非网络类最终失败的 502）, body: %s",
+					w.Code, w.Body.String())
+			}
+			if got := w.Body.String(); got != `{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known to registry"}]}` {
+				t.Errorf("Body = %q, want 原样透传回 404 候选的 body", got)
+			}
+			if got := w.Header().Get("X-Proxy-Upstream"); got != wantUpstream {
+				t.Errorf("X-Proxy-Upstream = %q, want 回 404 的候选 %q", got, wantUpstream)
+			}
+			if strings.Contains(w.Body.String(), `"error"`) {
+				t.Errorf("body %q 不应是 JSON 502 错误体（兜底未生效，仍在返回裸 502）", w.Body.String())
+			}
+		})
+	}
 }
 
 // TestUpstreamStatusCandidateRetryUnaffected 覆盖点 5：换候选重试语义不变。

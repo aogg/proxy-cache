@@ -159,8 +159,9 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 		round      int         // 当前轮次（1 基；轮边界在 schedMu 下自增）
 		released   int         // 本轮已放行候选数（schedMu 下读写）
 		hedgeTimer *time.Timer // 已武装的 hedge 放行定时器（nil = 未武装；schedMu 下读写）
-		cancels    = make([]context.CancelFunc, n)
-		lastErr    error
+		cancels       = make([]context.CancelFunc, n)
+		lastErr       error // 最近一次候选失败（全败后作为最终错误返回，后写覆盖前写）
+		lastStatusErr error // 最近一次「上游明确 4xx」候选失败（全败出口的网络类最终失败兜底，见下方出口注释）
 	)
 	done := make(chan candidateOutcome, n)
 
@@ -337,6 +338,16 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 			}
 			if oc.err != nil {
 				lastErr = oc.err
+				// 记下扫描期间出现过的「上游明确 4xx」载荷失败（404/403/429 等，401 被
+				// newUpstreamStatusError 排除不会到这里）：全败出口在最终失败为网络/超时类
+				// 时用它兜底透传。现场动机（2026-11-07 opencode-to-openai 拉取失败）：referrers
+				// 目标下 1panel.live 明确回了 404（docker 客户端本可容忍自行 fallback），但其余
+				// 候选全是 DNS 失败 / dance 后 401 / probe-timeout，最终 lastErr 落在网络类的
+				// probe-timeout 上，404 载荷被丢弃 → docker 收 502 判整次 pull 失败（层其实
+				// 已全部拉完），必须整次重试。
+				if _, ok := asUpstreamStatusError(oc.err); ok {
+					lastStatusErr = oc.err
+				}
 			}
 			// 失败快切：下一候选尚未被 hedge 定时器放行时立即放行（不等间隔）
 			schedMu.Lock()
@@ -413,6 +424,21 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 	}
 	if lastErr == nil {
 		lastErr = errors.New("全部 url-redirect 候选尝试均未产生结果")
+	}
+	// 自然跑完全部轮次后的兜底透传：最终失败为网络/超时类（无 4xx 载荷）而扫描期间出现过
+	// 「上游明确 4xx」时，改用最近一次明确 4xx 载荷上浮。它是对该目标的真实上游响应，docker
+	// 对 referrers 404 / 限流 429 等语义自带容错，透传后 pull 可正常完成；返回裸 502 则
+	// docker 判整次 pull 失败（现场动机见上方 lastStatusErr 记录处注释）。仅本出口兜底：
+	// 预算耗尽出口维持 502 语义不变——对 blob 而言把「上游还没同步 / 还在赶路」透传成
+	// 4xx 有把可重试失败误判成「对象不存在」的风险（见 stripUpstreamStatus 注释）。
+	if _, ok := asUpstreamStatusError(lastErr); !ok {
+		if fallback, ok2 := asUpstreamStatusError(lastStatusErr); ok2 && fallback != nil {
+			s.log.Warn("url-redirect 全部候选失败：最终失败为网络/超时类，改用扫描期间最近的上游明确 4xx 响应透传",
+				"last_error", lastErr.Error(),
+				"status", fallback.status,
+				"candidate", fallback.url)
+			return nil, lastStatusErr
+		}
 	}
 	return nil, lastErr
 	// //////////////////  全部轮次失败：回收并返回最后一个错误  end  ////////////////////////////
