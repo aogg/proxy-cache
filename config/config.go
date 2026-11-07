@@ -304,9 +304,12 @@ const urlRedirectItemReservedFields = "enabled / weight / hedge-delay"
 // hedge-delay（候选竞速放行间隔，作用于候选序列调度、非单候选属性，见 urlRedirectItemReservedFields）。
 //
 // CandidateAuth 候选级上游凭据（账号 + 密码）：供 401 token dance 用 Basic 认证换取
-// Bearer token（替代匿名 dance）。典型场景：带鉴权的镜像站（如 HLmirror——匿名 token
-// 只有匿名权限，私有仓库 / 登录限速账号需要登录态才能拉取）。凭据仅内存持有参与
-// Basic 头与 token 缓存 key（密码只取短哈希），绝不落盘、不打日志。
+// Bearer token（替代匿名 dance）。典型场景：带鉴权的镜像站（如 HLmirror——token 端点
+// 强制登录，匿名请求一律 UNAUTHORIZED，私有仓库 / 登录限速账号需要登录态才能拉取）。
+// 凭据仅内存持有参与 Basic 头与 token 缓存 key（密码只取短哈希），绝不落盘、不打日志。
+// 明文与不明文：username/password 均直接支持明文（配置文件本就是明文形态，建议
+// chmod 600）；password 亦可写「${环境变量}」引用——仅显式 ${VAR} 形态做展开
+// （expandCandidateAuthEnv，纯文本含 $ 不受影响），令牌经容器环境变量注入不落配置文件。
 type CandidateAuth struct {
 	// Username 账号（必填，trim 后非空；Validate 拒绝空账号）。
 	Username string `yaml:"username"`
@@ -1069,7 +1072,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("domain-rules[%d] (%s) 的 http-proxy 无效: %w", i, r.Label(), err)
 			}
 		}
-		// 规则级上游凭据：username 必填（候选级 auth 缺省来源），password 允许空串
+		// 规则级上游凭据：先做 ${VAR} 环境变量引用展开，再校验 username 必填
+		//（候选级 auth 缺省来源），password 允许空串
+		expandCandidateAuthEnv(r.Auth)
 		if err := validateCandidateAuth(r.Auth, fmt.Sprintf("domain-rules[%d] (%s) 的 auth", i, r.Label())); err != nil {
 			return err
 		}
@@ -1637,6 +1642,24 @@ func (c *Config) CheckACL(targetURL string) (matched string, err error) {
 	return "", nil
 }
 
+// expandCandidateAuthEnv 对凭据字段做环境变量引用展开（不明文方案）：仅当字段包含
+// 显式引用语法「${VAR}」才做 os.ExpandEnv 替换——纯文本（即使含 $ 不构成 ${..} 形态）
+// 原样保留，避免字面量密码被误展开；引用的变量不存在时展开为空串（username 空会被
+// 随后的必填校验拦下）。典型用法：password: "${HL_HOULANG_TOKEN}"，令牌经容器环境
+// 变量注入（docker run -e），不落在配置文件里。Validate 阶段调用一次，展开后运行期
+// 只读共享。
+func expandCandidateAuthEnv(a *CandidateAuth) {
+	if a == nil {
+		return
+	}
+	if strings.Contains(a.Username, "${") {
+		a.Username = os.ExpandEnv(a.Username)
+	}
+	if strings.Contains(a.Password, "${") {
+		a.Password = os.ExpandEnv(a.Password)
+	}
+}
+
 // validateCandidateAuth 校验候选/规则级上游凭据（token dance 用账号密码）：
 // username 必填（trim 后非空）；password 允许空串（个别 registry 支持空密码账号）。
 // 错误信息只带定位与字段名，绝不回显凭据内容。
@@ -1723,8 +1746,10 @@ func validateRedirectItems(list []URLRedirectItem, where string) error {
 				return fmt.Errorf("%s 第 %d 个候选的 http-proxy 无效: %w", where, i, err)
 			}
 		}
-		// 候选级上游凭据：username 必填（trim 后非空）；password 允许空串（个别 registry
-		// 支持空密码账号）。凭据不打印、不进错误信息，避免泄漏
+		// 候选级上游凭据：先做 ${VAR} 环境变量引用展开（不明文方案），再校验 username
+		// 必填（trim 后非空）；password 允许空串（个别 registry 支持空密码账号）。
+		// 凭据不打印、不进错误信息，避免泄漏
+		expandCandidateAuthEnv(list[i].Auth)
 		if err := validateCandidateAuth(list[i].Auth, fmt.Sprintf("%s 第 %d 个候选的 auth", where, i)); err != nil {
 			return err
 		}

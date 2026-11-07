@@ -146,3 +146,46 @@ func TestCandidateAuthResolution(t *testing.T) {
 		t.Errorf("无任何 auth 来源时候选应为匿名（nil）, got %+v", got)
 	}
 }
+
+// TestCandidateAuthEnvExpansion 不明文方案：password/username 的 ${VAR} 环境变量引用
+// 展开（仅显式 ${..} 形态；纯文本含 $ 原样保留，避免字面量密码被误展开）。
+func TestCandidateAuthEnvExpansion(t *testing.T) {
+	t.Setenv("HL_HOULANG_TOKEN", "tok-secret-123")
+	t.Setenv("HL_HOULANG_USER", "real-user@example.com")
+	data := "url-redirect:\n" +
+		"  - template: https://m.example.com/$1\n" +
+		"    auth:\n" +
+		"      username: \"${HL_HOULANG_USER}\"\n" +
+		"      password: \"${HL_HOULANG_TOKEN}\"\n" +
+		"  - template: https://n.example.com/$1\n" +
+		"    auth:\n" +
+		"      username: plain$user\n" + // 纯文本含 $（非 ${..} 形态）：原样保留
+		"      password: \"pw$123\"\n"
+	var cfg Config
+	if err := yaml.Unmarshal([]byte(data), &cfg); err != nil {
+		t.Fatalf("解析意外报错: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate 意外报错: %v", err)
+	}
+	if got := cfg.URLRedirect[0].Auth; got.Username != "real-user@example.com" || got.Password != "tok-secret-123" {
+		t.Errorf("候选0 凭据应展开环境变量, got %+v", got)
+	}
+	if got := cfg.URLRedirect[1].Auth; got.Username != "plain$user" || got.Password != "pw$123" {
+		t.Errorf("候选1 纯文本凭据应原样保留, got %+v", got)
+	}
+
+	// 引用的变量不存在：展开为空串 → username 必填校验拦下（快速失败而非静默匿名）
+	var cfg2 Config
+	data2 := "url-redirect:\n" +
+		"  - template: https://m.example.com/$1\n" +
+		"    auth:\n" +
+		"      username: \"${HL_NOT_SET_AT_ALL}\"\n" +
+		"      password: x\n"
+	if err := yaml.Unmarshal([]byte(data2), &cfg2); err != nil {
+		t.Fatalf("解析意外报错: %v", err)
+	}
+	if err := cfg2.Validate(); err == nil {
+		t.Error("引用不存在的环境变量导致 username 为空，应启动报错")
+	}
+}

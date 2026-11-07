@@ -303,6 +303,11 @@ url-redirect:
   #   auth:
   #     username: demo@gmail.com
   #     password: "访问令牌（令牌当密码用）"
+  #   # 不明文写法：password 用 ${环境变量} 引用，令牌经容器环境变量注入不落配置文件
+  #   #（仅 ${VAR} 显式形态展开；纯文本即使含 $ 也原样保留）：
+  #   # auth:
+  #   #   username: demo@gmail.com
+  #   #   password: "${HL_HOULANG_TOKEN}"   # 启动容器时 -e HL_HOULANG_TOKEN=真实令牌
 
 # 缓存配置
 # 注意：整块注释掉 cache: 并不等于关闭缓存！未配置时启用内置默认值
