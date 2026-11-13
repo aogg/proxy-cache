@@ -55,8 +55,12 @@
 //     起点 >0 但 起点 > 半截长度（中间缺一段，不能凭空补）——维持旧版 206 透传，只打
 //     Warn 说明缺口大小；
 //     no-cache / 关缓存等 BYPASS 请求维持既有行为；
-//   - 续传路径不叠加 slowdownload 慢速升级多源并发续传（与预取一路同一取舍：上游速率
-//     由续传那一路决定，过慢靠截断 + docker Range 重试兜底）。
+//   - 续传路径**接入**时间驱动的多源并发补充（与客户端主路径同一套
+//     判定/合并器，见 slowdownload.go 的 timeBlobSupplement）：续传执行方每满
+//     blob-concurrency-interval 且该层未完成，就向尚未加入的候选源补充并发 Range 续传
+//     （只做加法、客户端无感、不切状态码）；判速触发（slow-download-speed）在续传路径
+//     同样生效。此前本路径「不叠加 slowdownload 升级」，现场故障（1.32GiB 单层断流后走
+//     续传）因此仍然只有单路下载。
 //
 // 生命周期：
 //   - 产生：客户端主路径流式回源失败（stream.go「commit 后读上游失败」与「客户端断开
@@ -516,8 +520,9 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 // 让调用方走旧版 206 透传。
 //
 // 返回值语义与 fetchViaCandidatesStreaming 一致：committed=true 表示已向客户端写出
-// 响应头（调用方不得再 writeError）。不叠加 slowdownload 慢速升级多源并发续传
-// （取舍见文件头边界说明）。
+// 响应头（调用方不得再 writeError）。多源并发补充：时间驱动（blob-concurrency-interval）
+// 每满间隔向尚未加入的候选源增量补充并发 Range 续传（复用同一 slowMerger，客户端仍是
+// 一条连续的流）；判速触发（slow-download-speed）同样生效——两者共用「加入新源」逻辑。
 func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key, target, digest string, eff config.Options, disk *cache.Cache, start time.Time, finalize func(*cache.Entry), cr ...blobRangeSpec) (*cache.Entry, bool, error) {
 	// docker 日志统一标签：续传请求必然是 /v2/ blob 目标，按需解析 image/digest
 	//（本函数全部执行方日志统一 source=resume，见 log_attrs.go）
@@ -636,6 +641,10 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		graceMu      sync.Mutex
 		graceTimer   *time.Timer
 		graceAborted bool
+		// graceMerger 宽限到期时要一并终止的多源合并器（时间驱动补充启用后非 nil）：
+		// 由续传读循环在升级时登记（graceMu 保护），宽限到期回调据此逐路关闭全部上游源
+		//（客户端已断开又无人搭车时，多源并发的每一路都不该继续占带宽）。
+		graceMerger *slowMerger
 	)
 	// stopGrace 停掉宽限计时器（幂等）：读循环与 fail 的每个收场出口调用，防止计时器
 	// 在收场后误触发，timer goroutine 不泄漏。
@@ -662,7 +671,12 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			return // 宽限期内来了订阅者：放弃终止，继续拉（订阅者还要收增量）
 		}
 		graceAborted = true
+		merger := graceMerger // 锁内取：续传读循环升级时在同一把锁下登记
 		graceMu.Unlock()
+		// 多源并发补充过：宽限到期必须逐路关闭全部上游源（含尚未定局的 pending 续传源）
+		if merger != nil {
+			merger.abortAll("续传客户端断开且宽限期内无搭车订阅者，终止全部上游源")
+		}
 		upRes.Close()
 	}
 
@@ -684,15 +698,61 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 此后响应头固化，任何失败只能截断本次响应（docker 以 Range 重试，下次从更长前缀
 	// 续传——进度不回退）
 	s.commitResumeHeader(w, hdr, upRes.url, total, cr...)
+
+	// 时间驱动的单层 blob 多源并发补充（续传执行方，日志 source=resume）：
+	// 与客户端主路径同一套判定/合并器（slowdownload.go 的 timeBlobSupplement）。此前本
+	// 路径明确「不叠加 slowdownload 慢速升级」，现场故障里断流后走续传仍然只有单路——现
+	// 接入：每满 blob-concurrency-interval 且该层未完成，就向尚未加入的候选源补充并发
+	// Range 续传（只做加法、客户端无感、不切状态码）。总长优先取上游 206 的
+	// Content-Range，拿不到用 manifest 记录的 layer size 兜底（与客户端主路径一致）。
+	resumeKnownTotal, resumeTotalSource := total, blobTotalSourceUpstream
+	if resumeKnownTotal <= 0 {
+		if v, ok := s.manifestBlobSize(digest); ok && v > 0 {
+			resumeKnownTotal, resumeTotalSource = v, blobTotalSourceManifest
+		} else {
+			resumeTotalSource = blobTotalSourceUnknown
+		}
+	}
+	resumeEnd := int64(-1) // 续传区间终点（<0 = 开区间到对象末尾）
+	if resumeKnownTotal > n {
+		resumeEnd = resumeKnownTotal - 1
+	}
+	resumeStartedAt := time.Now()
+	blobTrack := newBlobConcurrencyTrack(
+		eff.RuleType == config.RuleTypeDocker && eff.BlobConcurrencyInterval > 0,
+		resumeStartedAt, eff.BlobConcurrencyInterval)
+	var blobConc blobSupplementInput
+	if blobTrack != nil {
+		blobConc = blobSupplementInput{
+			r:           r,
+			res:         upRes, // 胜者活体（升级时并入合并器首位）
+			labels:      labels,
+			logSource:   dockerLogSourceResume,
+			eff:         eff,
+			candidates:  candidates,
+			startedAt:   resumeStartedAt,
+			knownTotal:  resumeKnownTotal,
+			totalSource: resumeTotalSource,
+			end:         resumeEnd,
+		}
+	}
+
 	startArgs := labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n, "total", total,
-		"candidate", truncate(upRes.url, 300), "check", eff.SuccessCheck)
+		"total_source", resumeTotalSource, "candidate", truncate(upRes.url, 300),
+		"candidates", len(candidates), "sources", 1, "check", eff.SuccessCheck)
 	if isolatedGap > 0 {
 		startArgs = append(startArgs, "isolated_gap", isolatedGap.Round(time.Millisecond).String())
 	}
 	if hasRange {
 		startArgs = append(startArgs, "range_start", clientStart, "range_end", clientLast)
 	}
-	s.log.Info("blob 半截续传开始（回放半截前缀+实时拼接剩余区间，上游仅此一路 Range 续传）", startArgs...)
+	s.log.Info("blob 半截续传开始（回放半截前缀+实时拼接剩余区间，按候选轮询选定一路 Range 续传，可按间隔补充多源）", startArgs...)
+	if reason := blobConcurrencyOffReason(eff); reason != "" {
+		// 时间驱动补充未启用的一次性原因留痕（disabled / not_docker_rule）
+		s.log.Info("未补充多源并发",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "candidate", truncate(upRes.url, 300),
+				"reason", reason, "candidates", len(candidates))...)
+	}
 
 	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始写即登记
 	// source=resume，初始已下载字节 = 半截前缀 n（进度不回退，percent 直接对总长），
@@ -820,7 +880,10 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 上游剩余区间流式读取：经 progressReader 记入看门狗（read-timeout「无新增数据」
 	// 语义与客户端流式路径一致）；客户端写失败（已断开）按宽限语义处置——宽限到期仍无
 	// 搭车订阅者则终止上游读取（下方宽限终止出口），其余情况维持「继续读完只填缓存」
-	//（半截与广播照常推进，等待中的搭车订阅者不受影响）
+	//（半截与广播照常推进，等待中的搭车订阅者不受影响）。
+	// 时间驱动的多源并发补充在此判定：首轮满足条件即建合并器接手胜者连接（break 转入
+	// 下方有序合并循环），合并阶段再按同一节拍继续增量加源（只做加法，绝不切源）。
+	var resMerger *slowMerger
 	if upRes.body != nil {
 		pr := &progressReader{r: upRes.body, wd: upRes.wd}
 		buf := make([]byte, streamChunkSize)
@@ -833,6 +896,25 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			}
 			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
 				emitProgress(time.Now())
+			}
+			if blobTrack != nil && rdErr == nil {
+				if round, due := blobTrack.due(time.Now()); due {
+					blobConc.round = round
+					blobConc.now = time.Now()
+					blobConc.bytes = int64(accum.Len())
+					blobConc.offset = written
+					blobConc.clientGone = !clientOK
+					if s.timeBlobSupplement(&blobConc) {
+						// 首轮补充：胜者当前连接并入合并器（天然从 written 继续），其余候选
+						// 并发 Range 续传；客户端仍是同一条连续流（状态码/响应头不变）。
+						resMerger = blobConc.merger
+						blobConc.res = nil // 胜者连接已移交合并器：后续判定只做增量加源
+						graceMu.Lock()
+						graceMerger = resMerger // 宽限到期回调据此逐路终止全部上游源
+						graceMu.Unlock()
+						break
+					}
+				}
 			}
 			if rdErr != nil {
 				if errors.Is(rdErr, io.EOF) {
@@ -864,7 +946,63 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			}
 		}
 	}
-	stopGrace() // 正常 EOF 收场：停掉宽限计时器（幂等；宽限终止与 EOF 竞态以先到者为准）
+
+	// //////////////////  时间驱动补充后的有序合并循环  start  ///////////////////////////////////
+	if resMerger != nil {
+		// 有序合并：胜者（首位，天然从 written 继续）+ 补充的续传源按绝对偏移严格有序交给
+		// writeRemainChunk（追加半截 → 广播增量 → 写客户端与累积缓冲，顺序与单源路径完全
+		// 一致）；合并阶段每满 blob-concurrency-interval 继续增量加源（只做加法）。
+		var chunkErr error
+		_, merr := resMerger.run(func(p []byte) {
+			if chunkErr != nil {
+				return // 写半截已失败：后续块一律丢弃（合并循环随 abortAll 退出）
+			}
+			if aerr := writeRemainChunk(p); aerr != nil {
+				chunkErr = aerr
+				resMerger.abortAll("半截续传写半截文件失败，终止全部上游源")
+			}
+		}, func(now time.Time, live int) {
+			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
+				emitProgress(now)
+			}
+			if blobTrack != nil {
+				if round, due := blobTrack.due(now); due {
+					blobConc.round = round
+					blobConc.now = now
+					blobConc.bytes = int64(accum.Len())
+					blobConc.offset = resMerger.cursor()
+					blobConc.merger = resMerger
+					blobConc.clientGone = !clientOK
+					s.timeBlobSupplement(&blobConc)
+				}
+			}
+		})
+		if chunkErr != nil {
+			return fail(fmt.Errorf("blob 半截续传写半截文件失败（多源合并中）: %w", chunkErr))
+		}
+		// 宽限终止：客户端断开且宽限到期 → onGraceExpired 已 abortAll，合并循环随之退出
+		graceMu.Lock()
+		aborted := graceAborted
+		graceMu.Unlock()
+		if aborted {
+			stopGrace()
+			s.log.Info("blob 半截续传客户端断开且无搭车订阅者，宽限终止续传（半截保留，下次从断点再续）",
+				labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
+					"bytes", accum.Len(), "part_bytes", written,
+					"grace", graceLimit.String(), "subscribers", ent.subscriberCount())...)
+			return fail(errResumeGraceAborted)
+		}
+		if merr != nil {
+			s.log.Error("blob 半截续传读上游失败，终止本次响应（半截已保留，进度不回退）",
+				labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
+					"candidate", truncate(upRes.url, 300),
+					"bytes", accum.Len(), "part_bytes", written, "err", merr)...)
+			return fail(fmt.Errorf("blob 半截续传读上游失败（多源合并）: %w", merr))
+		}
+	}
+	// //////////////////  时间驱动补充后的有序合并循环  end  /////////////////////////////////////
+
+	stopGrace()     // 正常 EOF 收场：停掉宽限计时器（幂等；宽限终止与 EOF 竞态以先到者为准）
 	_ = paf.Close() // 追加完毕；磁盘写为直写（无用户态缓冲），无需 Sync（断电丢失由 Clean 兜底）
 	upRes.Close()   // 幂等：关闭连接、停看门狗、取消超时预算链
 
@@ -917,6 +1055,10 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		"cost", time.Since(start).Round(time.Millisecond).String())
 	if hasRange {
 		doneArgs = append(doneArgs, "range_start", clientStart, "sent", sentBytes)
+	}
+	if resMerger != nil {
+		// 多源并发补充过的流：完成日志补充 sources / alive_sources（与剪枝日志同一组字段）
+		doneArgs = append(doneArgs, "sources", resMerger.sourceCount(), "alive_sources", resMerger.finalAlive())
 	}
 	s.log.Info("blob 半截续传完成（半截前缀+剩余区间拼出完整 blob 并已写缓存）", doneArgs...)
 	s.log.Info("代理请求完成",

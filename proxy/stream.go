@@ -162,13 +162,76 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	// 慢速升级多源并发续传（slow-download escalation）门控与状态：
 	// 仅 type=docker 规则的 GET 路径目标流式回源启用，speed<=0 / window<=0 / max-behind<=0
 	// 视为关闭（未配置时 Options 已带默认值，规则显式 0 = 显式关闭）；窗口计时在循环内
-	// 进行（不满足条件零开销，除窗口计时本身），每流至多升级一次。
+	// 进行（不满足条件零开销，除窗口计时本身）。判速触发是「即时触发」，允许多次补充
+	//（后续补充由下方的时间驱动判定或合并阶段判定完成）。
 	slowEnabled := eff.RuleType == config.RuleTypeDocker &&
 		eff.SlowDownloadSpeed > 0 && eff.SlowDownloadWindow > 0 && eff.SlowDownloadMaxBehind > 0
 	slowWindowAt := committedAt // 判速滑动窗口起点（自 commit 起算）
 	slowWindowBytes := 0        // 窗口起点时已传字节数
-	slowEscalated := false      // 本流是否已升级（每流至多一次）
-	var slowMerger *slowMerger  // 升级后的有序合并器（nil = 未升级）
+	var slowMerger *slowMerger  // 升级后的有序合并器（nil = 仍在单源阶段）
+
+	// 时间驱动的单层 blob 多源并发补充（blob-concurrency-interval，见 slowdownload.go）：
+	// 每满间隔且该层尚未完成就「只做加法」地补充尚未加入的候选源（客户端全程无感）。
+	// **仅 blob 目标**（/v2/<name>/blobs/<digest>，labels.digest 非空）启用——manifest 等
+	// 小目标既没有「单层」语义，也不需要并发补源。
+	// 总长兜底：上游 200 无 Content-Length（现场 1.32GiB 单层故障）时用 manifest 记录的
+	// layer size（digest → size 进程内索引，见 blob_size_index.go）。
+	blobManifestTotal := int64(0)
+	if labels.digest != "" {
+		if v, ok := s.manifestBlobSize(labels.digest); ok {
+			blobManifestTotal = v
+		}
+	}
+	blobTrack := newBlobConcurrencyTrack(
+		labels.digest != "" && eff.RuleType == config.RuleTypeDocker && eff.BlobConcurrencyInterval > 0,
+		committedAt, eff.BlobConcurrencyInterval)
+	// 单源阶段的升级目标区间：胜者响应 + manifest 兜底解析一次即可（响应头不变），
+	// 之后每次判定只按「已写字节数」推进 offset。总长不可知（escalatable=false）时
+	// knownTotal=0，判定按 reason=content_length_unknown 留痕。
+	winnerStartAt, knownTotalAt, rangeEndAt, totalSourceAt, escalatable :=
+		slowEscalationTargetWithFallback(res.status, res.header, blobManifestTotal)
+	if labels.digest != "" {
+		// 单层下载开始（blob 目标才输出）：total 取上游声明值（206 取 Content-Range 的
+		// 对象总长），拿不到用 manifest size 兜底，都没有则 unknown（total 不可知时判速/
+		// 时间补充都无法评估剩余量）。
+		startTotal, startTotalSource := knownTotalAt, totalSourceAt
+		if !escalatable {
+			startTotal, startTotalSource = blobManifestTotal, blobTotalSourceManifest
+			if blobManifestTotal <= 0 {
+				startTotalSource = blobTotalSourceUnknown
+			}
+		}
+		s.log.Info("docker blob 单层下载开始（客户端主路径）",
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
+				"status", res.status, "total", startTotal, "total_source", startTotalSource,
+				"candidates", len(candidates), "sources", 1)...)
+		if reason := blobConcurrencyOffReason(eff); reason != "" {
+			// 时间驱动补充未启用的一次性原因留痕（disabled / not_docker_rule）
+			s.log.Info("未补充多源并发",
+				labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
+					"reason", reason, "candidates", len(candidates))...)
+		}
+	}
+	// blobConc 时间驱动补充判定的输入（单源阶段与合并阶段共用同一份，见 slowdownload.go
+	// 的 timeBlobSupplement）：merger 为 in/out，补充后回填合并器。
+	var blobConc blobSupplementInput
+	if blobTrack != nil {
+		blobConc = blobSupplementInput{
+			r:           r,
+			res:         res,
+			labels:      labels,
+			logSource:   dockerLogSourceClient,
+			eff:         eff,
+			candidates:  candidates,
+			startedAt:   committedAt,
+			knownTotal:  knownTotalAt,
+			totalSource: totalSourceAt,
+			end:         rangeEndAt,
+		}
+		if !escalatable {
+			blobConc.knownTotal, blobConc.totalSource = 0, blobTotalSourceUnknown
+		}
+	}
 
 	// //////////////////  边读上游边写客户端与累积缓冲  start  ///////////////////////////////////
 	clientOK := true    // 客户端写失败（docker 已断开）后置 false：不再写客户端
@@ -293,36 +356,60 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			// 窗口满且窗口平均送出速率 < slow-download-speed 判「过慢」，再校验剩余字节
 			//（已知总长 - 当前位置）>= slow-download-min-remaining 与候选数 > 1，全部满足
 			// 才升级（客户端已断开时 clientErr 非 nil，已在上方断开出口终止本流，到不了这里）。
-			if slowEnabled && !slowEscalated && rerr == nil && time.Since(slowWindowAt) >= eff.SlowDownloadWindow {
+			// 判速触发是「即时触发」，与时间驱动补充共用同一套「加入新源」逻辑与同一合并器；
+			// 升级后转入合并循环，后续补充由合并循环里的时间判定继续做（允许多次补充）。
+			if slowEnabled && slowMerger == nil && rerr == nil && time.Since(slowWindowAt) >= eff.SlowDownloadWindow {
 				windowSent := int64(total - slowWindowBytes)
 				windowElapsed := time.Since(slowWindowAt)
 				slowWindowAt = time.Now() // 窗口滚动（触发与否都重新计窗）
 				slowWindowBytes = total
 				if slowEscalationDue(windowSent, windowElapsed, eff.SlowDownloadSpeed) {
-					winnerStart, knownTotal, end, pok := slowEscalationTarget(res.status, res.header)
-					remaining := slowEscalationRemaining(knownTotal, winnerStart, int64(total))
-					if pok && remaining >= eff.SlowDownloadMinRemaining && len(candidates) > 1 {
-						offset := winnerStart + int64(total)
-						rangeHeader := resumeRangeHeader(offset, end)
+					remaining := slowEscalationRemaining(knownTotalAt, winnerStartAt, int64(total))
+					if escalatable && remaining >= eff.SlowDownloadMinRemaining && len(candidates) > 1 {
+						offset := winnerStartAt + int64(total)
 						others := escalationCandidates(candidates, res.url)
 						s.log.Info("下载过慢，升级多源并发续传",
 							labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
-								"bytes", total, "content_length", knownTotal,
+								"bytes", total, "content_length", knownTotalAt,
+								"total_source", totalSourceAt,
 								"window", eff.SlowDownloadWindow.String(),
 								"window_speed", humanBytesPerSec(windowSent, windowElapsed),
 								"sources", len(others)+1)...)
 						// 升级动作：胜者既有连接不中断并入合并，其余全部候选并发 Range 续传
 						//（每候选一个 goroutine，复用 startUpstream 公共底层）
-						slowMerger = s.escalateSlowSources(r, res, winnerStart, others, eff, rangeHeader, int64(total), knownTotal)
-						slowEscalated = true
+						slowMerger = s.escalateSlowSources(r, res, offset, others, eff, knownTotalAt, rangeEndAt,
+							labels, dockerLogSourceClient,
+							"total_source", totalSourceAt, "elapsed", time.Since(committedAt).Round(time.Millisecond).String())
+						// 回填时间驱动判定的输入（合并阶段：res 连接已移交合并器，只做增量加源）
+						blobConc.merger = slowMerger
+						blobConc.knownTotal, blobConc.totalSource, blobConc.end = knownTotalAt, totalSourceAt, rangeEndAt
 						break // 转入下方有序合并循环（胜者 body 保持活体移交）
 					}
 					s.log.Debug("流式回源判慢但暂不满足升级条件",
 						labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
 							"window_speed", humanBytesPerSec(windowSent, windowElapsed),
 							"speed", humanBytesPerSec(eff.SlowDownloadSpeed, time.Second),
-							"known_total", knownTotal, "remaining", remaining,
+							"known_total", knownTotalAt, "remaining", remaining, "total_source", totalSourceAt,
 							"min_remaining", eff.SlowDownloadMinRemaining, "candidates", len(candidates))...)
+				}
+			}
+			// 时间驱动的多源并发补充判定（与进度日志同一节拍；每满 blob-concurrency-interval
+			// 一次）：单源阶段首次满足即建合并器接手胜者连接（break 转入下方合并循环），
+			// 之后每轮继续判定并把尚未加入的候选源增量补进同一合并器（只做加法，不切源）。
+			// 这条通道不依赖速率与 Content-Length（总长可用 manifest size 兜底），专治
+			// 「上游 200 无 Content-Length → 判速升级被静默跳过」的现场故障。
+			if blobTrack != nil && rerr == nil {
+				if round, due := blobTrack.due(time.Now()); due {
+					blobConc.round = round
+					blobConc.now = time.Now()
+					blobConc.bytes = int64(total)
+					blobConc.offset = winnerStartAt + int64(total)
+					blobConc.clientGone = clientErr != nil
+					if s.timeBlobSupplement(&blobConc) {
+						slowMerger = blobConc.merger
+						blobConc.res = nil // 胜者连接已移交合并器：后续判定只做增量加源
+						break
+					}
 				}
 			}
 			if rerr != nil {
@@ -346,11 +433,24 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		// 有序合并：胜者（首位，天然从当前 total 继续）+ 全部续传源按绝对偏移严格有序
 		// 写给客户端与 accum；落后源按 max-behind 剪枝收敛带宽放大；游标推进到已知总长
 		// 走既有 EOF 收尾，全部源耗尽未到总长按「commit 后读上游失败」语义终止。
+		// 时间驱动补充在此继续：每满 blob-concurrency-interval 把尚未加入的候选源增量
+		// 补进同一合并器（只做加法，绝不切换/中断已在下载的源）。
 		if _, merr := slowMerger.run(writeOut, func(now time.Time, live int) {
 			// 与单源读循环同一节拍：仅到 progress-interval 间隔才输出；
 			// 升级后追加 sources 字段输出当前存活源数
 			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
 				emitProgress(now, "sources", live)
+			}
+			if blobTrack != nil {
+				if round, due := blobTrack.due(now); due {
+					blobConc.round = round
+					blobConc.now = now
+					blobConc.bytes = int64(total)
+					blobConc.offset = slowMerger.cursor()
+					blobConc.merger = slowMerger
+					blobConc.clientGone = clientErr != nil
+					s.timeBlobSupplement(&blobConc)
+				}
 			}
 		}); clientErr != nil {
 			// 断开即停：多源合并中的客户端断开——writeOut 已调 abortAll 逐路关闭全部上游
@@ -386,18 +486,26 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	}
 
 	// //////////////////  成功返回日志（字段与 serveEntry 兼容）  start  /////////////////////////
+	// 多源并发补充过的流：完成日志补充 sources / alive_sources（源总数与收尾时存活源数），
+	// 与剪枝日志同一组字段名，便于聚合「一次下载总共用了几路源、收尾时还剩几路」。
+	var concAttrs []any
+	if slowMerger != nil {
+		concAttrs = []any{"sources", slowMerger.sourceCount(), "alive_sources", slowMerger.finalAlive()}
+	}
+	// okArgs 组装「成功返回内容」类日志的字段（状态 200/206 共用，extra 追加多源字段）
+	okArgs := func(extra ...any) []any {
+		fields := []any{"rule", eff.Rule, "upstream", source, "status", res.status,
+			"bytes", total, "cache", cacheStatus}
+		return labels.attrs(dockerLogSourceClient, append(fields, extra...)...)
+	}
 	switch {
 	case res.status == http.StatusPartialContent:
-		s.log.Info("成功返回内容（Range 206 流式透传，不写缓存）",
-			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "upstream", source, "status", res.status,
-				"bytes", total, "cache", cacheStatus)...)
+		s.log.Info("成功返回内容（Range 206 流式透传，不写缓存）", okArgs(concAttrs...)...)
 	case res.status == http.StatusNotModified:
 		s.log.Info("内容未变更（304），客户端缓存副本有效",
 			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "upstream", source, "cache", cacheStatus)...)
 	case res.status == http.StatusOK && total > 0:
-		s.log.Info("成功返回内容",
-			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "upstream", source, "status", res.status,
-				"bytes", total, "cache", cacheStatus)...)
+		s.log.Info("成功返回内容", okArgs(concAttrs...)...)
 	}
 	s.log.Info("代理请求完成",
 		labels.attrs(dockerLogSourceClient,

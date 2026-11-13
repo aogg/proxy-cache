@@ -161,6 +161,14 @@ var logKeyZh = map[string]string{
 	"err":   "错误",
 	"error": "错误信息",
 	"panic": "异常",
+
+	// 多源并发补充（时间驱动 blob-concurrency-interval 与判速触发共用）
+	"alive_sources":   "存活源数",
+	"joined_sources":  "已并入源数",
+	"pending_sources": "待并入源数",
+	"added":           "本次加入源",
+	"rate":            "平均速率",
+	"total_source":    "总长来源",
 }
 
 // ReplaceAttr 给 TextHandler 用的键名改写钩子：把英文键名渲染成「英文(中文)」。

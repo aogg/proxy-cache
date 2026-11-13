@@ -1,8 +1,18 @@
-// slowdownload.go —— 慢速升级多源并发续传（slow-download escalation）：
+// slowdownload.go —— 慢速升级多源并发续传（slow-download escalation）与时间驱动的
+// 单层 blob 多源并发补充（blob-concurrency-interval）共用一套「加入新源 + 有序合并」：
 // docker 类（type=docker 规则）GET 路径目标流式回源 commit 后，滑动窗口平均送出速率
 // 低于 slow-download-speed 判「过慢」且剩余量足够、候选数>1 时，向其余全部候选并发发起
 // `Range: bytes={offset}-{end}` 续传，胜者既有连接不中断并入合并；合并循环按绝对偏移
 // 严格有序写给客户端与 accum（缓存语义不变），落后的源按 max-behind 剪枝关闭收敛带宽放大。
+//
+// 时间驱动补充（线上真实故障的直接对策）：客户端主路径与半截续传执行方每满
+// blob-concurrency-interval（默认 5m，0 = 关闭）且该层尚未下载完成，就**只做加法**地
+// 向尚未加入合并的候选源补充并发 Range 续传（复用同一 slowMerger；不切换/不中断已在
+// 下载的源、客户端无感、下完前一直保持并发）。首轮与之后的每一轮都走同一个
+// timeBlobSupplement 判定（日志 reason 枚举 / joined_sources / pending_sources 统一）。
+// 动机：1.32GiB 单层 blob 的上游 200 响应没有 Content-Length → 判速升级因「剩余量不可知」
+// 被静默跳过，只有一路 53KB/s 硬拉 19 分钟；断流后又走半截续传路径，而续传路径当时不
+// 叠加多源升级 → 仍然只有单路。总长不可知的兜底见 blob_size_index.go（manifest size）。
 //
 // 连续性保证不变：升级只增开续传源，绝不动客户端已见字节（不切状态码/响应头，不回退）。
 // 每源读继续走 progressReader+watchdog（无新增数据超时语义不变）；候选并发数上限 =
@@ -12,6 +22,10 @@
 // abortAll 逐路关闭全部上游源（含尚未定局的 pending 续传源），合并循环随即自然退出——
 // 断开后不再有「继续读源填缓存」，半截保留与运维事件留痕由调用方统一收尾（stream.go
 // clientGoneAbort）。
+//
+// 日志规范：本文件的判定/动作日志按调用方传入的 logSource 标注 source（client / resume，
+// 续传执行方路径同一套判定日志；见 log_attrs.go 的统一键序与 partial_resume.go 的续传
+// 执行方接入）。
 
 package proxy
 
@@ -94,6 +108,255 @@ func slowEscalationTarget(status int, header http.Header) (winnerStart, knownTot
 		return start, total, e, true
 	}
 	return 0, 0, 0, false
+}
+
+// blob 多源并发补充（时间驱动 + 判速触发共用「加入新源」逻辑）的日志枚举：键名固定，
+// 便于运维按 reason 聚合检索「为什么没有补充源」。
+const (
+	// blobAddReasonDisabled 时间驱动补充被关闭：blob-concurrency-interval<=0 且
+	// slow-download-speed<=0（两条触发通道都没开）。
+	blobAddReasonDisabled = "disabled"
+	// blobAddReasonNotDockerRule 命中规则不是 type=docker（slow-download-* 与
+	// blob-concurrency-interval 都只在 type=docker 规则的流式回源上生效）。
+	blobAddReasonNotDockerRule = "not_docker_rule"
+	// blobAddReasonTotalUnknown 总长不可知：上游响应无 Content-Length（也非 206）且
+	// manifest 里没有该 digest 的 size 记录 → 无法判定「剩余量」，无法安全并发续传。
+	blobAddReasonTotalUnknown = "content_length_unknown"
+	// blobAddReasonCandidatesLT2 候选源不足 2 个（只有当前一路，无从并发）。
+	blobAddReasonCandidatesLT2 = "candidates_lt_2"
+	// blobAddReasonAllJoined 全部候选源都已在合并器内（本次没有可补充的新源）。
+	blobAddReasonAllJoined = "all_joined"
+	// blobAddReasonClientGone 客户端已断开（下载已按断开即停终止，不再补源）。
+	blobAddReasonClientGone = "client_gone"
+	// blobAddReasonNoRange 该源不支持 Range（对续传请求回 200 全量）——该源被跳过并留痕。
+	blobAddReasonNoRange = "upstream_no_range"
+	// blobAddReasonRemainingSmall 剩余字节不足 slow-download-min-remaining（尾巴太小，
+	// 并发拉满没有收益）。
+	blobAddReasonRemainingSmall = "remaining_too_small"
+)
+
+// blob 层下载「已知总长」的来源枚举（日志 total_source 字段）：
+const (
+	// blobTotalSourceUpstream 总长来自上游响应（Content-Length / Content-Range）。
+	blobTotalSourceUpstream = "upstream"
+	// blobTotalSourceManifest 总长来自 manifest 记录的 layer size（上游无 Content-Length
+	// 时的兜底，见 blob_size_index.go）。
+	blobTotalSourceManifest = "manifest"
+	// blobTotalSourceUnknown 总长不可知（上游未声明且 manifest 无记录）。
+	blobTotalSourceUnknown = "unknown"
+)
+
+// slowEscalationTargetWithFallback slowEscalationTarget 的「总长可兜底」版本：
+// 上游 200 响应没有 Content-Length 时用 manifest 记录的 layer size 兜底 knownTotal
+//（线上故障：1.32GiB 单层上游 200 无 Content-Length → 判速升级被静默跳过，只有一路
+// 53KB/s 硬拉 19 分钟）。返回的 totalSource 标注总长来源（upstream / manifest；
+// ok=false 时视为 unknown）。206 分支语义不变：起点与区间终点只能来自 Content-Range
+//（上游 206 必带可解析 Content-Range 才算合规，见 validateResumeResponse）。
+func slowEscalationTargetWithFallback(status int, header http.Header, manifestTotal int64) (winnerStart, knownTotal, end int64, totalSource string, ok bool) {
+	winnerStart, knownTotal, end, ok = slowEscalationTarget(status, header)
+	if ok {
+		return winnerStart, knownTotal, end, blobTotalSourceUpstream, true
+	}
+	if status == http.StatusOK && manifestTotal > 0 {
+		return 0, manifestTotal, manifestTotal - 1, blobTotalSourceManifest, true
+	}
+	return 0, 0, 0, blobTotalSourceUnknown, false
+}
+
+// blobConcurrencyOffReason 时间驱动多源并发补充「未启用」的原因（仅用于单层 blob 下载
+// 开始的一次性留痕）：
+//   - 非 type=docker 规则 → not_docker_rule（线上踩过的坑：规则缺 type 时全部慢速/
+//     时间触发参数静默不生效）；
+//   - type=docker 但 blob-concurrency-interval<=0 **且** slow-download-speed<=0 →
+//     disabled（两条触发通道都关了）；
+//   - 其余（至少一条触发通道生效，或只关时间通道但判速仍在）→ 空串，不输出原因日志。
+func blobConcurrencyOffReason(eff config.Options) string {
+	if eff.RuleType != config.RuleTypeDocker {
+		return blobAddReasonNotDockerRule
+	}
+	if eff.BlobConcurrencyInterval <= 0 && eff.SlowDownloadSpeed <= 0 {
+		return blobAddReasonDisabled
+	}
+	return ""
+}
+
+// blobConcurrencyTrack 时间驱动的多源并发补充判定节拍（每层 blob 下载一个）：
+// 首次触发 = 该层下载开始（客户端主路径 commit / 续传执行方 commit）后满 interval，
+// 之后每满 interval 再判一次；读循环因上游停滞阻塞较久而错过时间点时只补一次判定
+//（不做补偿轮次），下一轮从当前时刻重新计时。
+type blobConcurrencyTrack struct {
+	// interval 判定间隔（blob-concurrency-interval 生效值）。
+	interval time.Duration
+	// start 该层下载开始时刻（日志 elapsed 的基线）。
+	start time.Time
+	// nextAt 下一次判定时刻。
+	nextAt time.Time
+	// round 已判定的轮次（1 起，日志字段）。
+	round int
+}
+
+// newBlobConcurrencyTrack 创建判定节拍：enabled=false（非 type=docker / interval<=0）
+// 时返回 nil——调用方按 nil 跳过全部判定（零开销，除一次 nil 判断）。
+func newBlobConcurrencyTrack(enabled bool, start time.Time, interval time.Duration) *blobConcurrencyTrack {
+	if !enabled || interval <= 0 {
+		return nil
+	}
+	return &blobConcurrencyTrack{interval: interval, start: start, nextAt: start.Add(interval)}
+}
+
+// due 判定是否到点：到点返回本次轮次（1 起）与 true，并把下一次判定推到 now+interval。
+func (t *blobConcurrencyTrack) due(now time.Time) (int, bool) {
+	if t == nil || now.Before(t.nextAt) {
+		return 0, false
+	}
+	t.round++
+	t.nextAt = now.Add(t.interval)
+	return t.round, true
+}
+
+// //////////////////  时间驱动补充的判定与动作（单源 / 合并两阶段共用）  //////////////////////
+
+// blobSupplementInput 一次「时间驱动补充」判定的输入（stream.go 客户端主路径与
+// partial_resume.go 续传执行方共用，保证两条路径的判定/日志/动作完全一致）：
+// merger 为 in/out——nil 表示仍在单源阶段（本函数会创建合并器并回填该字段），
+// 非 nil 表示已在有序合并中（本次只做「增量加入尚未加入的源」）。
+type blobSupplementInput struct {
+	// r 客户端请求（建续传源用：请求头白名单 / token dance / 候选级超时全复用）。
+	r *http.Request
+	// res 单源阶段的胜者活体结果（创建合并器时并入首位；合并阶段可为 nil）。
+	res *probeResult
+	// labels docker 日志统一标签（image/digest 等）。
+	labels dockerLogInfo
+	// logSource 日志 source 值（client / resume）。
+	logSource string
+	// eff 生效配置（候选级/规则级/全局已解析）。
+	eff config.Options
+	// candidates 本次请求展开出的全部候选（含当前胜者）。
+	candidates []candidate
+	// round 本次判定轮次（1 起）。
+	round int
+	// now 判定时刻。
+	now time.Time
+	// startedAt 该层下载开始时刻（日志 elapsed 基线）。
+	startedAt time.Time
+	// bytes 该层已写出的绝对字节数（日志 bytes；进度不回退）。
+	bytes int64
+	// offset 下一个期望的绝对偏移（单源 = 胜者起点+已消费；合并 = 由合并器游标另行取）。
+	offset int64
+	// knownTotal 已知对象总长（0 = 不可知）。
+	knownTotal int64
+	// totalSource 总长来源（upstream / manifest / unknown）。
+	totalSource string
+	// end 续传区间终点（<0 = 开区间到对象末尾）。
+	end int64
+	// clientGone 客户端是否已断开（断开即停语义下不再补源）。
+	clientGone bool
+	// merger in/out：nil = 单源阶段；非 nil = 已在有序合并中。
+	merger *slowMerger
+}
+
+// timeBlobSupplement 时间驱动补充的判定与动作（每满 blob-concurrency-interval 调用一次）：
+//  1. 输出 Info「blob 下载 N 分钟未完成，评估多源并发补充」（含 elapsed/bytes/total/
+//     total_source/rate/joined_sources/pending_sources）；
+//  2. 按原因枚举判定能否补充——client_gone / candidates_lt_2 / content_length_unknown /
+//     all_joined / remaining_too_small → Info「未补充多源并发」并带 reason；
+//  3. 可补充时：单源阶段创建合并器（胜者既有连接并入 + 其余全部候选并发 Range 续传，
+//     返回 created=true 让调用方转出单源读循环）；已在合并阶段则只做「增量加入尚未
+//     加入的候选源」（joinSlowSources，绝不切换/中断已在下载的源）。
+//
+// 返回值 created：本次调用是否新建了合并器（调用方据此转入有合并循环的路径）。
+func (s *Server) timeBlobSupplement(in *blobSupplementInput) (created bool) {
+	elapsed := in.now.Sub(in.startedAt)
+	// joined_sources / pending_sources：已加入合并的源数（含胜者）与尚未加入的候选数。
+	joined := 1
+	if in.merger != nil {
+		joined = in.merger.sourceCount()
+	}
+	pending := len(in.candidates) - joined
+	if pending < 0 {
+		pending = 0
+	}
+	minutes := int(elapsed.Minutes() + 0.5)
+	if minutes < 1 {
+		minutes = 1
+	}
+	s.log.Info(fmt.Sprintf("blob 下载 %d 分钟未完成，评估多源并发补充", minutes),
+		in.labels.attrs(in.logSource, "rule", in.eff.Rule,
+			"round", in.round,
+			"elapsed", elapsed.Round(time.Millisecond).String(),
+			"bytes", in.bytes,
+			"total", in.knownTotal,
+			"total_source", in.totalSource,
+			"rate", humanBytesPerSec(in.bytes, elapsed),
+			"joined_sources", joined,
+			"pending_sources", pending)...)
+
+	// 原因判定（顺序 = 优先级）：客户端没了 > 候选不足 > 总长不可知 > 已全加入 > 剩余太小
+	reason := ""
+	candidate := sourceURLOf(in.res)
+	if in.merger != nil {
+		candidate = in.merger.winnerURL()
+	}
+	remaining := int64(-1)
+	switch {
+	case in.clientGone:
+		reason = blobAddReasonClientGone
+	case len(in.candidates) < 2:
+		reason = blobAddReasonCandidatesLT2
+	case in.knownTotal <= 0:
+		reason = blobAddReasonTotalUnknown
+	case pending == 0:
+		reason = blobAddReasonAllJoined
+	default:
+		remaining = in.knownTotal - in.offset
+		if remaining < in.eff.SlowDownloadMinRemaining {
+			reason = blobAddReasonRemainingSmall
+		}
+	}
+	if reason != "" {
+		extra := []any{
+			"rule", in.eff.Rule,
+			"candidate", truncate(candidate, 300),
+			"round", in.round,
+			"reason", reason,
+			"joined_sources", joined,
+			"pending_sources", pending,
+			"bytes", in.bytes,
+			"total", in.knownTotal,
+			"total_source", in.totalSource,
+		}
+		if remaining >= 0 {
+			extra = append(extra, "remaining", remaining, "min_remaining", in.eff.SlowDownloadMinRemaining)
+		}
+		s.log.Info("未补充多源并发", in.labels.attrs(in.logSource, extra...)...)
+		return false
+	}
+
+	others := escalationCandidates(in.candidates, candidate)
+	if in.merger == nil {
+		// 单源阶段：胜者既有连接不中断并入合并（天然从当前偏移继续），其余全部候选
+		// 并发发起 Range 续传；客户端仍是一条连续的流（不切状态码、不回退已发字节）。
+		in.merger = s.escalateSlowSources(in.r, in.res, in.offset, others, in.eff,
+			in.knownTotal, in.end, in.labels, in.logSource,
+			"total_source", in.totalSource, "elapsed", elapsed.Round(time.Millisecond).String())
+		return true
+	}
+	// 合并阶段：只做加法（增量加入尚未加入的候选源，绝不切换/中断已在下载的源）
+	from := in.merger.cursor()
+	if from < in.offset {
+		from = in.offset
+	}
+	s.joinSlowSources(in.r, in.merger, others, in.eff, from, in.end, in.labels, in.logSource,
+		"total_source", in.totalSource, "elapsed", elapsed.Round(time.Millisecond).String())
+	return false
+}
+
+// sourceURLOf 取探测结果的候选 URL（res 为 nil 时返回空串，仅用于日志字段）。
+func sourceURLOf(res *probeResult) string {
+	if res == nil {
+		return ""
+	}
+	return res.url
 }
 
 // windowAvgSpeed 计算窗口平均送出速率（B/s）；d<=0（时钟回拨等异常）返回 0 兜底。
@@ -207,6 +470,11 @@ type slowMerger struct {
 	lastErr error
 	// notify 源状态变化通知（cap 冗余，changed 非阻塞发送，防漏唤醒）。
 	notify chan struct{}
+	// finished 是否已收场（run 的成功/失败出口在关闭源前置位）。
+	finished bool
+	// endedAlive 收尾时刻的存活源数快照（finished=true 后有效；完成日志的
+	// alive_sources 字段据此输出，见 finalAlive）。
+	endedAlive int
 	// log 结构化日志器（剪枝/收尾留痕）。
 	log *slog.Logger
 }
@@ -327,7 +595,11 @@ func (m *slowMerger) take() []byte {
 			m.lastErr = src.err
 		case src.eof && src.bufBytes == 0 && m.next < m.knownTotal:
 			reason = fmt.Sprintf("eof-behind: 上游已尽于 %d，流未完成（%d/%d）", src.readPos, m.next, m.knownTotal)
-		case m.next-src.readPos > m.maxBehind:
+		case !src.pending && m.maxBehind > 0 && m.next-src.readPos > m.maxBehind:
+			// pending（续传尝试尚未定局）不按落后剪枝：时间驱动的「补充源」是在下载已经
+			// 很慢时加入的，其响应头可能比既有源晚到几秒；若按落后剪枝会在它连上之前就把
+			// 它剪掉，等于白加一轮。maxBehind<=0（显式关闭剪枝阈值，仅时间驱动可配到）
+			// 表示不按落后剪枝，仍保留出错 / EOF 落后两条收敛规则。
 			reason = fmt.Sprintf("behind: 落后领先源 %d 字节（max-behind %d）", m.next-src.readPos, m.maxBehind)
 			level = slog.LevelInfo // 超限剪枝是带宽放大收敛的关键动作，Info 留痕
 		}
@@ -383,6 +655,7 @@ func (m *slowMerger) take() []byte {
 			alive++
 		}
 	}
+	total := len(m.sources)
 	m.mu.Unlock()
 	// 锁外收尾：关闭被剪枝源、唤醒可能在等缓冲空间的读取协程、输出剪枝留痕
 	for _, src := range toClose {
@@ -392,9 +665,12 @@ func (m *slowMerger) take() []byte {
 		m.changed() // 有剪枝或缓冲空间释放：唤醒等通知的合并循环/读取协程（防漏唤醒卡死）
 	}
 	for _, e := range events {
+		// sources = 源总数、alive_sources = 存活（未剪枝）源数：补充源后源数会变，
+		// 两个字段一起看才能判断「补充的源是否已经被剪掉了」。
 		m.log.Log(context.Background(), e.level, "慢速升级多源续传源已剪枝",
 			"candidate", truncate(e.name, 300), "reason", e.reason,
-			"next", m.next, "total", m.knownTotal, "live_sources", alive)
+			"next", m.next, "total", m.knownTotal,
+			"sources", total, "alive_sources", alive, "live_sources", alive)
 	}
 	return chunk
 }
@@ -403,6 +679,11 @@ func (m *slowMerger) take() []byte {
 func (m *slowMerger) aliveCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.aliveLocked()
+}
+
+// aliveLocked 统计存活（未剪枝）源数（m.mu 下调用）。
+func (m *slowMerger) aliveLocked() int {
 	alive := 0
 	for _, src := range m.sources {
 		if src.pruned == "" {
@@ -410,6 +691,66 @@ func (m *slowMerger) aliveCount() int {
 		}
 	}
 	return alive
+}
+
+// finalAlive 返回「收尾时刻」的存活源数（供完成日志的 alive_sources 字段）：
+// run 收场时 closeAll 会把全部源置剪枝，之后的 aliveCount 恒为 0——那不是运维想看的
+// 数字（「收尾时还剩几路源在跑」才有意义），因此在收场前记一份快照；run 尚未收场
+//（如被中断）时回落到当前存活数。
+func (m *slowMerger) finalAlive() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.finished {
+		return m.endedAlive
+	}
+	return m.aliveLocked()
+}
+
+// markFinished 记录收尾快照（存活源数），run 的每个收场出口在关闭源之前调用一次（幂等）。
+func (m *slowMerger) markFinished() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.finished {
+		return
+	}
+	m.finished = true
+	m.endedAlive = m.aliveLocked()
+}
+
+// sourceCount 返回合并器内源总数（含已剪枝的——「已在合并中的源」不再重复加入，
+// 日志 sources / joined_sources 字段据此计算）。
+func (m *slowMerger) sourceCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sources)
+}
+
+// cursor 返回当前有序合并游标（下一个期望的绝对偏移）：时间驱动补充源时以此作为
+// 新源的 Range 起点（绝不重复拉取已写给客户端的区间）。
+func (m *slowMerger) cursor() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.next
+}
+
+// winnerURL 返回首位源（胜者）的 URL（日志 candidate 字段用）。
+func (m *slowMerger) winnerURL() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.sources) == 0 {
+		return ""
+	}
+	return m.sources[0].name
+}
+
+// hasSourceLocked 判断某候选 URL 是否已在合并器内（m.mu 下调用；调用方持锁）。
+func (m *slowMerger) hasSourceLocked(url string) bool {
+	for _, src := range m.sources {
+		if src.name == url {
+			return true
+		}
+	}
+	return false
 }
 
 // closeAll 关闭全部仍未剪枝的源（成功收尾 / 失败收尾时统一释放连接与看门狗，幂等）。
@@ -475,7 +816,9 @@ func (m *slowMerger) run(write func([]byte), progress func(now time.Time, live i
 		m.mu.Unlock()
 		if next >= total {
 			// 游标推进到已知总长：完整对象已全部写给客户端与 accum，
-			// 正常走既有 EOF 收尾（finalize 写缓存/206 不写缓存、成功返回日志）
+			// 正常走既有 EOF 收尾（finalize 写缓存/206 不写缓存、成功返回日志）；
+			// 收场前先记存活源快照（完成日志的 alive_sources 才有可读值）
+			m.markFinished()
 			m.closeAll("completed")
 			return next, nil
 		}
@@ -483,6 +826,7 @@ func (m *slowMerger) run(write func([]byte), progress func(now time.Time, live i
 		if live == 0 {
 			// 所有源全部耗尽且未到总长：沿用「commit 后读上游失败」语义
 			//（Error 日志、终止响应、不写缓存，由调用方返回错误）
+			m.markFinished()
 			return next, fmt.Errorf("多源并发续传所有源耗尽，未达已知总长（%d/%d 字节）: 最后错误: %v",
 				next, total, m.lastErr)
 		}
@@ -497,40 +841,98 @@ func (m *slowMerger) run(write func([]byte), progress func(now time.Time, live i
 
 // //////////////////  升级动作（Server 入口）  ////////////////////////////////////////////////
 
-// escalateSlowSources 升级动作（触发时调用一次）：
+// resumeRangeHeaderTail 构造续传 Range 头：end>=0 且有界时 bytes={offset}-{end}，
+// 否则 bytes={offset}-（开区间到对象末尾）——总长不可知时也能按「从断点拉到末尾」续传。
+func resumeRangeHeaderTail(offset, end int64) string {
+	if end < 0 || end < offset {
+		return fmt.Sprintf("bytes=%d-", offset)
+	}
+	return resumeRangeHeader(offset, end)
+}
+
+// escalateSlowSources 单源阶段的升级动作（判速触发与时间驱动的首轮补充共用）：
 //   - 胜者既有连接不中断，作为首个源并入合并（天然从当前已传偏移继续）；
 //   - 其余全部候选（排除胜者；此前竞速中硬失败的候选也照常尝试）**并发**发起
 //     `Range: bytes={offset}-{end}` 续传——每个候选一个 goroutine（候选并发数上限 =
 //     候选列表长度），尝试本体复用 startUpstream 公共底层（请求头白名单、docker token
 //     dance、看门狗、read/http-timeout、候选级 insecure），严禁另复制一份 dance 逻辑。
 //
-// 返回的合并器已开始异步填充（胜者与已定局续传源的 pump 运行中，未定局源保持 pending）。
-func (s *Server) escalateSlowSources(r *http.Request, winner *probeResult, winnerStart int64, others []candidate, eff config.Options, rangeHeader string, consumed, knownTotal int64) *slowMerger {
-	offset := winnerStart + consumed
+// offset 为「下一个期望的绝对偏移」（胜者起点 + 已消费字节数）；end 为续传区间终点
+//（<0 = 开区间到对象末尾）。返回的合并器已开始异步填充（胜者与已定局续传源的 pump
+// 运行中，未定局源保持 pending）。加入动作的 Info 日志由 joinSlowSources 统一输出。
+func (s *Server) escalateSlowSources(r *http.Request, winner *probeResult, offset int64, others []candidate, eff config.Options, knownTotal, end int64, labels dockerLogInfo, logSource string, extra ...any) *slowMerger {
 	sources := make([]*slowSource, 0, len(others)+1)
 	// 胜者源：既有连接不中断（编号首位，合并时天然优先持有下一期望偏移）
-	sources = append(sources, &slowSource{name: winner.url, start: winnerStart, readPos: offset, res: winner})
-	// 其余全部候选：pending 占位占住候选顺序，续传尝试由下方 goroutine 并发完成
-	for _, cand := range others {
-		sources = append(sources, &slowSource{name: cand.url, start: offset, readPos: offset, pending: true})
-	}
+	sources = append(sources, &slowSource{name: winner.url, start: offset, readPos: offset, res: winner})
 	m := newSlowMerger(sources, offset, knownTotal, eff.SlowDownloadMaxBehind, s.log)
-	for i := range others {
-		cand, src := others[i], sources[i+1]
-		go func() {
-			s.settleSlowResume(r, src, m, cand, eff, rangeHeader, offset)
-			m.changed() // 定局通知（成功/失败皆然），合并循环免去 200ms tick 等待
-		}()
+	if len(others) > 0 {
+		s.joinSlowSources(r, m, others, eff, offset, end, labels, logSource, extra...)
 	}
 	return m
 }
 
-// settleSlowResume 单个候选的 Range 续传尝试（escalateSlowSources 的 goroutine 内执行）：
+// joinSlowSources 向合并器增量加入候选源（时间驱动补充与判速触发共用同一套「加入新源」
+// 逻辑，实现「允许多次补充」）：
+//   - 去重：已在合并器内的源（胜者 / 此前已加入的候选，含已被剪枝的）直接跳过——绝不
+//     重复拉取同一候选，也绝不切换/中断已在下载的源（只做加法）；
+//   - 每个新源以 offset 为 Range 起点（= 合并游标，已写给客户端的字节边界，绝不重复
+//     拉取已送出区间）、end 为终点（<0 = 开区间到对象末尾）并发发起续传；尝试本体复用
+//     startUpstream 公共底层与既有 206/Content-Range 校验（见 settleSlowResume）；
+//   - 加入动作输出 Info「补充多源并发下载」（added 列出本次加入的源、sources 计数），
+//     extra 追加调用方字段（total_source / elapsed 等）。返回本次真正加入的候选 URL。
+func (s *Server) joinSlowSources(r *http.Request, m *slowMerger, cands []candidate, eff config.Options, offset, end int64, labels dockerLogInfo, logSource string, extra ...any) (added []string) {
+	rangeHeader := resumeRangeHeaderTail(offset, end)
+	var picked []candidate
+	var fresh []*slowSource
+	m.mu.Lock()
+	for _, cand := range cands {
+		if m.hasSourceLocked(cand.url) {
+			continue // 已在合并中（含已被剪枝的）：不重复加入
+		}
+		src := &slowSource{name: cand.url, start: offset, readPos: offset, pending: true}
+		m.sources = append(m.sources, src)
+		picked = append(picked, cand)
+		fresh = append(fresh, src)
+	}
+	joined := len(m.sources)
+	m.mu.Unlock()
+	if len(fresh) == 0 {
+		return nil // 全部候选都已在合并中：本次没有可补充的新源（调用方已留痕 all_joined）
+	}
+	for i := range picked {
+		cand, src := picked[i], fresh[i]
+		go func() {
+			s.settleSlowResume(r, src, m, cand, eff, rangeHeader, offset, labels, logSource)
+			m.changed() // 定局通知（成功/失败皆然），合并循环免去 200ms tick 等待
+		}()
+	}
+	added = make([]string, 0, len(picked))
+	for _, c := range picked {
+		added = append(added, c.url)
+	}
+	args := []any{
+		"rule", eff.Rule,
+		"added", truncate(strings.Join(added, " "), 900),
+		"sources", len(added),
+		"joined_sources", joined,
+		"alive_sources", m.aliveCount(),
+		"offset", offset,
+		"total", m.knownTotal,
+	}
+	args = append(args, extra...)
+	s.log.Info("补充多源并发下载", labels.attrs(logSource, args...)...)
+	return added
+}
+
+// settleSlowResume 单个候选的 Range 续传尝试（joinSlowSources 的 goroutine 内执行）：
 // 复用 startUpstream 公共底层（与候选探测同一套请求头/token dance/看门狗/超时/insecure）。
 // 响应必须 206 且 Content-Range 起始等于请求偏移，否则丢弃该源；尝试失败同样只置 err
-// （合并循环剪枝留 debug 痕）——绝不影响胜者流与客户端已见字节。成功且有活体 body 时
-// 由本协程启动该源的 pump。全部状态写入在 m.mu 下进行（与合并循环并发安全）。
-func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerger, cand candidate, eff config.Options, rangeHeader string, offset int64) {
+// （合并循环剪枝留 debug 痕）——绝不影响胜者流与客户端已见字节。源不支持 Range（回
+// 200 全量）时额外输出 Info「未补充多源并发」reason=upstream_no_range（该源被跳过），
+// 其余失败保留既有 Debug 留痕。成功且有活体 body 时由本协程启动该源的 pump。
+// 全部状态写入在 m.mu 下进行（与合并循环并发安全）。labels/logSource 为 docker 日志
+// 统一标签（image/digest + source=client|resume），与判定日志同一套键序。
+func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerger, cand candidate, eff config.Options, rangeHeader string, offset int64, labels dockerLogInfo, logSource string) {
 	// 与客户端断开解耦（WithoutCancel）：docker 已断开也继续填缓存（与胜者流同一语义）
 	res, err := s.startUpstream(context.WithoutCancel(r.Context()), r, cand, eff, rangeHeader, nil, nil)
 	if err != nil {
@@ -538,7 +940,8 @@ func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerge
 		src.err = err
 		m.mu.Unlock()
 		s.log.Debug("慢速升级续传候选请求失败，该源将被剪枝",
-			"candidate", truncate(cand.url, 300), "range", rangeHeader, "err", err)
+			labels.attrs(logSource, "candidate", truncate(cand.url, 300), "range", rangeHeader, "err", err,
+				"sources", m.sourceCount(), "alive_sources", m.aliveCount())...)
 		return
 	}
 	if verr := validateResumeResponse(res.status, res.header, offset); verr != nil {
@@ -546,8 +949,17 @@ func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerge
 		m.mu.Lock()
 		src.err = verr
 		m.mu.Unlock()
+		if res.status == http.StatusOK {
+			// 该源不支持 Range（对 bytes=N- 回 200 全量）：跳过该源并留痕 reason
+			// upstream_no_range——绝不能把全量响应拼到已发字节后面（数据错位）。
+			s.log.Info("未补充多源并发",
+				labels.attrs(logSource, "rule", eff.Rule, "candidate", truncate(cand.url, 300),
+					"reason", blobAddReasonNoRange, "status", res.status, "offset", offset,
+					"range", rangeHeader, "sources", m.sourceCount(), "alive_sources", m.aliveCount())...)
+		}
 		s.log.Debug("慢速升级续传响应不合规，丢弃该源",
-			"candidate", truncate(cand.url, 300), "status", res.status, "offset", offset, "err", verr)
+			labels.attrs(logSource, "candidate", truncate(cand.url, 300), "status", res.status, "offset", offset,
+				"err", verr)...)
 		return
 	}
 	m.mu.Lock()

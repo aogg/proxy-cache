@@ -69,6 +69,12 @@ const (
 	// DefaultSlowDownloadMaxBehind 多源合并的剪枝阈值缺省值：8MB（某源落后领先源超过
 	// 该字节数即被剪枝关闭，收敛多源并发带来的带宽放大）。
 	DefaultSlowDownloadMaxBehind = 8 << 20
+	// DefaultBlobConcurrencyInterval 时间驱动的单层 blob 多源并发补充间隔缺省值：5m。
+	// 单层 blob 下载（客户端主路径与半截续传执行方）每满该间隔且该层尚未完成，就向
+	// 尚未加入合并的候选源并发发起 Range 续传（只做加法、不切源、客户端无感）。这是
+	// 「上游 200 无 Content-Length 导致判速升级被静默跳过」场景的兜底（现场 1.32GiB
+	// 单层 53KB/s 只下一路 19 分钟才下 57.6MiB）。显式 0 = 关闭时间驱动补充。
+	DefaultBlobConcurrencyInterval = 5 * time.Minute
 )
 
 // 候选探测提速（作用于 url-redirect 候选管线：流式 GET 与 HEAD 共用）的缺省值。
@@ -530,6 +536,11 @@ type DomainRule struct {
 	// slow-download-max-behind）。nil（未配置）沿用全局；启用时（生效 speed>0）
 	// 必须 >0，Validate 拒绝。
 	SlowDownloadMaxBehind *Bytes `yaml:"slow-download-max-behind"`
+	// BlobConcurrencyInterval 该规则时间驱动的单层 blob 多源并发补充间隔（语义同全局
+	// blob-concurrency-interval）。nil（未配置）沿用全局；0 = 关闭该规则的时间驱动补充；
+	// 负数为配置错误（Validate 拒绝）。**仅 type: docker 规则生效**（与 slow-download-*
+	// 同一门控，缺 type 时静默不生效）。
+	BlobConcurrencyInterval *Duration `yaml:"blob-concurrency-interval"`
 
 	// re 是 Match 编译后的正则；excludeRe 是 Exclude 逐项编译后的正则列表
 	//（均在 Validate 阶段填充，不参与 YAML 解析）。
@@ -655,6 +666,23 @@ type Config struct {
 	// 即被关闭移除（收敛「每个源都拉满剩余区间自己的流」的带宽放大）。默认 8MB；
 	// 启用时（生效 speed>0）必须 >0，Validate 拒绝。
 	SlowDownloadMaxBehind *Bytes `yaml:"slow-download-max-behind"`
+	// BlobConcurrencyInterval 时间驱动的单层 blob 多源并发补充间隔（实现见 proxy 包
+	// slowdownload.go 与 stream.go / partial_resume.go）：单层 blob 下载（客户端主路径
+	// 与半截续传执行方）每满该间隔且该层尚未下载完成，就向尚未加入合并的候选源并发
+	// 发起 Range 续传（复用 slowMerger 有序合并），客户端全程无感、只做加法（不切换/
+	// 不中断已在下载的源，下完前一直保持并发）。首次触发 = 该层下载开始后满该间隔仍未
+	// 完成；之后每满该间隔再检查一次，全部候选都加入后保持现状直到完成。
+	// 动机（线上真实故障）：1.32GiB 单层 blob，上游 200 响应**没有 Content-Length** →
+	// slow-download-speed 判速升级被静默跳过（剩余量不可知永不触发），docker 客户端只有
+	// 一路连接 ~53KB/s，19 分钟只下了 57.6MiB 后被上游 PROTOCOL_ERROR 掐断；断流后走
+	// 半截续传路径，而续传路径当时不叠加多源升级 → 仍然只有单路。
+	// 与 slow-download-speed 的关系：判速触发是「即时触发」（窗口平均速率低于阈值即升级），
+	// 本项是「时间触发」（不问速率，满间隔就补充）；两者共用同一套「加入新源」逻辑与
+	// 同一个慢速合并器，互不排斥（可以只用其一）。
+	// 仅 type: docker 规则生效（与 slow-download-* 同一门控；非 docker 规则静默不生效）。
+	// nil（未配置）= 5m（DefaultBlobConcurrencyInterval）；显式 0 = 关闭时间驱动补充
+	//（此时仅判速触发仍可生效）；负数为配置错误（Validate 拒绝）。
+	BlobConcurrencyInterval *Duration `yaml:"blob-concurrency-interval"`
 	// DockerPrefetchEnabled docker 镜像 layer 异步预取开关（manifest 驱动，实现见 proxy
 	// 包 prefetch.go）：识别出「路径目标 GET /v2/<name>/manifests/<ref> 回源成功（HTTP 200
 	// 已写入缓存）且响应为单平台 image manifest」后，异步预取该镜像其余 layer blob 写入
@@ -817,6 +845,11 @@ type Options struct {
 	SlowDownloadMinRemaining int64
 	// SlowDownloadMaxBehind 多源合并的剪枝阈值（落后超过该字节数的源被剪枝关闭）。
 	SlowDownloadMaxBehind int64
+	// BlobConcurrencyInterval 时间驱动的单层 blob 多源并发补充间隔（实现见 proxy 包
+	// slowdownload.go）：<=0 = 关闭时间驱动补充（判速触发仍独立生效）；0 < 值 < 1s 经
+	// Validate 钳制为 1s；规则显式 ?? 全局（ResolveOptions 解析）。
+	// 仅 type=docker 规则生效（与 SlowDownloadSpeed 同一门控）。
+	BlobConcurrencyInterval time.Duration
 }
 
 // CandidateInsecureSkipVerify 返回候选对象的「忽略 TLS 证书校验」最终生效值——
@@ -1028,6 +1061,12 @@ func (c *Config) Validate() error {
 	if err := validateSlowDownload("", c.SlowDownloadSpeed, c.SlowDownloadWindow, c.SlowDownloadMinRemaining, c.SlowDownloadMaxBehind, c.GlobalSlowDownloadSpeed()); err != nil {
 		return err
 	}
+	// 时间驱动的单层 blob 多源并发补充间隔：负数为配置错误；0 < 值 < 1s 钳制为 1s
+	//（间隔过短会把「补充源」变成高频动作，反复发起 Range 请求放大带宽与日志）；
+	// 0 = 关闭时间驱动补充（合法，判速触发仍独立生效）
+	if err := validateBlobConcurrencyInterval("", c.BlobConcurrencyInterval); err != nil {
+		return err
+	}
 	// docker 层预取并发数：必须为正整数（<=0 没有并发可用；关闭预取用
 	// docker-prefetch-enabled: false 而非并发数，两者语义分离避免歧义）
 	if c.DockerPrefetchConcurrency != nil && *c.DockerPrefetchConcurrency <= 0 {
@@ -1161,6 +1200,10 @@ func (c *Config) Validate() error {
 			r.SlowDownloadSpeed, r.SlowDownloadWindow, r.SlowDownloadMinRemaining, r.SlowDownloadMaxBehind, ruleSpeed); err != nil {
 			return err
 		}
+		// 规则级时间驱动补充间隔：与全局同款校验（负数报错、0<值<1s 钳制为 1s、0 = 关闭）
+		if err := validateBlobConcurrencyInterval(fmt.Sprintf("domain-rules[%d] (%s) 的", i, r.Label()), r.BlobConcurrencyInterval); err != nil {
+			return err
+		}
 	}
 	// //////////////////  域名规则校验  end  ////////////////////////////////////////////////
 
@@ -1233,6 +1276,30 @@ func validateSlowDownload(where string, speed *Bytes, window *Duration, minRemai
 		if maxBehind != nil && *maxBehind <= 0 {
 			return fmt.Errorf("%s 必须大于 0（slow-download-speed 启用时它是多源合并的剪枝阈值）", key("slow-download-max-behind"))
 		}
+	}
+	return nil
+}
+
+// validateBlobConcurrencyInterval 校验时间驱动的单层 blob 多源并发补充间隔
+//（全局与规则级共用）：
+//   - nil = 未配置（沿用全局 / 缺省 5m），合法；
+//   - 负数 = 配置错误（启动快速失败）；
+//   - 0 = 关闭时间驱动补充（合法，判速触发仍独立生效）；
+//   - 0 < 值 < 1s 就地钳制为 1s（间隔过短会把「补充源」变成高频动作，反复发起
+//     Range 请求放大带宽与日志；与 slow-download-window 的最小 1s 同款处理）。
+func validateBlobConcurrencyInterval(where string, d *Duration) error {
+	if d == nil {
+		return nil
+	}
+	key := "blob-concurrency-interval"
+	if where != "" {
+		key = where + " " + key
+	}
+	if d.D() < 0 {
+		return fmt.Errorf("%s 不能为负数（0 = 关闭时间驱动补充），当前为 %s", key, *d)
+	}
+	if d.D() > 0 && d.D() < time.Second {
+		*d = Duration(time.Second) // 钳制最小 1s
 	}
 	return nil
 }
@@ -1343,6 +1410,15 @@ func (c *Config) GlobalSlowDownloadMaxBehind() int64 {
 		return DefaultSlowDownloadMaxBehind
 	}
 	return c.SlowDownloadMaxBehind.Int64()
+}
+
+// GlobalBlobConcurrencyInterval 返回全局时间驱动单层 blob 多源并发补充间隔生效值：
+// nil（未配置）= 缺省 5m（DefaultBlobConcurrencyInterval）；显式 0 = 关闭时间驱动补充。
+func (c *Config) GlobalBlobConcurrencyInterval() time.Duration {
+	if c.BlobConcurrencyInterval == nil {
+		return DefaultBlobConcurrencyInterval
+	}
+	return c.BlobConcurrencyInterval.D()
 }
 
 // GlobalDockerPrefetchEnabled 返回 docker 镜像 layer 异步预取开关生效值：
@@ -1496,6 +1572,7 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		SlowDownloadWindow:        c.GlobalSlowDownloadWindow(),
 		SlowDownloadMinRemaining:  c.GlobalSlowDownloadMinRemaining(),
 		SlowDownloadMaxBehind:     c.GlobalSlowDownloadMaxBehind(),
+		BlobConcurrencyInterval:   c.GlobalBlobConcurrencyInterval(),
 
 		// 全局是否显式配置过探测预算：false 时 docker blob 目标可套用更大的 blob 缺省
 		//（见 Options.CandidateProbeTimeoutFor）
@@ -1613,6 +1690,9 @@ func (c *Config) ResolveOptions(host, targetURL string, fullURL bool) Options {
 		}
 		if r.SlowDownloadMaxBehind != nil {
 			o.SlowDownloadMaxBehind = r.SlowDownloadMaxBehind.Int64()
+		}
+		if r.BlobConcurrencyInterval != nil {
+			o.BlobConcurrencyInterval = r.BlobConcurrencyInterval.D()
 		}
 		o.RuleType = r.Type
 		o.Rule = r.Label()

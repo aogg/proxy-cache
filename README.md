@@ -125,6 +125,7 @@ docker run -d --name proxy-cache \
 | `slow-download-window` | duration | `10s` | 判速滑动窗口时长：窗口满按窗口平均速率判慢（启用时 Validate 钳制最小 `1s`，过短窗口会把网络抖动误判为持续过慢）；不满足触发条件零开销（除窗口计时本身） |
 | `slow-download-min-remaining` | bytes | `64MB` | 触发升级所需最小剩余字节数：剩余（已知总长 - 已传）不足不升级（尾巴太小没必要并发拉满）；`0` = 不设门槛；上游总长不可知（无 `Content-Length`/`Content-Range`）则永不触发 |
 | `slow-download-max-behind` | bytes | `8MB` | 多源合并的剪枝阈值：合并中某源落后领先源超过该字节数即被关闭移除（收敛多源并发的带宽放大）；启用时（`slow-download-speed > 0`）必须 `>0`，Validate 拒绝 |
+| `blob-concurrency-interval` | duration | `5m` | **时间驱动的单层 blob 多源并发补充间隔**（仅 type=docker 规则，与 `slow-download-*` 同一门控）：单层 blob 下载（客户端主路径与半截续传执行方）**每满该间隔且该层尚未下载完成**，就向**尚未加入**合并的候选源并发发起 Range 续传（复用同一 `slowMerger` 有序合并），客户端全程无感、只做加法（不切换/不中断已在下载的源，下完前一直保持并发）。首次触发 = 该层下载开始后满该间隔仍未完成，之后每满该间隔再检查一次；全部候选都加入后保持现状直到完成。`0` = 关闭时间驱动补充（判速触发仍独立生效）；负数启动报错。动机见下文「[时间驱动的多源并发补充](#时间驱动的多源并发补充blob-concurrency-interval)」（1.32GiB 单层、上游 200 无 `Content-Length`、19 分钟只下 57.6MiB 的现场故障） |
 | `docker-prefetch-enabled` | bool | `true` | **docker 镜像 layer 异步预取开关**：`GET /v2/<name>/manifests/<ref>` 路径目标回源成功（HTTP 200 已写入缓存）且响应为单平台 image manifest 时，异步预取该镜像其余 layer blob 写入缓存，客户端后续 blob 请求直接命中；**预取在途中的层被客户端请求时直接搭车**（`X-Cache: PREFETCH`，上游仅预取一路下载）；HEAD / 206(Range) / 多平台 manifest list 与 OCI index 不触发；预取失败只记日志、绝不影响客户端请求。详见下文「[manifest 驱动的镜像 layer 异步预取](#manifest-驱动的镜像-layer-异步预取)」与「[在途预取层搭车](#在途预取层搭车)」 |
 | `docker-prefetch-concurrency` | int | `4` | docker 层预取的并发数上限（全部预取共享一个 Server 级信号量）；必须为正整数（显式 `<=0` 启动报错——关闭预取请用 `docker-prefetch-enabled: false`，两者语义分离） |
 | `docker-partial-resume-enabled` | bool | `true` | **docker blob 半截保留与无感续传开关**：blob（`/v2/<name>/blobs/<digest>`）流式下载（客户端主路径与预取路径）中断/失败时把已下载前缀保留为缓存目录半截文件（`.part-<缓存key>`）；客户端无 Range 完整 GET 撞上「缓存 MISS + 半截文件」时从断点 Range 续传，对客户端回一次完整 200（前缀回放 + 剩余实时拼接，docker 无需支持 Range，`X-Cache: RESUME`）；manifest 会变仅 blob 启用；`Range` 起点 0 的 `bytes=0-` 等价完整 GET（照常缓存/续传）；**起点 >0 且不超过半截长度时复用本续传管线**（从半截的起点位置回放 + 上游剩余区间拼接，对客户端回 206，内部照常写完整缓存），起点超出半截（有缺口）才维持旧版 206 透传并打 Warn；上游不回 206 安全降级全量回源。详见下文「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」 |
@@ -190,6 +191,7 @@ docker run -d --name proxy-cache \
 | `slow-download-window` | duration | 覆盖该规则判速滑动窗口时长（启用时最小 `1s`）；未配置沿用全局 |
 | `slow-download-min-remaining` | bytes | 覆盖该规则触发升级所需最小剩余字节数（`0` = 不设门槛）；未配置沿用全局 |
 | `slow-download-max-behind` | bytes | 覆盖该规则多源合并的剪枝阈值（启用时必须 `>0`）；未配置沿用全局 |
+| `blob-concurrency-interval` | duration | 覆盖该规则时间驱动的单层 blob 多源并发补充间隔（`0` = 关闭该规则的时间驱动补充，判速触发仍独立生效）；未配置沿用全局。**仅 type=docker 规则生效**，详见下文「[时间驱动的多源并发补充](#时间驱动的多源并发补充blob-concurrency-interval)」 |
 
 规则覆盖项均为「可选」：不写则沿用全局配置；**第一条命中的规则生效**（不做多规则叠加）。
 
@@ -229,6 +231,7 @@ url-redirect-item-error-retry: 1   # 单候选失败后原地重试（总尝试 
 url-redirect-all-error-retry: 1    # 整轮全败后整体重试（总轮数 = 1+N；0 = 不重试）
 
 # docker-multi-source-enabled: true   # docker 可变目标多源并发回源与合并（默认开，见下文专节）
+# blob-concurrency-interval: 5m        # 时间驱动单层 blob 多源并发补充（默认 5m；0 = 关闭；仅 type=docker 规则）
 
 cache:
   enabled: true
@@ -339,15 +342,15 @@ docker 客户端拉取镜像时，对每个请求只等约 30s 的响应头（`n
 
 竞速胜出的镜像站有时「能连上但下载极慢」（首字节快、速率只有几十 KB/s），docker pull 一个大 blob 会拖几分钟。为此，**type=docker 规则**的 GET 路径目标流式回源默认开启慢速升级：下载过慢时自动向其余全部候选**并发发起 Range 续传**，与胜者既有连接按偏移有序合并，把速率拉到多镜像站的并集。
 
-> **⚠ 前置条件：规则的 `type` 必须是 `docker`**。`slow-download-speed` / `-window` / `-min-remaining` / `-max-behind` 四个参数（全局与规则级）只在 `type: docker` 规则的流式回源上生效；规则留空 type（默认 any）时这四个参数**静默不生效**——请求照样命中规则、缓存与候选照常工作，只是慢速升级永远不会触发，日志里也没有任何报错。
+> **⚠ 前置条件：规则的 `type` 必须是 `docker`**。`slow-download-speed` / `-window` / `-min-remaining` / `-max-behind` 与 `blob-concurrency-interval` 五个参数（全局与规则级）只在 `type: docker` 规则的流式回源上生效；规则留空 type（默认 any）时这五个参数**静默不生效**——请求照样命中规则、缓存与候选照常工作，只是慢速升级与时间驱动补充永远不会触发，日志里那条 blob 单层下载开始会带 `reason(原因)=not_docker_rule` 说明原因。
 
 ### 「过慢」的定义与触发条件
 
 commit 后的读循环里按 `slow-download-window`（默认 `10s`）滑动窗口计**平均送出速率**，**窗口满且窗口平均速率低于 `slow-download-speed`（默认 `1MB/s`）** 即判「过慢」。判慢后还需同时满足才真正升级：
 
-1. **剩余量足够**：剩余字节（上游声明总长 - 已传）≥ `slow-download-min-remaining`（默认 `64MB`）——尾巴太小没必要并发拉满；上游总长不可知（无 `Content-Length`/`Content-Range`）则永不触发；
+1. **剩余量足够**：剩余字节（上游声明总长 - 已传）≥ `slow-download-min-remaining`（默认 `64MB`）——尾巴太小没必要并发拉满；上游总长不可知（无 `Content-Length`/`Content-Range`，且 manifest 里也没有该 digest 的 size——见下节「[时间驱动的多源并发补充](#时间驱动的多源并发补充blob-concurrency-interval)」）则不会触发；
 2. **候选数 > 1**：只有当前胜者一个候选时无从并发；
-3. **本流尚未升级过**：每流至多触发一次。
+3. **判速窗口独立**：判速触发按 `slow-download-window` 每窗口判一次，允许**多次补充**——后续窗口仍可把尚未加入的候选源补进同一合并器（「只做加法」，绝不切换/中断已在下载的源）。
 
 全部条件不满足时保持现状零改动（除窗口计时外零开销）；客户端已断开时本流已在断开即停出口终止（见「[流式回源与 docker ~30s 响应头超时](#流式回源与-docker-30s-响应头超时)」），不会再走到升级判定——升级窗口只存在于客户端仍在线的下载过程中。触发时输出 Info 日志「下载过慢，升级多源并发续传」（含 `rule` / `candidate` / `bytes` / `content_length` / `window` / `window_speed` / `sources`）；升级后客户端断开则由 `abortAll` 逐路关闭全部上游源（含尚未定局的续传源），合并循环随即退出，同样按断开即停收尾。
 
@@ -360,12 +363,37 @@ commit 后的读循环里按 `slow-download-window`（默认 `10s`）滑动窗�
 - **剪枝**：源出错、EOF 已尽且游标落后（流未完成却再无数据）、或落后领先源超过 `slow-download-max-behind`（默认 `8MB`）即关闭移除（日志含 reason）；
 - **收尾**：游标推进到已知总长 → 走既有 EOF 收尾（finalize 写缓存 / 206 不写缓存、成功返回与完成日志，字段兼容）；所有源全部耗尽且未到总长 → 沿用「commit 后读上游失败」语义：Error 日志、终止响应、不写缓存，等待方收到错误（502）。
 
+### 时间驱动的多源并发补充（blob-concurrency-interval）
+
+判速触发（上一节）有个致命前提：**必须知道总长**（否则算不出「剩余量」，判定直接跳过）。线上真实故障正是踩在这里——用户 docker pull 一个 **1.32GiB 的单层 blob**：
+
+1. 目标镜像站的 200 响应**没有 `Content-Length`**（chunked 上游）→ 总长不可知 → 判速升级被静默跳过；
+2. 预取队列还没轮到该层（或预取已结束）；
+3. 客户端只有一路连接约 **53KB/s**，19 分钟只下了 **57.6MiB**，随后被上游 `PROTOCOL_ERROR` 掐断；
+4. 断流后走「[blob 半截保留与无感续传](#blob-半截保留与无感续传)」路径，而该路径当时**不叠加**多源升级 → 续传仍然只有一路。
+
+`blob-concurrency-interval`（默认 `5m`，`0` = 关闭，全局与规则级都可配，语义与 `slow-download-*` 完全一致的三级优先级/继承）就是这条故障的正面对策：**不看速率、只看时间**——只要单层 blob 还没下完，就按时间补充更多源并发下载。
+
+- **适用范围**：**客户端主路径**（`source=client` 的流式回源）与**半截续传执行方**（`source=resume`，即上面故障的第 4 步）两个执行方，且仅针对 **blob 目标**（`/v2/<name>/blobs/<digest>`，即「单层」——manifest 等小目标不适用）。预取（`source=prefetch`）与搭车（`source=ridealong`）保持既有取舍不变——前者不是客户端请求、后者没有自己的上游连接。
+- **首次触发**：该层下载开始（commit）后满 `blob-concurrency-interval` 仍未完成 → 向**其余全部候选源**并发发起 Range 续传，复用既有 `slowMerger` 有序合并（与判速触发同一个合并器、同一套源校验与剪枝），客户端仍是一条连续的流——**不切状态码、不回退已发字节、不改响应头**。
+- **循环**：之后每满该间隔再检查一次；有尚未加入的候选源就继续补充（`joinSlowSources` 增量加源），全部候选都加入后保持现有并发直到下载完成。全程**只做加法**：不切换、不中断已在下载的源。
+- **总长兜底（关键）**：解析单平台 image manifest（无论 `docker-prefetch-enabled` 开不开）时，把每个 layer/config 的 `digest → size` 记进 **Server 级进程内索引**（有界 FIFO，见 `proxy/blob_size_index.go`）；blob 流式回源响应没有 `Content-Length` 时用 manifest size 兜底 `knownTotal`，日志字段 `total_source(总长来源)=upstream|manifest|unknown` 标注来源。blob 按 digest 寻址、内容不可变，manifest 的 size 与 digest 一样稳定；写缓存前仍由既有 sha256 强校验做最终把关（size 被上游伪造时拼出的内容摘要必然不符，绝不会入库）。
+- **续传路径同样生效**：续传执行方每满间隔也会向尚未加入的候选源补充并发 Range 续传（总长优先取上游 206 的 `Content-Range`，拿不到再用 manifest size 兜底），日志 `source(来源)=resume`，与客户端主路径共用同一套判定/合并/日志（`timeBlobSupplement`）。
+- **判定与动作日志**（全部 Info 级，键序遵循 `proxy/log_attrs.go`）：
+  - 单层下载开始：`docker blob 单层下载开始（客户端主路径）`（续传执行方复用既有的「`blob 半截续传开始`」），带 `candidate(候选源)` / `total(总长)` / `total_source(总长来源)` / `candidates(候选数)` / `sources(源数量)=1`；
+  - 每满间隔：`blob 下载 N 分钟未完成，评估多源并发补充`，带 `round(当前轮)` / `elapsed(已耗时)` / `bytes(字节数)` / `total(总长)` / `total_source(总长来源)` / `rate(平均速率)` / `joined_sources(已并入源数)` / `pending_sources(待并入源数)`；
+  - 补充动作：`补充多源并发下载`，`added(本次加入源)` 列出本次加入的源（去重、排除当前胜者与已在合并中的源）+ `sources(源数量)` / `joined_sources(已并入源数)` / `alive_sources(存活源数)` / `offset(偏移)` / `total(总长)`；
+  - 无法补充：`未补充多源并发`，`reason(原因)` 枚举 = `disabled`（interval<=0 且 slow-download-speed<=0）/ `not_docker_rule` / `content_length_unknown`（无 `Content-Length` 且 manifest 无 size）/ `candidates_lt_2` / `all_joined` / `client_gone` / `upstream_no_range`（该源对 Range 回 200 全量，跳过并记该源）/ `remaining_too_small`（复用 `slow-download-min-remaining` 语义）；
+  - 剪枝 / 源失败 / 完成等既有日志全部保留，并补充 `sources(源数量)` / `alive_sources(存活源数)` 字段。
+- **向后兼容**：不配新键时默认行为 = 5m 时间驱动（**行为变化**：以前总长不可知的慢速单层只有一路，现在 5 分钟后会补源）；显式 `blob-concurrency-interval: 0` 可关闭时间驱动、只保留判速触发（`slow-download-speed: 0` 反之）。
+- **现场排障**：`grep '评估多源并发补充' proxy-cache.log` 看每层的定时判定，`grep '补充多源并发下载' proxy-cache.log` 看实际加了几路源，`grep '未补充多源并发' proxy-cache.log` + `reason(原因)=` 看为什么没加。
+
 ### 代价与边界（读配置前必看）
 
-- **带宽放大**：升级后**每个源都会拉满剩余区间自己的流**（慢源在被剪枝前会白拉一段），靠 `slow-download-max-behind` 剪枝收敛——阈值越小收敛越快、越大越容忍慢源后程发力；
+- **带宽放大**：升级后**每个源都会拉满剩余区间自己的流**（慢源在被剪枝前会白拉一段），靠 `slow-download-max-behind` 剪枝收敛——阈值越小收敛越快、越大越容忍慢源后程发力；时间驱动的补充源按合并游标处的偏移起拉，绝不重复拉取已写给客户端的区间；
 - **仅 docker type 生效**：非 docker 规则 / 未配 `url-redirect` 的直连路径 / HEAD 管线完全不生效；候选并发数上限 = 候选列表长度（一般 ≤5），不做额外并发池；
-- **连续性保证不变**：commit 后不再切换状态码/响应头，升级只增开续传源，绝不动客户端已见字节；
-- **关闭方式**：`slow-download-speed: 0`（或 `<=0`）显式关闭整个特性；也可按规则级覆盖只对个别 docker 规则开启/关闭。
+- **连续性保证不变**：commit 后不再切换状态码/响应头，升级只增开续传源，绝不动客户端已见字节；时间补充按 `blob-concurrency-interval`（默认 5m）发生，不会在下载刚开始就并发拉满（要更快收敛就把该间隔调小，如 `1m`）；
+- **关闭方式**：`slow-download-speed: 0`（或 `<=0`）关闭判速触发、`blob-concurrency-interval: 0` 关闭时间驱动补充——两者都关即完全恢复旧「单路下载」行为；也可按规则级覆盖只对个别 docker 规则开启/关闭。
 
 ## 单飞（singleflight）与等待上限
 
@@ -616,7 +644,7 @@ docker 客户端并发下载 layer 受限（daemon 默认 `max-concurrent-downlo
 - **singleflight 合并**：预取下载与客户端 blob 请求共用同一缓存键的 singleflight——客户端正在下载某 blob 时预取不另起第二路下载（等待并共享其结果）；客户端在预取登记在途流共享（hub）之前的极小窗口期撞上预取，同样经 singleflight 合并
 - **在途流共享（hub）**：预取执行方为流式下载——边读上游边写缓存临时文件并逐块广播增量；客户端请求撞上还在下载中的层时直接**搭车**（见下节「[在途预取层搭车](#在途预取层搭车)」），上游对该 blob 始终只有一路下载
 
-**回源路径复用**：预取 blob 的下载与客户端请求**完全相同的回源链路**——候选轮询（round-robin 起始下标共用）、候选级超时覆盖、`http-proxy`、insecure TLS、docker 401 匿名 token dance、成功判据与缓存写入全复用；**只写缓存、不产生客户端响应**。预取那一路不叠加 slowdownload 慢速升级多源并发续传（上游速率由预取一路决定，过慢时靠搭车订阅超时降级 + 客户端 Range 重试兜底）。
+**回源路径复用**：预取 blob 的下载与客户端请求**完全相同的回源链路**——候选轮询（round-robin 起始下标共用）、候选级超时覆盖、`http-proxy`、insecure TLS、docker 401 匿名 token dance、成功判据与缓存写入全复用；**只写缓存、不产生客户端响应**。预取那一路不叠加 slowdownload 慢速升级与时间驱动的多源并发补充（上游速率由预取一路决定，过慢时靠搭车订阅超时降级 + 客户端 Range 重试兜底）——但解析 manifest 时**与预取开关无关地**把每个 layer 的 `digest → size` 记进进程内索引，供「blob 流式回源无 `Content-Length`」时的 `knownTotal` 兜底（见「[时间驱动的多源并发补充](#时间驱动的多源并发补充blob-concurrency-interval)」）。
 
 **失败降级**：预取失败只记日志（Warn/Debug），不重试（候选管线自身已有单候选/整轮重试），绝不影响客户端主请求；正在搭车的客户端按 failed 广播降级（未 commit 改走原回源路径 / 已 commit 终止本次响应，docker 以 Range 续传重试），未搭车的客户端后续请求照走原路径。
 
@@ -641,7 +669,7 @@ docker 客户端并发下载 layer 受限（daemon 默认 `max-concurrent-downlo
 - **无感续传（主场景）**：客户端无 Range 完整 GET 撞上「正式缓存 MISS + 半截文件存在」时走**续传执行方**——按既有候选轮询（round-robin 起始下标共用）逐候选发 `Range: bytes=<已存字节>-`（既有候选级超时 / `http-proxy` / insecure TLS / 401 匿名 token dance 全复用，整体 20s 扫描预算兜底），从上游 `206` 响应的 `Content-Range` 取总长，对客户端回**一次完整 200**：`Content-Length=总长`（可得时，拿不到则流式不设），body = 本地半截前缀回放 + 上游剩余区间实时拼接——**docker 客户端无需支持 Range、完全无感知**（`X-Cache: RESUME`）。拼接期间上游剩余数据**边转发边追加写半截文件**；EOF 后半截内容 = 完整 blob，按既有 `cache.Set` 语义原子转为正式缓存条目并立即删除半截文件。
 - **并发合并**：续传执行方登记与预取同一套在途流共享注册表（resume 条目），其余客户端请求/等待超限的重试请求经既有搭车机制订阅「半截前缀 + 实时增量」（`X-Cache: PREFETCH`，上游只一路下载）；同 blob 的预取任务经既有 singleflight（同缓存键）合并到同一路续传流。半截文件的全部写侧操作按缓存键互斥（逐块追加 / 整体保存 / 预取改名），且续传执行方逐块追加前校验文件大小——半截被并发保存方更新为更长前缀时本流立即收尾（更长前缀已保留，进度不回退），绝不产生错位拼接。
 - **安全依据**：blob 按 digest 寻址、**内容不可变**——任意候选源的同 digest 内容一致，半截可从任意候选发 `Range` 续传拼接（续传可跨候选）；客户端/上游侧 `Docker-Content-Digest` 不做本地全量校验（GB 级 blob 成本过高），信任 digest 寻址语义。**commit 前必须先确认上游是 206 且 `Content-Range` 起点匹配半截长度**，确认前绝不向客户端写任何字节——若上游对 Range 回 200 全量响应，回放本地前缀再拼全量会数据错位，因此绝不允许。
-- **边界与降级**：manifest 会变，**仅 blob 启用**；客户端带 Range 的请求按起点分流——起点 0 的 `bytes=0-` 等价完整 GET（照常续传），起点 >0 且不超过半截长度时复用本管线（从半截的起点回放 + 上游剩余拼接、对客户端回 206，内部仍写完整缓存），起点超出半截（有缺口）/ 后缀区间 / 多区间 / 非 blob 目标维持旧版 206 透传；半截为 0 字节直接丢弃；上游对 Range 回非 206（不支持 / 200 全量回）→ 丢弃半截走既有全量回源路径（安全降级，绝不给客户端错误数据）；纯网络/超时类失败保留半截继续全量回源（全量再失败时失败捕获会把更长前缀存回半截，进度不回退）；上游 416（Range 起点 ≥ 总长，而半截是合法前缀）证明**半截已完整**，直接读回写缓存回放，不再全量下载；续传中途读上游失败 / 长度不符 → 保留更新后的半截、本次响应被截断（docker 重试接着更长前缀续传——进度不回退）；EOF 但累积长度 ≠ 总长 → 不写缓存（绝不缓存短 body）。续传路径不叠加 slowdownload 慢速升级多源并发续传（与预取一路同一取舍）。
+- **边界与降级**：manifest 会变，**仅 blob 启用**；客户端带 Range 的请求按起点分流——起点 0 的 `bytes=0-` 等价完整 GET（照常续传），起点 >0 且不超过半截长度时复用本管线（从半截的起点回放 + 上游剩余拼接、对客户端回 206，内部仍写完整缓存），起点超出半截（有缺口）/ 后缀区间 / 多区间 / 非 blob 目标维持旧版 206 透传；半截为 0 字节直接丢弃；上游对 Range 回非 206（不支持 / 200 全量回）→ 丢弃半截走既有全量回源路径（安全降级，绝不给客户端错误数据）；纯网络/超时类失败保留半截继续全量回源（全量再失败时失败捕获会把更长前缀存回半截，进度不回退）；上游 416（Range 起点 ≥ 总长，而半截是合法前缀）证明**半截已完整**，直接读回写缓存回放，不再全量下载；续传中途读上游失败 / 长度不符 → 保留更新后的半截、本次响应被截断（docker 重试接着更长前缀续传——进度不回退）；EOF 但累积长度 ≠ 总长 → 不写缓存（绝不缓存短 body）。续传路径**接入**时间驱动的多源并发补充（`blob-concurrency-interval`，日志 `source(来源)=resume`）：每满间隔且该层未完成，就向尚未加入的候选源补充并发 Range 续传（只做加法、客户端无感、不切状态码），判速触发同样生效——见「[时间驱动的多源并发补充](#时间驱动的多源并发补充blob-concurrency-interval)」。
 - **宽限终止（客户端断开宽限终止，仅续传执行方）**：续传执行方向客户端写响应体失败（docker 已断开）**且**在途条目（hub resume 条目）无搭车订阅者时，按 `docker-resume-client-gone-grace`（默认 `2s`）启动宽限计时——到期仍无订阅者则**终止上游读取、保留半截（进度不回退）、移除在途条目**，不再「继续读完只填缓存」长时间占用上游带宽；宽限期内有订阅者搭车（subscribe）则放弃终止、继续拉（订阅者还要收增量）；断开时已有订阅者则不宽限、直接维持现状。动机：旧语义「客户端断开后继续读完只填缓存」在现场表现为没人下载还长时间占上游带宽（261MB blob 断开后按旧语义又拉了 3m44s 才写完）。语义分工（用户明确约定）：docker 客户端驱动的链路（`client` 主路径 / `ridealong` 搭车读侧 / `resume` 续传执行方）客户端没了就该停——客户端主路径是**断开即停**（b251149，立即终止），续传执行方是**宽限终止**（给搭车订阅者留上车窗口），搭车读侧断开仅停读取订阅；**异步预取（`source=prefetch`）没有客户端概念，保持「继续填缓存」语义不变，绝不受本项影响**。日志：宽限终止为 Info 级运维事件（消息含「宽限终止」：`blob 半截续传客户端断开且无搭车订阅者，宽限终止续传（半截保留，下次从断点再续）`），触发判定时另有 Warn「`写响应体失败（客户端已断开，续传按宽限语义处置）`」（含宽限时长 `grace(宽限)` 与搭车订阅数 `subscribers(搭车订阅数)` 键）——均为运维事件而非故障，**绝不产生 Error**。配置：`docker-resume-client-gone-grace` 默认 `2s`；显式 `<=0` = 关闭宽限终止（完全恢复旧「继续读完填缓存」语义）。
 - **开关**：`docker-partial-resume-enabled`（全局，默认开启；显式 `false` 关闭后全部路径行为与旧版完全一致——无半截文件的产生、保留与续传）。
 
@@ -712,7 +740,7 @@ grep 时按键名原文匹配即可（括号在 grep 基本正则里不是特殊
 
 | 级别 | 能看到什么 |
 | --- | --- |
-| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason(原因)=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index(起始下标)` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail(硬失败原因)=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、流式透传进度（`流式透传进度`：按 `log.progress-interval` 周期输出，含已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收；间隔 `<=0` 关闭）、活跃下载周期汇总（`活跃下载进度汇总` 一条 + 每个活跃下载一条 `活跃下载进度`：按 `log.progress-summary-interval` 周期输出，覆盖 client（含缓存/回放）/ridealong/resume/prefetch，本轮无任何下载登记时静默，见下文「[活跃下载周期汇总](#活跃下载周期汇总)」）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file(文件)`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、blob 半截续传宽限终止（`blob 半截续传客户端断开且无搭车订阅者，宽限终止续传（半截保留，下次从断点再续）`：续传执行方客户端断开且宽限期内无搭车订阅者的运维事件而非故障，绝不 Error）、每条访问完成日志（`代理请求完成`） |
+| `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason(原因)=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index(起始下标)` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail(硬失败原因)=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、流式透传进度（`流式透传进度`：按 `log.progress-interval` 周期输出，含已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收；间隔 `<=0` 关闭）、docker blob 单层下载开始（`docker blob 单层下载开始（客户端主路径）`：`total(总长)` 与 `total_source(总长来源)=upstream|manifest|unknown`、`candidates(候选数)`）、时间驱动的多源并发补充（`blob 下载 N 分钟未完成，评估多源并发补充` / `补充多源并发下载` / `未补充多源并发`（带 `reason(原因)` 枚举），见「[时间驱动的多源并发补充](#时间驱动的多源并发补充blob-concurrency-interval)」）、活跃下载周期汇总（`活跃下载进度汇总` 一条 + 每个活跃下载一条 `活跃下载进度`：按 `log.progress-summary-interval` 周期输出，覆盖 client（含缓存/回放）/ridealong/resume/prefetch，本轮无任何下载登记时静默，见下文「[活跃下载周期汇总](#活跃下载周期汇总)」）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file(文件)`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态；多源并发补充过的流追加 `sources(源数量)`/`alive_sources(存活源数)`）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、blob 半截续传宽限终止（`blob 半截续传客户端断开且无搭车订阅者，宽限终止续传（半截保留，下次从断点再续）`：续传执行方客户端断开且宽限期内无搭车订阅者的运维事件而非故障，绝不 Error）、每条访问完成日志（`代理请求完成`） |
 | `debug` | `info` 全部内容，再加：代理请求开始、逐条域名规则匹配过程（每条规则的 `matched(是否命中)` / `excluded(是否被排除)` 明细）、每次候选尝试开始、候选竞速放行（`url-redirect 候选竞速放行`）、候选被取消（其他候选胜出/扫描预算到期）、缓存查询 MISS 细节 |
 | `warn` | 候选请求失败 / 未过成功判据 / 回退直连、等待单飞超限自拔回源（`等待同 key 单飞回源超限，自行走候选回源`）、commit 后客户端断开（`写响应体失败（客户端已断开，终止上游读取）` 与断开终止事件 `客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）`——运维事件而非故障，含已接收字节数 `bytes(字节数)` 与半截保留状态 `partial(半截保留)`）、续传执行方客户端断开按宽限语义处置（`写响应体失败（客户端已断开，续传按宽限语义处置）`——运维事件而非故障，含宽限时长 `grace(宽限)` 与搭车订阅数 `subscribers(搭车订阅数)`）、commit 后读上游失败（`流式回源读上游失败...不写缓存`）、写缓存失败、ACL 拦截等警告（含 `error` 级日志） |
 | `error` | 仅错误：回源彻底失败（502）、候选扫描总预算耗尽（`url-redirect 候选扫描总预算耗尽，提前终止候选扫描`）、候选尝试 panic 等 |
@@ -745,6 +773,11 @@ grep 'image(镜像)=foxhui/webai-2api' proxy-cache.log | grep 'source(来源)=pr
 grep 'source(来源)=client' proxy-cache.log
 grep 'source(来源)=ridealong' proxy-cache.log
 grep 'source(来源)=resume' proxy-cache.log
+
+# 时间驱动的多源并发补充：定时判定 / 实际加了几路源 / 为什么没加（reason 枚举）
+grep '评估多源并发补充' proxy-cache.log
+grep '补充多源并发下载' proxy-cache.log
+grep '未补充多源并发' proxy-cache.log
 ```
 
 ### 活跃下载周期汇总

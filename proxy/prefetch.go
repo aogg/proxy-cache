@@ -86,10 +86,15 @@ type imageManifestBody struct {
 	// Config 镜像 config blob（容器文件系统元数据，按 digest 寻址），客户端拉镜像必取。
 	Config struct {
 		Digest string `json:"digest"`
+		// Size config blob 的字节数（记进 manifest blob size 索引：blob 流式回源响应没有
+		// Content-Length 时兜底 knownTotal，见 blob_size_index.go）。
+		Size int64 `json:"size"`
 	} `json:"config"`
 	// Layers 镜像 layer blob 列表（digest 寻址、内容不可变）。
 	Layers []struct {
 		Digest string `json:"digest"`
+		// Size layer blob 的字节数（同上，knownTotal 兜底来源；与 digest 一样不可变）。
+		Size int64 `json:"size"`
 	} `json:"layers"`
 }
 
@@ -108,11 +113,8 @@ type imageManifestBody struct {
 // 绝不影响客户端主请求。
 func (s *Server) maybePrefetchImageLayers(r *http.Request, target string, ent *cache.Entry, eff config.Options, disk *cache.Cache) {
 	// //////////////////  触发条件逐项判定  start  ////////////////////////////////////////////
-	if s.cfg == nil || disk == nil || ent == nil {
-		return // 防御：缓存未写盘（disk==nil）预取无从落地；其余为绕过 New 构造的兜底
-	}
-	if !s.cfg.GlobalDockerPrefetchEnabled() {
-		return // 全局开关关闭
+	if s.cfg == nil || ent == nil {
+		return // 防御：绕过 New 构造的兜底（disk==nil 也会在此后单独判定）
 	}
 	if r == nil || r.Method != http.MethodGet {
 		return // HEAD 不触发（HEAD 探测无 body 不写缓存，本到不了这里，兜底防御）
@@ -133,6 +135,16 @@ func (s *Server) maybePrefetchImageLayers(r *http.Request, target string, ent *c
 		s.log.Debug("docker manifest 解析失败，跳过 layer 预取",
 			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "ref", truncate(ref, 128), "err", err)...)
 		return
+	}
+	// manifest 里每个 blob（config + layers）的 size 记进进程内索引：**与预取开关无关**——
+	// blob 流式回源响应没有 Content-Length 时用它兜底 knownTotal（现场 1.32GiB 单层故障：
+	// 无 Content-Length → 判速升级被静默跳过），预取关掉时兜底同样需要这份 size。
+	s.recordManifestBlobSizes(body)
+	if !s.cfg.GlobalDockerPrefetchEnabled() {
+		return // 全局开关关闭（size 已记录，预取不再执行）
+	}
+	if disk == nil {
+		return // 缓存未写盘（缓存禁用）：预取无从落地
 	}
 	// config blob 在前（体积小、客户端必取），随后 layers；digest 不合法的单项剔除
 	digests := make([]string, 0, len(body.Layers)+1)

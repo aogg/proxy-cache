@@ -116,6 +116,15 @@ type Server struct {
 	progressReg *progressRegistry
 	// progressOnce 保证周期汇总 goroutine 只启动一次（StartProgressSummary 幂等）。
 	progressOnce sync.Once
+	// blobSizeMu 保护 blobSizes 的并发访问/惰性补建（manifest layer size 索引，见
+	// blob_size_index.go）。
+	blobSizeMu sync.Mutex
+	// blobSizes docker layer blob 的 manifest size 进程内索引（digest → size，有界 FIFO）：
+	// blob 流式回源响应没有 Content-Length 时用它兜底 knownTotal（日志 total_source=
+	// manifest），让判速/时间驱动的多源并发补充在「上游 200 无 Content-Length」场景仍能
+	// 正常工作（线上 1.32GiB 单层故障的根因之一）。New 预构建，防御性惰性补建见
+	// blobSizeIndex。
+	blobSizes *manifestBlobSizeIndex
 	// blobDigestVerify blob 写缓存前的内容寻址校验钩子（防毒缓存）：入参 (body 原文,
 	// digest "sha256:<hex>" 原文)，返回 (实际摘要 hex, 是否一致)。nil 时使用默认实现
 	//（sha256 全量比对）——生产恒走默认强校验；仅测试注入 stub（既有夹具的 digest
@@ -142,6 +151,10 @@ func New(cfg *config.Config, caches *cache.Manager, logger *slog.Logger) (*Serve
 	// 活跃下载注册表（周期进度汇总，见 progress_summary.go）：New 只预构建注册表，
 	// 定时汇总 goroutine 由 main.go 调 StartProgressSummary(ctx) 启动（生命周期归调用方）
 	s.progressReg = newProgressRegistry()
+	// docker layer blob 的 manifest size 索引（blob 无 Content-Length 时的 knownTotal
+	// 兜底，见 blob_size_index.go）：容量有界，进程内即可（manifest 与 layer 通常在同一次
+	// pull 内先后回源；size 与 digest 内容一样不可变）
+	s.blobSizes = newManifestBlobSizeIndex()
 
 	// 预构建全局与各域名规则可能用到的 (上游代理, connect-timeout) 组合客户端：
 	// 启动期完成代理地址解析校验（配置错误启动快速失败），运行期 client() 只做防御性补建。
