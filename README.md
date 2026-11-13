@@ -86,7 +86,7 @@ docker build -t proxy-cache .
 | 阶段 | 基础镜像 | 内容 |
 | --- | --- | --- |
 | Stage 1 `builder` | `golang:1.23-alpine` | `go mod download` + `go build`（CGO 禁用，静态编译，`-ldflags="-s -w"` 去符号） |
-| Stage 2 `runtime` | `alpine:3.20` | 仅含：编译产物二进制、`/app/config.yaml`（默认配置）、`ca-certificates`、非 root 用户 `app(uid=10001)`；不含任何构建工具与源码 |
+| Stage 2 `runtime` | `alpine:3.20` | 仅含：编译产物二进制、`/app/config.yaml`（默认配置）、`ca-certificates`、非 root 用户 `app(uid=1000)`；不含任何构建工具与源码 |
 
 ### docker run（挂载配置与缓存目录）
 
@@ -103,7 +103,7 @@ docker run -d --name proxy-cache \
 说明：
 
 - 配置挂载到 `/app/config.yaml`（容器入口 `proxy-cache -c /app/config.yaml`，环境变量 `PROXY_CACHE_CONFIG` 亦可）；不挂载时使用镜像内置的默认配置
-- 缓存挂载到 `/app/cache-data` 建议持久化，避免容器重建后缓存丢失；宿主机目录需要对容器内 uid=10001 可写（如 `chmod 777 ./cache-data` 或 `chown 10001 ./cache-data`）；使用规则级 `cache.path` 独立目录时，对应目录同样需要挂载并保证可写
+- 缓存挂载到 `/app/cache-data` 建议持久化，避免容器重建后缓存丢失；宿主机目录需要对容器内 uid=1000 可写（如 `chmod 777 ./cache-data` 或 `chown 1000 ./cache-data`）；使用规则级 `cache.path` 独立目录时，对应目录同样需要挂载并保证可写
 - 服务监听地址由配置文件 `listen` 决定（默认 `0.0.0.0:8080`），容器默认暴露 8080
 
 ## 配置项说明

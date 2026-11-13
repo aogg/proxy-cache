@@ -28,10 +28,10 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/proxy-cache .
 FROM alpine:3.20
 
 # ca-certificates: 回源 https 目标所需；tzdata: 时区
-# app(uid=10001): 非 root 运行用户
+# app(uid=1000): 非 root 运行用户
 RUN apk add --no-cache ca-certificates tzdata \
-    && addgroup -g 10001 -S app \
-    && adduser -u 10001 -S -G app -h /app app \
+    && addgroup -g 1000 -S app \
+    && adduser -u 1000 -S -G app -h /app app \
     && mkdir -p /app/cache-data \
     && chown -R app:app /app/cache-data
 
