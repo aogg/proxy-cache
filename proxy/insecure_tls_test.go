@@ -80,8 +80,8 @@ func TestExpandCandidatesInsecurePerItem(t *testing.T) {
 			t.Errorf("候选[%d] insecureSkipVerify = %v, want %v（逐候选独立解析）", i, got[i].insecureSkipVerify, w)
 		}
 	}
-	if got[0].url != "https://a.example.com/v2/x" || got[1].url != "https://b.example.com/v2/x" {
-		t.Errorf("候选 URL 展开语义应不变，得到 %q / %q", got[0].url, got[1].url)
+	if got[0].url != "https://a.example.com/http://"+slowHost+"/v2/x" || got[1].url != "https://b.example.com/http://"+slowHost+"/v2/x" {
+		t.Errorf("候选 URL 展开语义应不变（路径目标 $1 = 含入站 Host 的完整 URL），得到 %q / %q", got[0].url, got[1].url)
 	}
 }
 

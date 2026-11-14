@@ -296,8 +296,8 @@ func TestSlowDownloadEscalationDockerFullChain(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("Code = %d, want %d（升级绝不动客户端已见状态码）", rec.Code, http.StatusOK)
 	}
-	if got := rec.Header().Get("X-Proxy-Upstream"); got != winner.URL+"/"+target {
-		t.Errorf("X-Proxy-Upstream = %q, want 胜者候选 %q（连续性：绝不切换候选）", got, winner.URL+"/"+target)
+	if got := rec.Header().Get("X-Proxy-Upstream"); got != winner.URL+"/http://"+slowHost+"/"+target {
+		t.Errorf("X-Proxy-Upstream = %q, want 胜者候选 %q（连续性：绝不切换候选；路径目标 $1 = 含入站 Host 的完整 URL）", got, winner.URL+"/http://"+slowHost+"/"+target)
 	}
 	if !bytes.Equal(rec.Body.Bytes(), data) {
 		t.Errorf("客户端应收到与原始数据逐字节一致的完整 body（got %d 字节, want %d）", rec.Body.Len(), len(data))

@@ -111,7 +111,9 @@ const (
 // （ExpandCandidates）共用同一套常量，避免两处维护漂移。
 const (
 	// PlaceholderTarget 目标串（$1 / ${1}，兼容保留）：完整 URL 请求 = 目标 URL 原文；
-	// 路径目标请求（如 docker registry 的 /v2/xxx/manifests/latest）= 路径目标本身（不带 scheme）。
+	// 路径目标请求（如 docker registry 的 /v2/xxx/manifests/latest）= 含入站 Host 的
+	// 完整 URL「scheme://<Host>/<路径目标>」（与缓存 key 同构）——裸路径不是合法上游
+	// 地址；该展开值等于请求本代理自身时为自引用候选，回源管线会跳过其上游请求。
 	PlaceholderTarget = "1"
 	// PlaceholderFullURL 本次入站请求的完整 URL（scheme://host/path?query）：
 	// scheme 优先取请求头 X-Forwarded-Proto 首个值（小写），否则按 TLS 判定 https/http；host 含端口原样。

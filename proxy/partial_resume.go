@@ -56,7 +56,11 @@
 //     拼在一起会数据错位，非 206 一律安全降级。立即响应只把**本地半截前缀**（同 digest
 //     内容的合法前缀，内容永远可信）先发给客户端；扫描失败/非 206 时响应已 commit 的
 //     按「安全中断」截断（docker 重试接续，绝不在已回放前缀的流上拼全量），未 commit
-//     的（旧时序）维持既有降级全量回源不变；
+//     的（旧时序）维持既有降级全量回源不变。2026-11 现场 767MB blob 拼接后 sha256 不符
+//     的对策再加两道内容级校验（只加严不放宽）：续传响应 Content-Length 与 Content-Range
+//     区间长度一致性核对（validateResumeResponse）；多源补充源的重复区间字节与已确认
+//     输出同偏移对账（slowMerger.verify → verifyStaleAgainstConfirmed），不符即剪枝——
+//     谎报起点的源的错位字节进不了半截文件、广播与客户端流；
 //   - 半截为 0 字节直接丢弃；上游 416（起点 ≥ 总长，而半截是合法前缀）证明半截已完整，
 //     直接读回写缓存回放，不再全量下载；
 //   - 客户端带 Range 的请求按起点与半截长度的关系分流（见 client_range.go）：
@@ -965,6 +969,15 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 			knownTotal:  resumeKnownTotal,
 			totalSource: resumeTotalSource,
 			end:         resumeEnd,
+			// 重复区间内容对账（slowMerger.verify，见 slowdownload.go 的
+			// verifyStaleAgainstConfirmed）：补充源的过期缓冲字节与已确认输出（accum =
+			// [0..已写游标) 的权威字节：半截前缀 + 胜者已写增量）同偏移逐字节比对，不符
+			// 即剪枝该源——上游谎报 206 起点 / 混入非本 blob 内容的错位字节从此进不了
+			// 半截文件、广播与客户端流。闭包在合并循环 goroutine 内调用（与
+			// writeRemainChunk 同 goroutine 串行），读 accum 无数据竞争。
+			verify: func(off int64, stale []byte) bool {
+				return verifyStaleAgainstConfirmed(accum.Bytes(), off, stale)
+			},
 		}
 	}
 

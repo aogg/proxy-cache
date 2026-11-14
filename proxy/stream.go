@@ -238,6 +238,17 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	var clientErr error // 客户端断开错误（writeOut/writeFirst 检测到写失败时置值，非 nil = 断开即停）
 	accum := bytes.NewBuffer(make([]byte, 0, len(res.first)+streamChunkSize))
 	total := 0
+	// 重复区间内容对账（slowMerger.verify，见 slowdownload.go 的 verifyStaleAgainstConfirmed）：
+	// 补充源的过期缓冲字节与已确认输出（accum = [0..已写游标) 的权威字节）同偏移逐字节
+	// 比对，不符即剪枝该源——上游谎报 206 起点 / 混入非本 blob 内容的错位字节从此进不了
+	// 客户端流与缓存。闭包在合并循环 goroutine 内调用（与 writeOut 同 goroutine 串行），
+	// 读 accum 无数据竞争。
+	staleVerify := func(off int64, stale []byte) bool {
+		return verifyStaleAgainstConfirmed(accum.Bytes(), off, stale)
+	}
+	if blobTrack != nil {
+		blobConc.verify = staleVerify // 建合并器时挂到 slowMerger.verify（见 timeBlobSupplement）
+	}
 	// clientGoneAbort 客户端断开（clientErr 非 nil）的统一终止出口：关闭上游、按既有条件
 	// 保留半截（仅 blob + 开关开启 + 无 Range 的缓存可读主路径，进度不回退，见
 	// captureStreamPartial）、Warn 级运维事件留痕（含 source=client 与 image/digest 统一
@@ -380,6 +391,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 						slowMerger = s.escalateSlowSources(r, res, offset, others, eff, knownTotalAt, rangeEndAt,
 							labels, dockerLogSourceClient,
 							"total_source", totalSourceAt, "elapsed", time.Since(committedAt).Round(time.Millisecond).String())
+						slowMerger.verify = staleVerify // 重复区间对账（时间触发通道同一套）
 						// 回填时间驱动判定的输入（合并阶段：res 连接已移交合并器，只做增量加源）
 						blobConc.merger = slowMerger
 						blobConc.knownTotal, blobConc.totalSource, blobConc.end = knownTotalAt, totalSourceAt, rangeEndAt

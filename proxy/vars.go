@@ -15,13 +15,28 @@ import (
 
 // RequestVars 是一次请求可用的 url-redirect 模板变量集合（可扩展结构，后续新增变量加字段即可）。
 // 字段与占位符的对应关系：
-//   - Target          -> $1 / ${1}（兼容保留，见 config.PlaceholderTarget）；
+//   - TargetURL       -> $1 / ${1}（兼容保留，见 config.PlaceholderTarget；Target 原文
+//     仅作目标串保留，不再是展开值）；
 //   - FullURL         -> $http.server.header.full_url / ${...}；
 //   - FullURLNoServer -> $http.server.header.full_url_no_server / ${...}。
 type RequestVars struct {
-	// Target 目标串：完整 URL 请求 = 目标 URL 原文；路径目标请求 = 路径目标本身
-	// （不带 scheme，如 v2/xxx/manifests/latest）。
+	// Target 目标串原文：完整 URL 请求 = 目标 URL 原文；路径目标请求 = 路径目标本身
+	// （不带 scheme，如 v2/xxx/manifests/latest）。仅作原始目标串保留（blob 目标判定等），
+	// 不是 $1 的展开值（见 TargetURL）。
 	Target string
+	// TargetURL $1 / ${1} 的展开值（README 承诺的「原始 URL」）：
+	//   - 完整 URL 目标 = Target 原文（行为不变）；
+	//   - 路径目标 = 「scheme://<入站Host>/<路径目标>」完整 URL（与缓存 key
+	//     cacheKeyInput 的 BuildMatchStr 输入同构）——路径目标只有在入站 Host 上才有
+	//     「原始 URL」语义，裸路径串不是合法的上游地址（旧版展开成裸路径回源必报
+	//     unsupported protocol scheme ""，还按 item 重试空转烧满重试次数）。
+	// scheme 用 inboundScheme（X-Forwarded-Proto 优先，否则按 TLS 判定），host 用入站
+	// r.Host 原样（含端口），与 FullURL 的拼装同一套规则。
+	TargetURL string
+	// SelfURL 本次请求「向本代理自身取同一目标」的完整 URL（仅路径目标非空 = TargetURL）：
+	// 候选展开后与之相等即自引用候选（回源等于请求本代理自己，必然递归成环），
+	// ExpandCandidates 会给它打 selfRef 标记，回源管线对它跳过上游请求。
+	SelfURL string
 	// FullURL 本次入站请求的完整 URL：scheme://host/path?query。
 	FullURL string
 	// FullURLNoServer 入站请求 URL 去掉 scheme://host 的部分：/path?query
@@ -38,7 +53,10 @@ type redirectVar struct {
 }
 
 // NewRequestVars 基于入站请求与 ExtractTarget 的结果构建模板变量上下文：
-//   - Target 即 target（完整 URL 或路径目标），对应 $1；
+//   - Target 即 target 原文（blob 目标判定等用），$1 的展开值是 TargetURL（见该字段）；
+//   - 完整 URL 目标（isFullURLTarget）：TargetURL = target 原文，SelfURL 为空；
+//   - 路径目标：TargetURL = SelfURL = scheme://host/target（含入站 Host 的完整 URL，
+//     与缓存 key 同构）——前者是 $1 的展开值，后者用于自引用候选判定；
 //   - FullURLNoServer 用 r.URL.EscapedPath()（RawQuery 非空时拼 "?" + RawQuery）；
 //   - FullURL = scheme://host + FullURLNoServer：host 用入站 r.Host 原样（含端口），
 //     scheme 优先取请求头 X-Forwarded-Proto 的首个值（小写），否则按 r.TLS 判定 https/http。
@@ -47,11 +65,24 @@ func NewRequestVars(r *http.Request, target string) RequestVars {
 	if r.URL.RawQuery != "" {
 		noServer += "?" + r.URL.RawQuery
 	}
-	return RequestVars{
+	schemeHost := inboundScheme(r) + "://" + r.Host
+	v := RequestVars{
 		Target:          target,
-		FullURL:         inboundScheme(r) + "://" + r.Host + noServer,
+		FullURL:         schemeHost + noServer,
 		FullURLNoServer: noServer,
 	}
+	if isFullURLTarget(target) {
+		v.TargetURL = target // 完整 URL 目标：$1 = 目标原文（行为不变）
+		return v
+	}
+	// 路径目标：$1 展开为含 scheme+host 的完整 URL（裸路径串不是合法上游地址）；
+	// 它同时就是「向本代理自身取同一目标」的 URL（自引用判定基准）
+	if strings.HasPrefix(target, "/") {
+		v.TargetURL, v.SelfURL = schemeHost+target, schemeHost+target
+	} else {
+		v.TargetURL, v.SelfURL = schemeHost+"/"+target, schemeHost+"/"+target
+	}
+	return v
 }
 
 // inboundScheme 推断入站请求的 scheme：优先取请求头 X-Forwarded-Proto 的首个值
@@ -73,7 +104,9 @@ func inboundScheme(r *http.Request) string {
 // （如 $http.server.header.full_url 抢先吃掉 $http.server.header.full_url_no_server 的前缀）。
 func (v RequestVars) pairs() []redirectVar {
 	pairs := []redirectVar{
-		{name: config.PlaceholderTarget, value: v.Target},
+		// $1 的展开值是 TargetURL（完整 URL 目标 = 原文；路径目标 = 含入站 Host 的完整
+		// URL），Target 原文仅作判定用、不再作为展开值（裸路径不是合法上游地址）
+		{name: config.PlaceholderTarget, value: v.TargetURL},
 		{name: config.PlaceholderFullURL, value: v.FullURL},
 		{name: config.PlaceholderFullURLNoServer, value: v.FullURLNoServer},
 	}
@@ -114,13 +147,22 @@ type candidate struct {
 	// 候选显式 auth ?? 规则级 auth 的解析结果（ExpandCandidates 经 Options.CandidateAuth）。
 	// 只读共享，随 candidate 值传递进探测/回源管线。
 	auth *config.CandidateAuth
+	// selfRef 自引用候选（路径目标下展开结果指向本次请求自身，如 docker 规则里的
+	// template: $1——入站 Host 就是本代理）：回源等于请求本代理自己、必然递归成环。
+	// 展开时标记（不删除——selectCandidate 的模板下标与候选列表必须一一对应），
+	// startUpstream 见到即跳过上游请求直接失败，候选竞速对它不原地重试（旧版该候选
+	// 报 unsupported protocol scheme "" 还按 item 重试空转烧满重试次数）。
+	selfRef bool
 }
 
 // ExpandCandidates 把 url-redirect 候选对象列表展开为候选列表：
 // 逐个候选替换 template 中的占位符，每个变量支持 ${name} 与 $name 两种写法，按「变量名
-// 长度降序」顺序替换（见 pairs）；$1 兼容保留（完整 URL 请求 = 目标 URL，路径目标请求 =
-// 路径目标）。长变量先替换也顺带规避了递归展开：后替换的 $1 值（目标串）里即使含变量名
-// 字面量也不会被二次替换。未知的 $ 序列原样保留为字面量。
+// 长度降序」顺序替换（见 pairs）；$1 兼容保留（完整 URL 请求 = 目标 URL 原文，路径目标
+// 请求 = 含入站 Host 的完整 URL，见 RequestVars.TargetURL）。长变量先替换也顺带规避了
+// 递归展开：后替换的 $1 值（目标串）里即使含变量名字面量也不会被二次替换。未知的 $
+// 序列原样保留为字面量。
+// 展开结果等于本次入站完整 URL（自引用候选：回源等于请求本代理自己）的候选打 selfRef
+// 标记——候选列表的个数与顺序保持不变（模板下标一一对应），由回源管线跳过其上游请求。
 // 斜杠接缝去重：full_url_no_server 的值以 / 开头，若模板中占位符前紧邻 /（如
 // https://docker.1panel.live/$http.server.header.full_url_no_server），接缝处的两个 /
 // 合并为一个，保证展开结果为 https://docker.1panel.live/v2/... 而非 ...//v2/...（见 replaceVar）。
@@ -147,7 +189,11 @@ func ExpandCandidates(items []config.URLRedirectItem, vars RequestVars, eff conf
 			t = replaceVar(t, v.name, v.value)
 		}
 		out = append(out, candidate{
-			url:                t,
+			url: t,
+			// 自引用判定：展开结果等于「向本代理自身取同一目标」的 URL（$1 在路径目标下
+			// 的展开值）或本次入站完整 URL。完整 URL 目标的 SelfURL 恒空，恒为 false
+			//（行为不变）。
+			selfRef:            vars.SelfURL != "" && (t == vars.SelfURL || t == vars.FullURL),
 			insecureSkipVerify: eff.CandidateInsecureSkipVerify(item),
 			httpProxy:          eff.CandidateHTTPProxy(item),
 			connectTimeout:     eff.CandidateConnectTimeout(item),

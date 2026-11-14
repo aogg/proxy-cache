@@ -204,6 +204,13 @@ func probeHardFailReason(res *probeResult, pathTarget bool) string {
 // 返回 (结果, 错误)：res 非 nil 时资源所有权移交调用方。eff 为该请求「规则 ?? 全局」
 // 合并生效配置，保留在签名中维持调用方语义（尝试级取值已全部随 cand 传入）。
 func (s *Server) startUpstream(parent context.Context, r *http.Request, cand candidate, eff config.Options, rangeHeader string, onWatchdog func(*progressWatchdog), onHeaders func()) (res *probeResult, err error) {
+	if cand.selfRef {
+		// 自引用候选（展开结果指向本次请求自身，如 docker 规则的 template: $1——入站
+		// Host 就是本代理）：回源等于请求本代理自己、必然递归成环，绝不发起上游请求。
+		// 立即失败交由调用方按既有候选失败路径换下一候选（候选竞速对它不原地重试，
+		// 见 selectCandidate 的 runCandidate）
+		return nil, errors.New("自引用候选（展开后指向本次请求自身），跳过上游请求")
+	}
 	urlStr := cand.url // 候选最终 URL（占位符展开后）
 	// //////////////////  http-timeout（整次尝试总预算）  start  //////////////////////////////
 	// 与客户端连接解耦由上层 ctx（WithoutCancel）保证；这里的总预算不能 defer cancel——

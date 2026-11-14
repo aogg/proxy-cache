@@ -78,7 +78,7 @@ func TestExpandCandidates(t *testing.T) {
 			},
 		},
 		{
-			name:   "dollar1路径目标等于路径目标本身",
+			name:   "dollar1路径目标展开为含入站Host的完整URL（与缓存key同构）",
 			method: http.MethodGet,
 			url:    "http://" + hostDockerRegistry + pathDockerManifest,
 			target: "v2/adockero/proxy-cache/manifests/latest",
@@ -86,7 +86,7 @@ func TestExpandCandidates(t *testing.T) {
 				"https://docker.1panel.live/$1",
 			},
 			want: []string{
-				"https://docker.1panel.live/v2/adockero/proxy-cache/manifests/latest",
+				"https://docker.1panel.live/http://" + hostDockerRegistry + pathDockerManifest,
 			},
 		},
 		{

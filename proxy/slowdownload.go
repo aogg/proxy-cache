@@ -15,6 +15,17 @@
 // 叠加多源升级 → 仍然只有单路。总长不可知的兜底见 blob_size_index.go（manifest size）。
 //
 // 连续性保证不变：升级只增开续传源，绝不动客户端已见字节（不切状态码/响应头，不回退）。
+// 内容对账（2026-11 现场 767MB blob 拼接后 sha256 不符的对策，三道互相补位）：
+//   1. 续传响应一致性核对：206 Content-Length 必须等于 Content-Range 区间长度
+//     （validateResumeResponse）、闭区间声明终点不得超出所请求区间（settleSlowResume）；
+//   2. 非胜者源「首次出数」前与胜者缓冲同偏移交叉对账（take + mismatchSample），
+//     且不得抢在胜者首块之前出数——胜者是已确认前缀的延续、定义权威字节，错位源
+//     （cross-check-mismatch）在第一个块就被剪枝，错位字节进不了流与缓存；
+//   3. 补充源的重复区间字节在丢弃前与已确认输出同偏移比对（slowMerger.verify →
+//     verifyStaleAgainstConfirmed，调用方闭包捕获 accum），不符即剪枝该源
+//    （verify-mismatch）；胜者对账不符绝不反向剪枝（verify-conflict 仅 Warn 留痕——
+//     更可能是有源抢先出数污染了已确认输出）。
+// 「206 且起点匹配」的强制前置绝不放宽、只加严；写缓存前 sha256 强校验仍为最终把关。
 // 每源读继续走 progressReader+watchdog（无新增数据超时语义不变）；候选并发数上限 =
 // 候选列表长度（一般 ≤5），不做额外并发池。
 //
@@ -30,6 +41,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -52,6 +64,9 @@ const (
 	// slowMergeWaitTick 合并循环在无就绪数据时的最长等待：既兜底通知单 token 被
 	// 其他等待方消费的极端情形（防漏唤醒卡死），也让升级后的进度日志保持周期节拍。
 	slowMergeWaitTick = 200 * time.Millisecond
+	// verifySampleWindow 交叉对账的单次比对采样上限（字节）：源错位从第一个字节就
+	// 不符，采样窗口内的比对足以判定，不必整块 memcmp。
+	verifySampleWindow = 8 << 10
 )
 
 // //////////////////  纯逻辑（可单测）  //////////////////////////////////////////////////////
@@ -253,6 +268,11 @@ type blobSupplementInput struct {
 	clientGone bool
 	// merger in/out：nil = 单源阶段；非 nil = 已在有序合并中。
 	merger *slowMerger
+	// verify 重复区间内容对账回调（可 nil = 关闭）：建合并器时挂到 slowMerger.verify，
+	// 把补充源的过期缓冲字节与已确认输出同偏移比对，不符即剪枝该源（见
+	// verifyStaleAgainstConfirmed / take 的对账剪枝）。调用方用闭包捕获自己的累积缓冲
+	//（合并循环 goroutine 内调用，与写侧同 goroutine 串行，无数据竞争）。
+	verify func(off int64, stale []byte) bool
 }
 
 // timeBlobSupplement 时间驱动补充的判定与动作（每满 blob-concurrency-interval 调用一次）：
@@ -339,6 +359,7 @@ func (s *Server) timeBlobSupplement(in *blobSupplementInput) (created bool) {
 		in.merger = s.escalateSlowSources(in.r, in.res, in.offset, others, in.eff,
 			in.knownTotal, in.end, in.labels, in.logSource,
 			"total_source", in.totalSource, "elapsed", elapsed.Round(time.Millisecond).String())
+		in.merger.verify = in.verify // 重复区间对账：补充源字节错位即剪枝（见 take）
 		return true
 	}
 	// 合并阶段：只做加法（增量加入尚未加入的候选源，绝不切换/中断已在下载的源）
@@ -401,19 +422,48 @@ func resumeRangeHeader(offset, end int64) string {
 }
 
 // validateResumeResponse 校验续传响应：必须 206 且 Content-Range 起始等于请求偏移
-// （上游不支持 Range 会回 200 整段 → 丢弃该源，debug 留痕）。
+// （上游不支持 Range 会回 200 整段 → 丢弃该源，debug 留痕）。另做一致性核对（防「头说
+// 一套、字节另一套」的失配源混入合并）：206 声明 Content-Length 时其值必须等于
+// Content-Range 声明区间的长度（end-start+1，RFC 7233 对单区间 206 的要求）——不符即
+// 该源的起点/区间声明不可信，丢弃该源。
 func validateResumeResponse(status int, header http.Header, offset int64) error {
 	if status != http.StatusPartialContent {
 		return fmt.Errorf("续传响应状态码 %d ≠ 206（上游可能不支持 Range）", status)
 	}
-	start, _, _, ok := parseContentRange(header.Get("Content-Range"))
+	start, end, _, ok := parseContentRange(header.Get("Content-Range"))
 	if !ok {
 		return fmt.Errorf("续传响应缺少可解析的 Content-Range 头")
 	}
 	if start != offset {
 		return fmt.Errorf("续传响应 Content-Range 起始 %d ≠ 请求偏移 %d", start, offset)
 	}
+	if cl := strings.TrimSpace(header.Get("Content-Length")); cl != "" {
+		clv, err := strconv.ParseInt(cl, 10, 64)
+		if err == nil && clv > 0 && clv != end-start+1 {
+			return fmt.Errorf("续传响应 Content-Length %d ≠ Content-Range 区间长度 %d（bytes %d-%d），声明不可信",
+				clv, end-start+1, start, end)
+		}
+	}
 	return nil
+}
+
+// verifyStaleAgainstConfirmed 重复区间对账的纯逻辑实现：把源的过期缓冲字节 stale
+// （绝对偏移 off 起、本就不会写给客户端）与已确认输出 confirmed（同一偏移处已写给
+// 客户端与 accum 的内容，即 [0..游标) 的权威字节）重叠部分逐字节比对。重叠 = 区间
+// [off, off+len(stale)) 与 [0, len(confirmed)) 的交集；交集为空（该段尚无权威字节）
+// 视为通过（无可比样本，不冤枉源）。不符 = 该源的实际字节与其 206 起点声明错位。
+func verifyStaleAgainstConfirmed(confirmed []byte, off int64, stale []byte) bool {
+	if off < 0 || len(stale) == 0 {
+		return true
+	}
+	avail := int64(len(confirmed)) - off
+	if avail <= 0 {
+		return true // 权威输出尚未覆盖该偏移：无可比样本
+	}
+	if avail > int64(len(stale)) {
+		avail = int64(len(stale))
+	}
+	return bytes.Equal(confirmed[off:int64(off)+avail], stale[:int(avail)])
 }
 
 // //////////////////  源与有序合并  //////////////////////////////////////////////////////////
@@ -448,8 +498,46 @@ type slowSource struct {
 	// pumping true = 该源的 pump 读取协程已启动（m.mu 下读写，防止 start 与续传协程
 	// 对同一源重复启动 pump 造成数据重复）。
 	pumping bool
+	// delivered true = 该源已有数据写给客户端/累积缓冲（m.mu 下读写）：非胜者源的
+	// 「首次出数」要与胜者缓冲做同偏移交叉对账（见 take），此后不再重复对账。
+	delivered bool
 	// pruned 非空 = 已剪枝（剪枝 reason，用于留痕与去重）。
 	pruned string
+}
+
+// mismatchSample 把本源缓冲中与区间 [off, off+len(p)) 重叠的字节作为对账样本，与 p
+// 逐字节比对（m.mu 下调用；调用方只对本源 = 胜者时取用——胜者是已确认输出的延续、
+// 样本可信）。返回首个不符字节的绝对偏移（>=0 = 对账不符）；-1 = 相符，含「无重叠
+// 样本」（本源缓冲尚未覆盖该区间，无可比样本，调用方放行）。比对上限
+// verifySampleWindow 字节——源错位从首个字节就不符，采样足以判定，不必整块 memcmp。
+func (src *slowSource) mismatchSample(off int64, p []byte) int64 {
+	cmpLen := len(p)
+	if cmpLen > verifySampleWindow {
+		cmpLen = verifySampleWindow
+	}
+	base := src.readPos - int64(src.bufBytes) // 缓冲首块的绝对偏移
+	for _, chunk := range src.buf {
+		chunkLo, chunkHi := base, base+int64(len(chunk))
+		base = chunkHi
+		lo, hi := off, off+int64(cmpLen)
+		if chunkHi <= lo || chunkLo >= hi {
+			continue // 该块与比对区间无重叠
+		}
+		sLo, sHi := lo, hi
+		if chunkLo > sLo {
+			sLo = chunkLo
+		}
+		if chunkHi < sHi {
+			sHi = chunkHi
+		}
+		// 重叠区间 [sLo, sHi)：chunk[sLo-chunkLo:] ↔ p[sLo-off:]
+		for a, b := sLo, sLo-chunkLo; a < sHi; a, b = a+1, b+1 {
+			if chunk[b] != p[a-off] {
+				return a
+			}
+		}
+	}
+	return -1
 }
 
 // slowMerger 有序合并器：客户端严格按偏移有序写——每次取「持有下一期望偏移」的就绪
@@ -477,6 +565,15 @@ type slowMerger struct {
 	endedAlive int
 	// log 结构化日志器（剪枝/收尾留痕）。
 	log *slog.Logger
+	// verify 重复区间内容对账回调（可 nil = 关闭，测试与既有行为不受影响）：
+	// 把「偏移已落后游标、绝不会再写给客户端」的过期缓冲字节与已确认输出（同一绝对
+	// 偏移处已写给客户端与 accum 的内容）逐字节比对——不符说明该源的 206 起点声明
+	// 与实际字节错位（上游谎报起点 / 混入非本 blob 内容），立即剪枝该源，其后字节
+	// 绝不再进入客户端流与缓存。回调在合并循环 goroutine 内调用（与 write 同一
+	// goroutine），对调用方闭包捕获的累积缓冲只读、与写侧天然串行，无数据竞争。
+	verify func(off int64, stale []byte) bool
+	// winnerConflictLogged 胜者对账冲突的 Warn 已输出过（一次性，防逐块刷屏；m.mu 下读写）。
+	winnerConflictLogged bool
 }
 
 // newSlowMerger 创建合并器；调用 run 前源尚未开始异步填充。
@@ -581,7 +678,21 @@ func (m *slowMerger) take() []byte {
 	var (
 		events  []pruneEvent
 		toClose []*slowSource
+		// conflictEvents 对账冲突事件（胜者字节与已确认输出不符）：不剪枝、仅留痕
+		//（锁外用独立文案输出，避免复用「源已剪枝」文案误导）
+		conflictEvents []pruneEvent
 	)
+	// pruneSource 统一的剪枝登记（m.mu 下调用）：置标记、留痕事件、待关闭列表。
+	pruneSource := func(src *slowSource, reason string, level slog.Level) {
+		if src.pruned != "" {
+			return
+		}
+		src.pruned = reason
+		events = append(events, pruneEvent{name: src.name, reason: reason, level: level})
+		if src.res != nil {
+			toClose = append(toClose, src)
+		}
+	}
 	m.mu.Lock()
 	for _, src := range m.sources {
 		if src.pruned != "" {
@@ -604,11 +715,7 @@ func (m *slowMerger) take() []byte {
 			level = slog.LevelInfo // 超限剪枝是带宽放大收敛的关键动作，Info 留痕
 		}
 		if reason != "" {
-			src.pruned = reason
-			events = append(events, pruneEvent{name: src.name, reason: reason, level: level})
-			if src.res != nil {
-				toClose = append(toClose, src)
-			}
+			pruneSource(src, reason, level)
 		}
 	}
 	// 丢弃过期前缀（偏移已落后 next 的缓冲字节绝不会再写给客户端），随后取
@@ -625,6 +732,25 @@ func (m *slowMerger) take() []byte {
 			if headFrom >= m.next {
 				break
 			}
+			// 重复区间丢弃前先对账（m.verify 非 nil 时）：过期字节本就不会写给客户端，
+			// 但它是该源「Range 起点声明是否与实际字节一致」的免费校验样本——与已确认
+			// 输出同偏移逐字节比对，不符说明该源 206 起点声明不可信（上游谎报起点 /
+			// 混入非本 blob 内容），立即剪枝，其后字节绝不再进入客户端流与缓存。
+			// 例外：胜者对账不符绝不反向剪枝（它是已确认前缀的延续、最可信流；不符
+			// 更可能是某源在胜者缓冲空窗抢先出数污染了已确认输出）——过期字节照旧
+			// 丢弃，Warn 一次留痕供运维判定污染区间
+			if m.verify != nil && !m.verify(headFrom, head) {
+				if len(m.sources) > 0 && m.sources[0] == src {
+					if !m.winnerConflictLogged {
+						m.winnerConflictLogged = true
+						conflictEvents = append(conflictEvents, pruneEvent{name: src.name, level: slog.LevelWarn,
+							reason: fmt.Sprintf("verify-conflict: 胜者偏移 %d 起的重复区间字节与已确认输出不符（已确认输出可能被抢先出数的源污染，胜者保留继续供数）", headFrom)})
+					}
+					break
+				}
+				pruneSource(src, fmt.Sprintf("verify-mismatch: 偏移 %d 起的重复区间字节与已确认输出不符（该源起点声明不可信）", headFrom), slog.LevelWarn)
+				break
+			}
 			if headFrom+int64(len(head)) <= m.next {
 				src.buf = src.buf[1:] // 整块过期：弹出
 				src.bufBytes -= len(head)
@@ -632,15 +758,51 @@ func (m *slowMerger) take() []byte {
 				continue
 			}
 			cut := int(m.next - headFrom) // 跨界块：只丢过期前缀，剩余部分仍有效
+			if m.verify != nil && !m.verify(headFrom, head[:cut]) {
+				if len(m.sources) > 0 && m.sources[0] == src {
+					if !m.winnerConflictLogged {
+						m.winnerConflictLogged = true
+						conflictEvents = append(conflictEvents, pruneEvent{name: src.name, level: slog.LevelWarn,
+							reason: fmt.Sprintf("verify-conflict: 胜者偏移 %d 起的重复区间字节与已确认输出不符（已确认输出可能被抢先出数的源污染，胜者保留继续供数）", headFrom)})
+					}
+					break
+				}
+				pruneSource(src, fmt.Sprintf("verify-mismatch: 偏移 %d 起的重复区间字节与已确认输出不符（该源起点声明不可信）", headFrom), slog.LevelWarn)
+				break
+			}
 			src.buf[0] = head[cut:]
 			src.bufBytes -= cut
 			dropped += cut
 			break
 		}
+		if src.pruned != "" {
+			continue // 对账剪枝：该源剩余缓冲一并废弃，不再参与取数
+		}
 		if src.bufBytes == 0 {
 			continue
 		}
 		if headFrom := src.readPos - int64(src.bufBytes); headFrom == m.next {
+			// 非胜者源不得抢在胜者「首次出数」之前出数：胜者是已确认前缀（已写给客户端
+			// 与 accum 的字节）的延续、最可信流，且它尚未出数时缓冲可能瞬时空窗——此时
+			// 交叉对账无样本可依，谁先出数谁定义「权威」就把错位源洗白成权威。等胜者先
+			// 出一块（慢源场景这只是它已在途的下一块，延迟可忽略）或被剪枝/EOF（其流
+			// 无法再供数）再放行非胜者源。胜者彻底卡死由 read-timeout 看门狗兜底剪枝，
+			// 等待有界。
+			if winner := m.sources[0]; winner != src && winner.pruned == "" && !winner.delivered {
+				continue
+			}
+			// 非胜者源「首次出数」前的交叉对账：胜者是已确认前缀的延续、优先采信——它
+			// 缓冲里与本次出数区间重叠的字节就是免费的对账样本。不符 = 该源的 206 起点
+			// 声明与实际字节错位（上游谎报起点 / 混入非 blob 内容），剪枝该源，绝不把
+			// 首个错位块抢在胜者之前写进流与缓存。胜者缓冲暂无该区间样本（慢源瞬时空
+			// 窗）时放行（无可比样本；此后的重复区间对账仍会兜底核查）。
+			if !src.delivered && m.sources[0] != src && m.sources[0].pruned == "" {
+				if bad := m.sources[0].mismatchSample(headFrom, src.buf[0]); bad >= 0 {
+					pruneSource(src, fmt.Sprintf("cross-check-mismatch: 偏移 %d 起的字节与胜者缓冲不符（该源起点声明不可信，bad_at=%d）", headFrom, bad), slog.LevelWarn)
+					continue
+				}
+			}
+			src.delivered = true
 			chunk = src.buf[0]
 			src.buf = src.buf[1:]
 			src.bufBytes -= len(chunk)
@@ -671,6 +833,15 @@ func (m *slowMerger) take() []byte {
 			"candidate", truncate(e.name, 300), "reason", e.reason,
 			"next", m.next, "total", m.knownTotal,
 			"sources", total, "alive_sources", alive, "live_sources", alive)
+	}
+	for _, e := range conflictEvents {
+		// 对账冲突（胜者字节 vs 已确认输出）不是剪枝：源保留继续供数，独立文案留痕，
+		// 运维据此判定「已确认输出可能被抢先出数的错位源污染」的区间（写缓存前的
+		// sha256 强校验仍是最终把关）
+		m.log.Log(context.Background(), e.level, "慢速升级多源续传对账冲突",
+			"candidate", truncate(e.name, 300), "reason", e.reason,
+			"next", m.next, "total", m.knownTotal,
+			"sources", total, "alive_sources", alive)
 	}
 	return chunk
 }
@@ -902,7 +1073,7 @@ func (s *Server) joinSlowSources(r *http.Request, m *slowMerger, cands []candida
 	for i := range picked {
 		cand, src := picked[i], fresh[i]
 		go func() {
-			s.settleSlowResume(r, src, m, cand, eff, rangeHeader, offset, labels, logSource)
+			s.settleSlowResume(r, src, m, cand, eff, rangeHeader, offset, end, labels, logSource)
 			m.changed() // 定局通知（成功/失败皆然），合并循环免去 200ms tick 等待
 		}()
 	}
@@ -926,13 +1097,15 @@ func (s *Server) joinSlowSources(r *http.Request, m *slowMerger, cands []candida
 
 // settleSlowResume 单个候选的 Range 续传尝试（joinSlowSources 的 goroutine 内执行）：
 // 复用 startUpstream 公共底层（与候选探测同一套请求头/token dance/看门狗/超时/insecure）。
-// 响应必须 206 且 Content-Range 起始等于请求偏移，否则丢弃该源；尝试失败同样只置 err
-// （合并循环剪枝留 debug 痕）——绝不影响胜者流与客户端已见字节。源不支持 Range（回
-// 200 全量）时额外输出 Info「未补充多源并发」reason=upstream_no_range（该源被跳过），
-// 其余失败保留既有 Debug 留痕。成功且有活体 body 时由本协程启动该源的 pump。
+// 响应必须 206 且 Content-Range 起始等于请求偏移，否则丢弃该源；end>=0（闭区间续传
+// bytes=offset-end）时 Content-Range 声明终点还必须不大于请求终点（上游回超出所请求
+// 区间的声明 = 区间语义不可信）。尝试失败同样只置 err（合并循环剪枝留 debug 痕）——
+// 绝不影响胜者流与客户端已见字节。源不支持 Range（回 200 全量）时额外输出 Info
+// 「未补充多源并发」reason=upstream_no_range（该源被跳过），其余失败保留既有 Debug
+// 留痕。成功且有活体 body 时由本协程启动该源的 pump。
 // 全部状态写入在 m.mu 下进行（与合并循环并发安全）。labels/logSource 为 docker 日志
 // 统一标签（image/digest + source=client|resume），与判定日志同一套键序。
-func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerger, cand candidate, eff config.Options, rangeHeader string, offset int64, labels dockerLogInfo, logSource string) {
+func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerger, cand candidate, eff config.Options, rangeHeader string, offset, end int64, labels dockerLogInfo, logSource string) {
 	// 与客户端断开解耦（WithoutCancel）：docker 已断开也继续填缓存（与胜者流同一语义）
 	res, err := s.startUpstream(context.WithoutCancel(r.Context()), r, cand, eff, rangeHeader, nil, nil)
 	if err != nil {
@@ -961,6 +1134,20 @@ func (s *Server) settleSlowResume(r *http.Request, src *slowSource, m *slowMerge
 			labels.attrs(logSource, "candidate", truncate(cand.url, 300), "status", res.status, "offset", offset,
 				"err", verr)...)
 		return
+	}
+	if end >= 0 {
+		// 闭区间续传（bytes=offset-end）：声明终点超出所请求区间 = 该源的区间语义
+		// 不可信（合规服务端只会收窄或相等），按不合规丢弃，绝不让它的字节进合并
+		if _, e, _, pok := parseContentRange(res.header.Get("Content-Range")); pok && e > end {
+			res.Close()
+			m.mu.Lock()
+			src.err = fmt.Errorf("续传响应 Content-Range 终点 %d 超出请求终点 %d（区间声明不可信）", e, end)
+			m.mu.Unlock()
+			s.log.Debug("慢速升级续传响应区间超出所请求范围，丢弃该源",
+				labels.attrs(logSource, "candidate", truncate(cand.url, 300), "status", res.status,
+					"offset", offset, "range", rangeHeader, "declared_end", e)...)
+			return
+		}
 	}
 	m.mu.Lock()
 	if src.pruned != "" {

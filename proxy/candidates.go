@@ -195,6 +195,19 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 			}
 		}()
 		candLast := error(nil)
+		if cand.selfRef {
+			// 自引用候选（路径目标下展开结果指向本次请求自身，如 docker 规则的
+			// template: $1——入站 Host 就是本代理）：回源等于请求本代理自己、必然递归
+			// 成环，绝不发上游请求；本候选一次跳过（不按 url-redirect-item-error-retry
+			// 原地重试——跳过是确定性的，重试只会空转烧日志）。Debug 留痕即可：候选配置
+			// 有误属噪音候选，Warn 会在每一轮都刷屏。
+			candLast = errors.New("自引用候选（展开后指向本次请求自身），跳过")
+			s.log.Debug("url-redirect 自引用候选跳过（展开后指向本次请求自身，回源会递归请求本代理）",
+				"round", roundNo, "round_total", totalRounds,
+				"index", idx, "template", tpl, "candidate", cand.url)
+			done <- candidateOutcome{err: candLast, slot: slot}
+			return
+		}
 		for attempt := 1; attempt <= itemTotalAttempts; attempt++ {
 			if ctx.Err() != nil {
 				break // 已被胜者/扫描总预算取消：本候选提前收场
