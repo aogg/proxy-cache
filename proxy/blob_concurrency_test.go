@@ -1126,9 +1126,23 @@ func TestBlobConcurrencyResumeGraceAbortsAllSources(t *testing.T) {
 	wantLineField(t, mustLogLine(t, logText, "写响应体失败（客户端已断开，续传按宽限语义处置）"),
 		"source=resume", "grace=1.2s")
 	wantLineField(t, mustLogLine(t, logText, "宽限终止续传"), "source=resume", "part_bytes=")
-	// 合并器内全部源（胜者 + 补充源）都被 abortAll 逐路关闭：两路各一条 Debug 关闭痕
-	abortLines := logLinesOf(logText, "慢速升级多源续传源已关闭")
+	// 合并器内全部源（胜者 + 补充源）都被 abortAll 逐路关闭：两路各一条 Debug 关闭痕。
+	// 注意时序：abortAll 在宽限计时器 goroutine 里逐源「Close → 写关闭日志」，而执行方
+	// goroutine 在第一路（胜者）Close 的瞬间即被唤醒收尾、ServeHTTP 返回——本测试紧随
+	// 其后读到的日志快照可能早于第二路（补充源）的关闭日志落盘，这里先轮询等两条关闭
+	// 日志都可见（语义与下方断言一致，只是等日志写完），再做严格计数断言。
 	reason := "续传客户端断开且宽限期内无搭车订阅者，终止全部上游源"
+	resumeWaitUntil(t, 3*time.Second, func() bool {
+		aborted := 0
+		for _, line := range logLinesOf(fx.log.String(), "慢速升级多源续传源已关闭") {
+			if strings.Contains(line, reason) {
+				aborted++
+			}
+		}
+		return aborted >= 2
+	}, "等待宽限终止的 2 路源关闭日志落盘超时")
+	logText = fx.log.String()
+	abortLines := logLinesOf(logText, "慢速升级多源续传源已关闭")
 	aborted := 0
 	for _, line := range abortLines {
 		if strings.Contains(line, reason) {

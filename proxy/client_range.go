@@ -215,6 +215,15 @@ func (z *zeroRangeWriter) WriteHeader(status int) {
 	z.ResponseWriter.WriteHeader(status)
 }
 
+// Flush 转发底层 Flusher：立即响应路径在候选扫描前只回放小体积的本地前缀（可能小于
+// net/http 服务端缓冲），必须显式冲刷响应头与前缀，客户端才能及时拿到首字节。底层
+// ResponseWriter 不支持 Flusher 时静默跳过（与 net/http 对非 Flusher 的语义一致）。
+func (z *zeroRangeWriter) Flush() {
+	if f, ok := z.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Write 实现 http.ResponseWriter：带区间终点时把超出区间的字节丢弃（不写客户端），
 // 返回「已消费」的长度让内部完整 GET 链路继续跑完——缓存照常写全，客户端只收区间内字节。
 func (z *zeroRangeWriter) Write(p []byte) (int, error) {

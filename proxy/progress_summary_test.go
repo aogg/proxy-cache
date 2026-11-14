@@ -839,6 +839,7 @@ func TestProgressRegisterResumeInFlight(t *testing.T) {
 	half := 48 << 10 // 半截前缀：注册初始已下载字节
 	fx.reg.setContent(digest, content)
 	fx.reg.setChunkConfig(8<<10, 10*time.Millisecond)
+	fx.setManifestSize(digest, int64(len(content))) // manifest 先行：立即响应登记的 total 依据
 	key := prefetchBlobKey(name, digest)
 	fx.s.savePartialPart(fx.disk, key, content[:half])
 
@@ -862,7 +863,7 @@ func TestProgressRegisterResumeInFlight(t *testing.T) {
 			row.image, row.digest, row.method, name, digest)
 	}
 	if row.total != int64(len(content)) {
-		t.Errorf("resume 条目 total = %d, want %d（Content-Range 总长）", row.total, len(content))
+		t.Errorf("resume 条目 total = %d, want %d（立即响应 commit 时按 manifest 索引登记）", row.total, len(content))
 	}
 	if row.bytes < int64(half) {
 		t.Errorf("resume 条目 bytes=%d 应 ≥ 半截前缀 %d（进度不回退）", row.bytes, half)

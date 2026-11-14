@@ -16,6 +16,15 @@
 //     body = 本地半截前缀回放 + 上游剩余区间实时拼接——docker 客户端无需支持 Range、
 //     完全无感知；拼接期间上游剩余数据边转发边追加写半截文件，EOF 后半截内容 = 完整
 //     blob，按既有 cache.Set 语义原子转为正式缓存条目并删除半截文件；
+//   - 立即响应（首字节时序优化，2026-11 现场「docker pull 长时间零进度」的根因修复）：
+//     响应头不再等待候选扫描命中（旧时序里扫描窗口可达 60s+，docker 客户端等响应头约
+//     30s 就超时断开）——登记续传在途条目后立即合成响应头 commit 并回放本地半截前缀
+//     （总长取 manifest 索引 blob_size_index.go，未知则 chunked），docker 毫秒级看到
+//     响应头与字节进度；上游增量仍必须等既有安全校验（206 且 Content-Range 起点匹配）
+//     通过后才拼接。扫描失败（含上游明确拒绝 Range）时按「安全中断」截断本次响应——
+//     已发出的前缀字节是合法内容前缀、绝不错位，docker 以 Range/重试接续（无半截走
+//     干净全量回源、有半截从更长前缀再续），数据永远正确；搭车订阅者同样立即响应
+//     （快照未就绪即合成头 commit，见 prefetch_hub.go 的 tryServeFromPrefetchHub）；
 //   - 并发合并：续传执行方登记与预取同一套在途流共享注册表（prefetchStreamHub 的
 //     resume 条目），其余客户端请求/等待超限的重试请求经既有搭车机制（tryServeFromPrefetchHub）
 //     订阅「半截前缀 + 实时增量」，X-Cache: PREFETCH；同 blob 的预取任务经既有
@@ -42,9 +51,12 @@
 //     但写缓存前由 finalizeFetchEntry 统一做 sha256 强校验（防毒缓存兜底）——2026-11-07
 //     现场：毒半截（前缀混入异常镜像源的错误字节）被固化为正式缓存后客户端每次 pull 都
 //     确定性失败，故校验失败拒绝入库并丢弃毒半截（下次全量回源自愈）；
-//   - commit 前必须先确认上游是 206 且 Content-Range 起点匹配半截长度：确认前绝不向
-//     客户端写任何字节——若上游对 Range 回 200 全量响应，回放本地前缀再拼全量会数据
-//     错位，因此非 206 一律安全降级（丢弃半截走既有全量回源路径，绝不给客户端错误数据）；
+//   - 上游数据写客户端的前置校验绝不放宽：206 且 Content-Range 起点匹配半截长度确认前，
+//     绝不把上游字节写给客户端——若上游对 Range 回 200 全量响应，把本地前缀与全量响应
+//     拼在一起会数据错位，非 206 一律安全降级。立即响应只把**本地半截前缀**（同 digest
+//     内容的合法前缀，内容永远可信）先发给客户端；扫描失败/非 206 时响应已 commit 的
+//     按「安全中断」截断（docker 重试接续，绝不在已回放前缀的流上拼全量），未 commit
+//     的（旧时序）维持既有降级全量回源不变；
 //   - 半截为 0 字节直接丢弃；上游 416（起点 ≥ 总长，而半截是合法前缀）证明半截已完整，
 //     直接读回写缓存回放，不再全量下载；
 //   - 客户端带 Range 的请求按起点与半截长度的关系分流（见 client_range.go）：
@@ -493,16 +505,22 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 //  1. 重查半截前缀（前置检查后可能已被并发流程消费，竞态按既有全量回源兜底）；
 //  2. 登记「续传在途条目」（prefetchStreamHub 的 resume 条目，written 预置为半截前缀
 //     长度）——此后其余客户端请求即可经既有搭车机制订阅前缀+增量（上游仅此一路下载）；
-//  3. 候选轮询 Range 续传扫描（scanResumeCandidate）：全部失败按失败类别降级——上游
-//     明确拒绝按断点续传（非 206）丢弃半截、网络/超时保留半截，均走既有全量回源兜底
-//     （commit 前未向客户端写过任何字节，行为与旧版一致）；
-//  4. 扫描发现半截已完整（上游 416）：读回半截写缓存并回放（区间请求按区间切片回 206），
-//     不再全量下载；
-//  5. 206 且起点匹配（commit 前置校验）：合成响应头（剔除上游 206 的 Content-Range）——
-//     缺省对客户端 commit 一次完整 200（Content-Length=总长）；cr 非空（客户端区间请求，
-//     起点 >0）时 commit 206 + Content-Range，body 只发区间内字节；
-//  6. 回放半截前缀（写锁内整读、锁外按客户端区间窗口写客户端——慢客户端不拖住写锁），
-//     随后流式读取上游剩余区间：逐块「追加写半截文件 → 广播增量给搭车订阅者 → 写客户端
+//  3. 立即响应（首字节时序优化）：登记条目后立即合成响应头并 commit——不再等待上游
+//     206 确认（旧时序里 commit 被候选扫描窗口拖住数十秒，docker 客户端等响应头约 30s
+//     就超时断开，pull 输出长时间零进度的根因）。总长已知（manifest 索引，见
+//     blob_size_index.go）时 commit 200 + Content-Length=总长（cr 非空为 206 + 区间头），
+//     未知则不设（chunked）；随后立即回放本地半截前缀——本地前缀内容永远可信，先发给
+//     客户端是安全的，docker 毫秒级看到响应头与字节进度；
+//  4. 候选轮询 Range 续传扫描（scanResumeCandidate）：全部失败时——立即响应路径响应头
+//     已 commit，按「安全中断」收场（半截保留/丢弃规则不变，docker 以重试接续；绝不在
+//     已回放前缀的流上降级全量回源，从 0 的全量与已发前缀拼接必然错位）；旧时序路径
+//     （区间请求且总长未知，未 commit）维持既有降级全量回源不变；
+//  5. 扫描发现半截已完整（上游合规 416）：立即响应路径直接缓存收尾（前缀已回放完毕）；
+//     旧时序路径读回半截写缓存并回放（区间请求按区间切片回 206），不再全量下载；
+//  6. 206 且起点匹配（上游增量拼接的强制前置校验，绝不放宽）：旧时序路径此时才合成
+//     响应头（沿用上游 206 的 Content-Type / Docker-Content-Digest 等，剔除
+//     Content-Range、Content-Length 重置为总长）并 commit + 回放前缀；两路时序随后一致
+//     ——流式读取上游剩余区间：逐块「追加写半截文件 → 广播增量给搭车订阅者 → 写客户端
 //     与累积缓冲」（先磁盘后推进 written，是搭车订阅者读前缀的既有契约）；
 //  7. EOF 且累积长度与总长一致：半截内容 = 完整 blob，复用 finalize（既有 cache.Set
 //     语义）原子写缓存（blob 落盘成功即删半截，见 finalizeFetchEntry 钩子），置 done
@@ -573,66 +591,15 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		}
 	}()
 
-	// 候选轮询 Range 续传扫描（commit 前，可自由换候选；失败不向客户端写任何字节）
-	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target), eff)
-	upRes, total, complete, invalid, serr := s.scanResumeCandidate(r, candidates, eff, n)
-	if serr != nil {
-		// 广播搭车订阅者降级（未 commit 的改走各自既有回源路径）
-		ent.finishFailed(serr)
-		if invalid {
-			// 上游明确拒绝按断点续传（非 206 / Content-Range 起点不匹配）：丢弃半截
-			// 走既有全量回源（安全降级——确认 206 且起点匹配前未向客户端写过任何字节，
-			// 全量回源从 0 开始，绝不产生数据错位）
-			disk.RemovePart(key)
-		}
-		s.log.Warn("blob 半截续传候选扫描失败，降级既有全量回源",
-			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n,
-				"invalid", invalid, "err", serr)...)
-		// 网络/超时类失败保留半截：下方全量回源若再失败，其失败捕获会把更长前缀存回
-		// 半截（进度不回退）；全量成功则写缓存并删半截，两条路都正确
-		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
-	}
-	if complete {
-		// 半截已完整（上游 416 证实）：读回半截写缓存并回放（区间请求按区间切片回 206）
-		return s.serveResumeComplete(w, r, key, target, digest, ent, eff, disk, start, finalize, cr...)
-	}
-
-	if hasRange && total <= 0 {
-		// 客户端区间请求必须有总长才能给出合法的 Content-Range / Content-Length：上游 206
-		// 没带可解析的 Content-Range 时绝不 commit（半截前缀长度 ≠ 对象总长，谎报会让客户端
-		// 从错误偏移继续）。此刻未向客户端写任何字节 → 按「本地半截无法满足」收场，调用方
-		// 改走旧版 206 透传（client_range.go 的 errBlobRangeUnavailable 分支）
-		upRes.Close()
-		ent.finishFailed(errBlobRangeUnavailable)
-		s.log.Warn("blob 半截续传拿不到对象总长，无法满足客户端区间请求，改走旧版 206 透传",
-			labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
-				"part_bytes", n, "range_start", spec.start)...)
-		return nil, false, errBlobRangeUnavailable
-	}
-
-	// 合成（以完整 blob 为基准的）响应头：沿用上游响应头（Content-Type /
-	// Docker-Content-Digest / ETag 等），剔除上游 206 的 Content-Range、Content-Length
-	// 重置为总长（拿不到总长则不设，Go 按 chunked 编码流式传输）。完整 GET 时它直接作为
-	// 客户端的 200 响应头；区间请求（cr 非空）时 commitResumeHeader 会把它改写成 206 +
-	// 区间 Content-Range/Content-Length（上游 206 语义绝不透传给客户端）。
-	// hdr 为本次探测独立深拷贝，构建后只读（直接共享给缓存条目与搭车快照）。
-	hdr := upRes.header.Clone()
-	hdr.Del("Content-Range")
-	if total > 0 {
-		hdr.Set("Content-Length", strconv.FormatInt(total, 10))
-	} else {
-		hdr.Del("Content-Length")
-	}
-	ent.setSnapshot(http.StatusOK, hdr, upRes.url) // 搭车订阅者的响应头快照（预取侧 commit 点同语义）
-
-	// 宽限终止状态（graceMu 保护，语义分工见文件头）：客户端写失败（docker 已断开）且
-	// hub 条目无搭车订阅者时启动宽限计时器——到期仍无订阅者则置位 graceAborted 并从
-	// 计时器 goroutine 关闭上游 body（让阻塞在 Read 上的读循环立即返回错误终止读取，
-	// 读循环查 graceAborted 按宽限终止收场）；宽限期内有订阅者加入则放弃终止维持现状。
-	// 与 EOF 的竞态以先到者为准：EOF 先到则 break 出循环经 stopGrace 停表正常写缓存
-	//（计时器已停；恰已触发的回调最多做一次幂等 upRes.Close，无害），宽限先到则读循环
-	// 按 errResumeGraceAborted 收场——两条路的半截（只增不减）与缓存（仅完整 EOF 后
-	// 写入）数据都一致。
+	// 宽限终止状态（graceMu 保护，语义分工见文件头；自原 commit 后位置上移——立即响应
+	// 路径在候选扫描前就要写客户端，writeClient 的断开检测/宽限计时必须先于扫描就绪）：
+	// 客户端写失败（docker 已断开）且 hub 条目无搭车订阅者时启动宽限计时器——到期仍无
+	// 订阅者则置位 graceAborted 并从计时器 goroutine 关闭上游 body（让阻塞在 Read 上的
+	// 读循环立即返回错误终止读取，读循环查 graceAborted 按宽限终止收场）；宽限期内有
+	// 订阅者加入则放弃终止维持现状。与 EOF 的竞态以先到者为准：EOF 先到则 break 出循环
+	// 经 stopGrace 停表正常写缓存（计时器已停；恰已触发的回调最多做一次幂等 upRes.Close，
+	// 无害），宽限先到则读循环按 errResumeGraceAborted 收场——两条路的半截（只增不减）
+	// 与缓存（仅完整 EOF 后写入）数据都一致。
 	graceLimit := config.DefaultDockerResumeClientGoneGrace
 	if s.cfg != nil {
 		graceLimit = s.cfg.GlobalDockerResumeClientGoneGrace()
@@ -645,6 +612,12 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		// 由续传读循环在升级时登记（graceMu 保护），宽限到期回调据此逐路关闭全部上游源
 		//（客户端已断开又无人搭车时，多源并发的每一路都不该继续占带宽）。
 		graceMerger *slowMerger
+
+		upRes    *probeResult // 扫描命中后的活体上游（onGraceExpired 引用，先声明后赋值）
+		total    int64        // 上游确认的对象总长（206 Content-Range；不可知为 -1）
+		complete bool         // 扫描发现半截已完整（上游合规 416）
+		invalid  bool         // 存在「上游明确拒绝按断点续传」的候选
+		serr     error        // 扫描失败（全部候选出结果且无命中）
 	)
 	// stopGrace 停掉宽限计时器（幂等）：读循环与 fail 的每个收场出口调用，防止计时器
 	// 在收场后误触发，timer goroutine 不泄漏。
@@ -680,6 +653,255 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		upRes.Close()
 	}
 
+	// 累积缓冲与客户端写窗口（自原 prefix 回放处上移，供立即响应路径在扫描前回放前缀）：
+	// accum 始终累积完整 blob（缓存条目必须完整），writeClient 按客户端区间窗口裁剪
+	//（起点之前的字节跳过、终点之后的字节不再写；完整 GET 时窗口 = [0, +∞) 等价于
+	// 原来的 w.Write(p)）。
+	accum := bytes.NewBuffer(make([]byte, 0, int(n)+streamChunkSize))
+	clientOK := true // 客户端写失败（docker 已断开）后置 false：按宽限语义处置（见写失败分支）
+	writeClient := func(off int64, p []byte) {
+		if !clientOK || len(p) == 0 {
+			return
+		}
+		lo, hi := off, off+int64(len(p)) // 该块在完整 blob 中的半开区间 [lo, hi)
+		if lo < clientStart {
+			lo = clientStart
+		}
+		if clientLast >= 0 && hi > clientLast+1 {
+			hi = clientLast + 1
+		}
+		if hi <= lo {
+			return // 整块都在客户端区间之外：只进缓存/半截，不写客户端
+		}
+		if _, werr := w.Write(p[lo-off : hi-off]); werr != nil {
+			clientOK = false
+			// 客户端断开（docker 已断）的宽限终止判定（本闭包此后不再进入，仅此一次）：
+			//   - hub 条目已有搭车订阅者：不宽限，维持现状继续拉（订阅者还要收增量）；
+			//   - 宽限配置 <=0（graceLimit<=0）：关闭宽限终止，维持旧版「继续读完只填
+			//     缓存」语义不变；
+			//   - 无订阅者且宽限 >0：启动宽限计时器——到期仍无订阅者则终止上游读取
+			//    （errResumeGraceAborted，见读循环的宽限终止出口；预取路径与搭车读侧
+			//     不受影响），宽限期内有订阅者加入则到点自动放弃（见 onGraceExpired）。
+			subs := ent.subscriberCount()
+			if graceLimit > 0 && subs == 0 {
+				graceMu.Lock()
+				if graceTimer == nil { // 防御：仅启动一次（clientOK 已拦住重复进入）
+					graceTimer = time.AfterFunc(graceLimit, onGraceExpired)
+				}
+				graceMu.Unlock()
+			}
+			s.log.Warn("写响应体失败（客户端已断开，续传按宽限语义处置）",
+				labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200),
+					"grace", graceLimit.String(), "subscribers", subs, "err", werr)...)
+		}
+	}
+	// replayPrefix 读回半截前缀并写入累积缓冲与客户端（写锁内整读、锁外写客户端——慢
+	// 客户端不拖住写锁；磁盘顺序读，锁持有时间 = 磁盘读耗时）。前缀字节即同 digest 内容
+	// 前缀（digest 寻址不可变），先发给客户端是安全的；与并发保存方的整体重写互斥，
+	// 保证读到的每个字节来自同一份合法前缀。短于注册快照按失败终止（绝不给客户端
+	// 「短前缀 + 从 n 起的上游剩余」的错位拼接）。
+	replayPrefix := func() error {
+		mu := s.partWriter(key)
+		mu.Lock()
+		prefix, rerr := os.ReadFile(disk.PartPath(key))
+		mu.Unlock()
+		if rerr != nil {
+			return fmt.Errorf("读半截文件失败: %w", rerr)
+		}
+		if int64(len(prefix)) < n {
+			return fmt.Errorf("半截文件短于注册快照（实读 %d / 期望 %d 字节），终止本次续传", len(prefix), n)
+		}
+		accum.Write(prefix[:n])
+		writeClient(0, prefix[:n])
+		return nil
+	}
+
+	// //////////////////  立即响应（首字节时序优化）  /////////////////////////////////////////
+	// 2026-11 现场：docker pull 长时间零进度的根因——旧时序里客户端响应头被推迟到候选
+	// 扫描命中之后（scanResumeCandidate 逐候选探测 + 401 token dance，预算 60s 起步），
+	// 而 docker 客户端等响应头约 30s 就超时断开，于是「反复重试 → 每次都等扫描 → 永远
+	// 见不到进度」。现在登记条目后立即合成响应头并 commit（早于上游确认）：总长已知
+	//（manifest 索引，blob_size_index.go）时设 Content-Length=总长（cr 非空为 206 +
+	// 区间头），未知则不设（chunked）；commit 后立即回放本地半截前缀——本地前缀内容永远
+	// 可信，先发给客户端是安全的，docker 毫秒级看到响应头与字节进度。上游增量仍必须等
+	// 既有安全校验（206 且 Content-Range 起点匹配）通过后才拼接，该语义绝不放宽。
+	// cr 非空（客户端区间请求）必须有总长才能给出合法的 206 头：总长未知时维持旧时序
+	//（先扫描后 commit，扫描后仍无总长按 errBlobRangeUnavailable 走旧版 206 透传）。
+	earlyTotal := int64(0)
+	if v, ok := s.manifestBlobSize(digest); ok && v > n {
+		earlyTotal = v
+	}
+	earlyCommit := !hasRange || earlyTotal > 0
+	var hdrEarly http.Header
+	// prog 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始写即登记
+	// source=resume，初始已下载字节 = 半截前缀 n（进度不回退，percent 直接对总长），defer
+	// 注销——失败/成功/panic 返回都不留幽灵条目；每追加一块经 addBytes 累加
+	var prog *progressSummaryEntry
+	if earlyCommit {
+		hdrEarly = resumeEarlyHeader(digest, earlyTotal)
+		// 搭车订阅者立即拿到同一份响应头快照（不再等扫描完成才 setSnapshot）
+		ent.setSnapshot(http.StatusOK, hdrEarly, "")
+		s.commitResumeHeader(w, hdrEarly, "", earlyTotal, cr...)
+		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, earlyTotal)
+		defer prog.unregister()
+		earlySource := blobTotalSourceManifest
+		if earlyTotal <= 0 {
+			earlySource = blobTotalSourceUnknown // 不设 Content-Length，Go 按 chunked 传输
+		}
+		s.log.Info("blob 半截续传立即响应（先回放半截前缀，响应头不再等待上游 206 确认）",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n,
+				"total", earlyTotal, "total_source", earlySource, "has_range", hasRange)...)
+		if rerr := replayPrefix(); rerr != nil {
+			stopGrace()
+			ent.finishFailed(rerr)
+			s.log.Warn("blob 半截续传立即响应读半截失败，终止本次响应（半截保留，docker 重试再续）",
+				labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n, "err", rerr)...)
+			return nil, true, rerr
+		}
+		// 显式冲刷：响应头 + 已回放前缀立即落网（前缀可能小于服务端缓冲，不冲刷会在
+		// 候选扫描期间滞留，客户端拿不到首字节）
+		flushClient(w)
+		if !clientOK && ent.subscriberCount() == 0 {
+			// 客户端在回放前缀时已断开且无搭车订阅者：尚未开始任何上游读取，宽限终止
+			// 的意义（给搭车订阅者留上车窗口 + 终止在途上游读取）均不成立——立即按失败
+			// 收场移除条目（半截保留，进度不回退），docker 重试时重新成为执行方
+			stopGrace()
+			ferr := fmt.Errorf("%w: 立即响应回放前缀失败（客户端已断开）", errClientDisconnected)
+			ent.finishFailed(ferr)
+			s.log.Info("blob 半截续传立即响应阶段客户端已断开且无搭车订阅者，终止（半截保留，docker 重试再续）",
+				labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n)...)
+			return nil, true, ferr
+		}
+	}
+
+	// 候选轮询 Range 续传扫描：立即响应路径的 commit 与前缀回放已在上方完成（扫描只
+	// 决定「上游增量从哪一路、哪个偏移拼接」）；旧时序路径（区间请求且总长未知）保持
+	// commit 前扫描，失败不向客户端写任何字节
+	candidates := ExpandCandidates(eff.URLRedirect, NewRequestVars(r, target), eff)
+	upRes, total, complete, invalid, serr = s.scanResumeCandidate(r, candidates, eff, n)
+	if serr != nil {
+		// 广播搭车订阅者收场
+		ent.finishFailed(serr)
+		if invalid {
+			// 上游明确拒绝按断点续传（非 206 / Content-Range 起点不匹配）：丢弃半截
+			//（半截对续传已无价值；重试按干净全量回源，进度回零但内容正确）
+			disk.RemovePart(key)
+		}
+		if earlyCommit {
+			// 立即响应路径：响应头已 commit、本地前缀已回放——绝不能在已回放前缀的流上
+			// 「降级全量回源」（从 0 开始的全量与已发前缀拼接必然错位），按既有「commit
+			// 后失败只能截断本次响应」安全中断。已发出的前缀字节是合法内容前缀（绝不
+			// 错位），docker 以 Range/重试接续：无半截（invalid 丢弃）走干净全量回源，
+			// 有半截（网络/超时保留）从更长前缀再次续传，两条路数据都正确。
+			stopGrace()
+			s.log.Warn("blob 半截续传候选扫描失败（响应头已先行写出，安全中断本次响应，docker 将重试接续）",
+				labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n,
+					"invalid", invalid, "err", serr)...)
+			return nil, true, fmt.Errorf("blob 半截续传候选扫描失败（已 commit，安全中断，docker 将重试）: %w", serr)
+		}
+		// 旧时序路径（commit 前）：维持既有降级——走既有全量回源兜底
+		s.log.Warn("blob 半截续传候选扫描失败，降级既有全量回源",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n,
+				"invalid", invalid, "err", serr)...)
+		// 网络/超时类失败保留半截：下方全量回源若再失败，其失败捕获会把更长前缀存回
+		// 半截（进度不回退）；全量成功则写缓存并删半截，两条路都正确
+		return s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
+	}
+	if complete {
+		// 半截已完整（上游合规 416 证实：Content-Range 总长 == 半截长度）
+		if earlyCommit {
+			// 立即响应路径：半截前缀已在 commit 后整段回放给客户端，416 只证明「前缀即
+			// 完整 blob」——直接走缓存收尾，不再读上游、不再重复回放：
+			//   - 总长一致（或未知-chunked）：复用 finalizeFetchEntry 写缓存（blob 落盘
+			//     成功即删半截），置 done 关闭订阅，正常收尾；
+			//   - 总长不一致（manifest 索引与 416 证实值冲突，极小概率）：缓存仍按摘要
+			//     校验结论入库/丢弃，但本次客户端响应的 Content-Length 已按错误总长固化
+			//     ——Warn 留痕后按截断收场（docker 重试命中刚写入的缓存自愈）。
+			if earlyTotal > 0 && earlyTotal != n {
+				s.log.Warn("blob 半截续传 commit 总长与上游 416 证实值不符（响应头已固化，按截断收场，docker 重试走缓存自愈）",
+					labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "part_bytes", n,
+						"commit_total", earlyTotal)...)
+			}
+			stopGrace()
+			entry := &cache.Entry{
+				Status:   http.StatusOK,
+				Header:   hdrEarly,
+				Body:     accum.Bytes(),
+				StoredAt: time.Now(),
+				Source:   "part-resume", // 观测：内容来自半截文件整体回放（写缓存前由 finalize 强校验摘要）
+			}
+			// 续传执行方写缓存：直接调 finalizeFetchEntry 并标注 source=resume（不经注入的
+			// finalize 回调——该回调按客户端主路径标注 source=client，此处写者实为续传执行方）
+			if cached := s.finalizeFetchEntry(r, key, target, entry, eff, disk, dockerLogSourceResume); !cached {
+				// 半截整体回放被拒入库（防毒缓存守卫 / 写盘失败）：前缀字节已发给客户端
+				//（docker 将因摘要不符重试；守卫拒绝时毒半截已随 finalize 丢弃，重试走
+				// 干净全量回源自愈），hub 条目按 failed 收场——绝不广播 done
+				ferr := fmt.Errorf("blob 半截整体回放未写入缓存（digest %s，摘要校验/守卫拒绝或写盘失败）", digest)
+				s.log.Warn("blob 半截已完整但内容未写缓存（防毒缓存守卫拒绝或写盘失败；毒半截已丢弃，docker 重试全量回源）",
+					labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "digest", digest, "bytes", accum.Len())...)
+				ent.finishFailed(ferr)
+				return nil, true, ferr
+			}
+			ent.finishDone()
+			// 客户端实际收到的状态码与字节数：区间请求是 206 + 区间长度，完整 GET 是 200 + 总长
+			respStatus, sentBytes := http.StatusOK, int64(accum.Len())
+			if hasRange {
+				respStatus = http.StatusPartialContent
+				sentBytes = blobRangeLast(spec, int64(accum.Len())) - clientStart + 1
+			}
+			s.log.Info("blob 半截续传完成（半截已完整，整体回放写缓存）",
+				labels.attrs(dockerLogSourceResume, "rule", eff.Rule, "bytes", accum.Len(),
+					"cost", time.Since(start).Round(time.Millisecond).String())...)
+			s.log.Info("代理请求完成",
+				labels.attrs(dockerLogSourceResume,
+					"method", r.Method,
+					"target", truncate(r.URL.Path, 300),
+					"status", respStatus,
+					"cache", resumeCacheStatus,
+					"upstream", entry.Source,
+					"rule", eff.Rule,
+					"bytes", sentBytes,
+					"cost", time.Since(start).Round(time.Millisecond).String(),
+				)...)
+			return entry, true, nil
+		}
+		// 旧时序路径（区间请求且总长未知，未 commit）：读回半截写缓存并回放
+		//（区间请求按区间切片回 206）
+		return s.serveResumeComplete(w, r, key, target, digest, ent, eff, disk, start, finalize, cr...)
+	}
+
+	if !earlyCommit && hasRange && total <= 0 {
+		// 客户端区间请求必须有总长才能给出合法的 Content-Range / Content-Length：上游 206
+		// 没带可解析的 Content-Range 时绝不 commit（半截前缀长度 ≠ 对象总长，谎报会让客户端
+		// 从错误偏移继续）。此刻未向客户端写任何字节 → 按「本地半截无法满足」收场，调用方
+		// 改走旧版 206 透传（client_range.go 的 errBlobRangeUnavailable 分支）
+		upRes.Close()
+		ent.finishFailed(errBlobRangeUnavailable)
+		s.log.Warn("blob 半截续传拿不到对象总长，无法满足客户端区间请求，改走旧版 206 透传",
+			labels.attrs(dockerLogSourceResume, "rule", eff.Rule,
+				"part_bytes", n, "range_start", spec.start)...)
+		return nil, false, errBlobRangeUnavailable
+	}
+
+	// 合成（以完整 blob 为基准的）响应头（仅旧时序路径需要重建：区间请求且总长未知——
+	// 立即响应路径的响应头已在扫描前合成并 commit，此处直接沿用 hdrEarly）：沿用上游
+	// 响应头（Content-Type / Docker-Content-Digest / ETag 等），剔除上游 206 的
+	// Content-Range、Content-Length 重置为总长（拿不到总长则不设，Go 按 chunked 编码
+	// 流式传输）。完整 GET 时它直接作为客户端的 200 响应头；区间请求（cr 非空）时
+	// commitResumeHeader 会把它改写成 206 + 区间 Content-Range/Content-Length（上游 206
+	// 语义绝不透传给客户端）。hdr 构建后只读（直接共享给缓存条目与搭车快照）。
+	hdr := hdrEarly
+	if !earlyCommit {
+		hdr = upRes.header.Clone()
+		hdr.Del("Content-Range")
+		if total > 0 {
+			hdr.Set("Content-Length", strconv.FormatInt(total, 10))
+		} else {
+			hdr.Del("Content-Length")
+		}
+		ent.setSnapshot(http.StatusOK, hdr, upRes.url) // 搭车订阅者的响应头快照（预取侧 commit 点同语义）
+	}
+
 	// 失败收尾：关闭上游与半截写句柄、广播 failed 并移除条目（半截文件已随流追加到
 	// 最新前缀，进度不回退；本次响应被截断，docker 重试从更长前缀续传）
 	var paf *os.File // 半截文件追加写句柄（O_APPEND）
@@ -693,11 +915,20 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		return nil, true, cause
 	}
 
-	// commit 点：缺省回一次完整 200（本地前缀回放 + 上游剩余实时拼接，docker 无需支持
-	// Range）；cr 非空（客户端区间请求）回 206 + Content-Range，body 只含区间内字节。
-	// 此后响应头固化，任何失败只能截断本次响应（docker 以 Range 重试，下次从更长前缀
-	// 续传——进度不回退）
-	s.commitResumeHeader(w, hdr, upRes.url, total, cr...)
+	if !earlyCommit {
+		// commit 点（仅旧时序路径）：缺省回一次完整 200（本地前缀回放 + 上游剩余实时
+		// 拼接，docker 无需支持 Range）；cr 非空（客户端区间请求）回 206 + Content-Range，
+		// body 只含区间内字节。此后响应头固化，任何失败只能截断本次响应（docker 以
+		// Range 重试，下次从更长前缀续传——进度不回退）。立即响应路径的 commit 已在
+		// 扫描前完成（合成响应头，上游命中与否不影响客户端已拿到的头）。
+		s.commitResumeHeader(w, hdr, upRes.url, total, cr...)
+	}
+
+	// 扫描命中：进度汇总的 total 按上游 206 Content-Range 校正（立即响应路径 commit 时
+	// 可能仅有 manifest 索引值或未知-chunked，percent 以此从「不可知」变为精确）
+	if prog != nil && total > 0 {
+		prog.setTotal(total)
+	}
 
 	// 时间驱动的单层 blob 多源并发补充（续传执行方，日志 source=resume）：
 	// 与客户端主路径同一套判定/合并器（slowdownload.go 的 timeBlobSupplement）。此前本
@@ -754,71 +985,26 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 				"reason", reason, "candidates", len(candidates))...)
 	}
 
-	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始写即登记
-	// source=resume，初始已下载字节 = 半截前缀 n（进度不回退，percent 直接对总长），
-	// defer 注销——失败/成功/panic 返回都不留幽灵条目；每追加一块经 addBytes 累加
-	prog := s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, total)
-	defer prog.unregister()
+	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：立即响应路径已在扫描前登记
+	//（初始字节 = 半截前缀 n、total = commit 总长）；旧时序路径在 commit 后登记，初始
+	// 已下载字节同样 = 半截前缀 n（进度不回退，percent 直接对总长），defer 注销——失败/
+	// 成功/panic 返回都不留幽灵条目；每追加一块经 addBytes 累加
+	if !earlyCommit {
+		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, total)
+		defer prog.unregister()
+	}
 
-	// 回放半截前缀：写锁内一次性整读进累积缓冲（与并发保存方的整体重写互斥，保证读到
-	// 的每个字节来自同一份合法前缀；磁盘顺序读，锁持有时间 = 磁盘读耗时），锁外再写给
-	// 客户端（慢客户端绝不拖住写锁）。前缀字节即同 digest 内容前缀（digest 寻址不可变）
-	mu := s.partWriter(key)
-	mu.Lock()
-	prefix, rerr := os.ReadFile(disk.PartPath(key))
-	mu.Unlock()
-	if rerr != nil {
-		return fail(fmt.Errorf("读半截文件失败: %w", rerr))
+	// 回放半截前缀（仅旧时序路径；立即响应路径已在扫描前经 replayPrefix 回放完毕）：
+	// 写锁内一次性整读进累积缓冲（与并发保存方的整体重写互斥，保证读到的每个字节来自
+	// 同一份合法前缀；磁盘顺序读，锁持有时间 = 磁盘读耗时），锁外再按客户端区间窗口
+	// 写给客户端（慢客户端绝不拖住写锁）。前缀字节即同 digest 内容前缀（digest 寻址
+	// 不可变）
+	if !earlyCommit {
+		if rerr := replayPrefix(); rerr != nil {
+			return fail(rerr)
+		}
+		flushClient(w) // 冲刷响应头 + 前缀（与立即响应路径同款，首字节及时落网）
 	}
-	if int64(len(prefix)) < n {
-		// 半截比注册快照短（并发重写竞态窗口，理论不可达）：绝不能给客户端「短前缀 +
-		// 从 n 起的上游剩余」的错位拼接，按失败截断（半截保留，docker 重试再续）
-		return fail(fmt.Errorf("半截文件短于注册快照（实读 %d / 期望 %d 字节），终止本次续传", len(prefix), n))
-	}
-	accum := bytes.NewBuffer(make([]byte, 0, int(n)+streamChunkSize))
-	clientOK := true // 客户端写失败（docker 已断开）后置 false：按宽限语义处置（见下方宽限终止判定与读循环出口）
-	// writeClient 按客户端区间窗口把「完整 blob 中偏移 off 起的 p」写给客户端：起点之前的
-	// 字节跳过、终点之后的字节不再写；内部累积（accum 与半截文件）始终是完整 blob——缓存
-	// 条目必须完整，后续任意起点才能直接本地切片秒回（客户端只收区间内字节）。
-	// 完整 GET（无 cr）时窗口 = [0, +∞)，等价于原来的 w.Write(p)。
-	writeClient := func(off int64, p []byte) {
-		if !clientOK || len(p) == 0 {
-			return
-		}
-		lo, hi := off, off+int64(len(p)) // 该块在完整 blob 中的半开区间 [lo, hi)
-		if lo < clientStart {
-			lo = clientStart
-		}
-		if clientLast >= 0 && hi > clientLast+1 {
-			hi = clientLast + 1
-		}
-		if hi <= lo {
-			return // 整块都在客户端区间之外：只进缓存/半截，不写客户端
-		}
-		if _, werr := w.Write(p[lo-off : hi-off]); werr != nil {
-			clientOK = false
-			// 客户端断开（docker 已断）的宽限终止判定（本闭包此后不再进入，仅此一次）：
-			//   - hub 条目已有搭车订阅者：不宽限，维持现状继续拉（订阅者还要收增量）；
-			//   - 宽限配置 <=0（graceLimit<=0）：关闭宽限终止，维持旧版「继续读完只填
-			//     缓存」语义不变；
-			//   - 无订阅者且宽限 >0：启动宽限计时器——到期仍无订阅者则终止上游读取
-			//    （errResumeGraceAborted，见读循环的宽限终止出口；预取路径与搭车读侧
-			//     不受影响），宽限期内有订阅者加入则到点自动放弃（见 onGraceExpired）。
-			subs := ent.subscriberCount()
-			if graceLimit > 0 && subs == 0 {
-				graceMu.Lock()
-				if graceTimer == nil { // 防御：仅启动一次（clientOK 已拦住重复进入）
-					graceTimer = time.AfterFunc(graceLimit, onGraceExpired)
-				}
-				graceMu.Unlock()
-			}
-			s.log.Warn("写响应体失败（客户端已断开，续传按宽限语义处置）",
-				labels.attrs(dockerLogSourceResume, "target", truncate(r.URL.Path, 200),
-					"grace", graceLimit.String(), "subscribers", subs, "err", werr)...)
-		}
-	}
-	accum.Write(prefix[:n])
-	writeClient(0, prefix[:n])
 
 	// 追加写句柄：上游剩余区间逐块追加到半截文件（O_APPEND 顺序追加 + 每块大小一致性
 	// 校验，见 appendPartChunk）
@@ -1151,6 +1337,33 @@ func (s *Server) serveResumeComplete(w http.ResponseWriter, r *http.Request, key
 	}
 	s.serveEntry(w, r, entry, resumeCacheStatus, eff, start)
 	return entry, true, nil
+}
+
+// resumeEarlyHeader 续传/搭车「立即响应」的合成响应头（commit 先于上游确认，本地半截
+// 前缀回放先行）：blob 按 digest 寻址、内容不可变，Content-Type 恒 application/octet-stream、
+// Docker-Content-Digest 即目标 digest；total>0（manifest 索引，见 blob_size_index.go）时设
+// Content-Length=total，否则不设（Go 按 chunked 编码流式传输——docker 对 chunked blob
+// 响应完全兼容，客户端至少立即看到字节进度而不是长时间零反馈）。构建后只读，直接共享
+// 给客户端 commit、搭车快照与缓存条目。
+func resumeEarlyHeader(digest string, total int64) http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "application/octet-stream")
+	if digest != "" {
+		h.Set("Docker-Content-Digest", digest)
+	}
+	if total > 0 {
+		h.Set("Content-Length", strconv.FormatInt(total, 10))
+	}
+	return h
+}
+
+// flushClient 显式冲刷响应（commit 头 + 已回放的本地前缀立即到达客户端）：net/http
+// 服务端对响应有约 2-4KB 的用户态缓冲，半截前缀小于缓冲时不显式冲刷的话，响应头与
+// 前缀会滞留到下一个大块写出才落网——立即响应的全部意义就是首字节及时到网。
+func flushClient(w http.ResponseWriter) {
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // commitResumeHeader 续传执行方对客户端的 commit 点——沿用 skipResponseHeader 过滤逐跳头

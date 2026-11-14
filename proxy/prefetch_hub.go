@@ -9,13 +9,17 @@
 // 文件 + rename 语义由 finalizeFetchEntry 复用）后置 done 并关闭订阅（条目滞留一小段
 // 时间供并发 MISS 兜底检出「done → 直接 HIT」，到期移除）→ 失败置 failed 广播后移除。
 //
-// 活性与降级（订阅等待增量必须有超时，取值与 docker 客户端约 30s 响应头超时同量级）：
-//   - 等待响应头快照 / 等待下一段增量超过 prefetchHubIdleTimeout 即视为预取卡死：
-//     尚未向客户端 commit 响应头 → 放弃搭车改走既有原回源路径（含 flight 等待与流式
-//     回源，慢速升级等特性全保留）；
+// 活性与降级（订阅等待增量必须有超时；等待响应头快照的旧阻塞语义已由「立即响应」
+// 取代——快照未就绪即合成响应头先 commit，不再有搭车侧的等头窗口）：
+//   - 等待下一段增量超过活性超时即视为执行方卡死/过慢：尚未向客户端 commit 响应头 →
+//     放弃搭车改走既有原回源路径（含 flight 等待与流式回源，慢速升级等特性全保留）；
 //   - 已 commit → 终止本次响应并记日志（客户端 docker 会对该层以 Range 断点续传重试，
 //     既有「206 透传不写缓存」机制自然兜底「不从 0 重新下载」——重试命中已写盘的前缀
-//     缓存则直接 HIT，缓存未就绪则回源 206，两路都不从头拉整层）。
+//     缓存则直接 HIT，缓存未就绪则回源 206，两路都不从头拉整层）；
+//   - 早响应路径（快照未就绪即 commit）等待首个增量的上限取与执行方同源的候选扫描
+//     总预算（blobCandidateScanBudget）——执行方扫描期间不广播增量，不能因「扫描还没
+//     结束」就掐断已 commit 的搭车响应；快照就绪后回到常规活性超时（prefetchHubIdleTimeout，
+//     与 docker 客户端约 30s 响应头超时同量级，见 candidates.go）。
 //
 // 边界约束：
 //   - 仅无 Range 的完整 GET 搭车：检查点位于 handleGet 的缓存可读（非 BYPASS）MISS
@@ -393,7 +397,9 @@ func (e *prefetchStreamEntry) subOverflow(sub *prefetchStreamSub) bool {
 
 // waitHeaderReady 等待响应头快照就绪（或条目变终态）：超时返回 false（调用方按
 // 「预取卡死」降级）。changed 为 close-once 广播——快照就绪与终态都会唤醒，唤醒后
-// 调用方须再查 terminal() 分流。
+// 调用方须再查 terminal() 分流。搭车请求路径已不再阻塞等待快照（tryServeFromPrefetchHub
+// 的立即响应：快照未就绪即合成响应头先 commit，见该函数），本方法保留供测试与观测
+// 时序窗口使用。
 func (e *prefetchStreamEntry) waitHeaderReady(timeout time.Duration) bool {
 	e.mu.Lock()
 	ready, st := e.ready, e.state
@@ -407,6 +413,14 @@ func (e *prefetchStreamEntry) waitHeaderReady(timeout time.Duration) bool {
 	case <-time.After(timeout):
 		return false
 	}
+}
+
+// headerReadyOf 读取响应头快照是否就绪（搭车立即响应的分流依据：就绪照抄快照、未就绪
+// 合成响应头先 commit，见 tryServeFromPrefetchHub）。
+func (e *prefetchStreamEntry) headerReadyOf() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ready
 }
 
 // finishDone 终态收尾（EOF 缓存已原子落盘后调用）：关闭临时文件写句柄、关闭全部订阅
@@ -477,12 +491,17 @@ func (e *prefetchStreamEntry) notifyChanged() {
 	e.changedOnce.Do(func() { close(e.changed) })
 }
 
-// tryServeFromPrefetchHub 客户端 blob GET 缓存 MISS 时检查该层是否正被预取流式下载
-// （hub 在途条目），命中即「搭车」：响应用预取的响应头快照（X-Cache: PREFETCH），
-// body = 已落盘磁盘前缀（从 0 读临时文件）+ 订阅增量 channel 的实时后续——上游只有
-// 预取那一路下载，客户端不从 0 重新发起网络下载。返回 handled=true 表示本次请求已由
-// 搭车路径处理（含已 commit 后的各类终止），调用方直接返回；false 表示继续走既有
+// tryServeFromPrefetchHub 客户端 blob GET 缓存 MISS 时检查该层是否正被预取/续传流式
+// 下载（hub 在途条目），命中即「搭车」：响应用执行方的响应头（X-Cache: PREFETCH），
+// body = 已落盘磁盘前缀（从 0 读临时/半截文件）+ 订阅增量 channel 的实时后续——上游
+// 只有执行方那一路下载，客户端不从 0 重新发起网络下载。返回 handled=true 表示本次请求
+// 已由搭车路径处理（含已 commit 后的各类终止），调用方直接返回；false 表示继续走既有
 // 回源路径（行为与旧版完全一致）。
+//
+// 首字节时序（立即响应）：执行方响应头快照已就绪 → 照抄快照 commit（头最真实）；
+// 未就绪（执行方仍在候选扫描/竞速，blob 预算 60s 起步）→ 立即合成响应头 commit（不再
+// 阻塞等快照，旧时序最长等 30s、恰为 docker 客户端等响应头的超时量级），随后照常回放
+// 本地前缀并等增量广播。合成头与续传执行方立即响应同一构造（resumeEarlyHeader）。
 //
 // 调用位置（handleGet）保证进入本检查的请求必然：路径目标 GET、缓存可读（非 BYPASS）、
 // 无 Range / no-cache（可缓存判定已排除）——HEAD / 206 续传 / 强制刷新天然不搭车。
@@ -516,38 +535,49 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	// 客户端断开 / 降级 / 完成后注销订阅：仅停止读取，预取那一路继续填缓存不受影响
 	defer ent.unsubscribe(sub)
 
-	// 等预取侧响应头快照就绪（候选竞速期间需数秒到十几秒）；超时视为预取卡死：
-	// 尚未向客户端 commit 响应头 → 放弃搭车，改走既有原回源路径
-	if !ent.waitHeaderReady(prefetchHubIdleTimeout) {
-		if st, _ := ent.terminal(); st == prefetchStreamDone {
-			return s.servePrefetchHubDoneHit(w, r, key, eff, disk, start)
+	// //////////////////  立即响应（首字节时序优化）  //////////////////////////////////////////
+	// 执行方响应头快照已就绪 → 照抄快照（既有行为，头最真实）；未就绪（执行方仍在候选
+	// 扫描/竞速，blob 预算 60s 起步）→ **立即合成响应头 commit，不再阻塞等快照**——旧
+	// 时序在这里等快照最长 prefetchHubIdleTimeout（30s，恰为 docker 客户端等响应头的
+	// 超时量级），超时后还要放弃搭车再自行回源烧一遍候选竞速，客户端整段窗口零进度
+	//（2026-11 现场「docker pull 一行进度都没有」的直接卡点之一）。合成头与续传执行方
+	// 立即响应同一份构造（resumeEarlyHeader：blob 恒 application/octet-stream +
+	// Docker-Content-Digest，总长取 manifest 索引、未知则 chunked——docker 对 chunked
+	// blob 响应完全兼容）；本地前缀内容永远可信，commit 后立即回放，增量随广播到达。
+	// 上游数据仍只由执行方那一路下载，搭车绝不产生第二路回源。
+	var (
+		status int
+		header http.Header
+		source string
+		early  bool
+	)
+	if ent.headerReadyOf() {
+		status, header, source = ent.snapshot()
+	} else {
+		early = true
+		earlyTotal := int64(0)
+		if v, ok := s.manifestBlobSize(ent.digest); ok {
+			earlyTotal = v
 		}
-		s.log.Warn("搭车放弃：等待预取响应头快照超时（预取疑似卡死），改走原回源路径",
-			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
-				"target", truncate(target, 300), "wait", prefetchHubIdleTimeout.String())...)
-		return false
+		status = http.StatusOK
+		header = resumeEarlyHeader(ent.digest, earlyTotal)
+		source = "" // 执行方尚未命中候选：X-Proxy-Upstream 省略（完成日志按终态快照补记）
 	}
-	switch st, terr := ent.terminal(); st {
-	case prefetchStreamDone:
-		// 快照就绪后预取即完成（极小 blob）：缓存已就绪，直接走既有 HIT 路径（兜底）
-		return s.servePrefetchHubDoneHit(w, r, key, eff, disk, start)
-	case prefetchStreamFailed:
-		// 预取失败广播：搭车放弃改走既有原回源路径（客户端自己回源，上游只此一路）
-		s.log.Debug("预取失败广播，搭车放弃改走原回源路径",
-			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
-				"target", truncate(target, 300), "err", terr)...)
-		return false
-	}
-
-	// commit 点：照抄预取的响应头快照（Content-Length / Docker-Content-Digest /
-	// Content-Type / X-Proxy-Upstream 等），X-Cache 用新观测值 PREFETCH。此后响应头
-	// 固化，任何失败只能终止本次响应（docker 对失败层以 Range 断点续传重试，既有
-	// 206 透传不写缓存机制兜底「不从 0 重新下载」）。
-	status, header, source := ent.snapshot()
+	// commit 点：快照路径照抄预取/续传的响应头快照，早响应路径用合成头（均经
+	// commitPrefetchHubHeader 过滤逐跳头并补 X-Cache: PREFETCH）。此后响应头固化，任何
+	// 失败只能终止本次响应（docker 对失败层以 Range 断点续传重试，既有 206 透传不写
+	// 缓存机制兜底「不从 0 重新下载」）。
 	s.commitPrefetchHubHeader(w, status, header, source)
-	s.log.Info("搭车在途预取层（拼接磁盘前缀+实时增量，上游仅预取一路下载）",
-		labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
-			"prefix_bytes", prefixLen, "candidate", truncate(source, 300), "status", status)...)
+	if early {
+		s.log.Info("搭车在途流立即响应（执行方响应头快照未就绪，合成头先 commit + 回放本地前缀，不再等扫描/竞速）",
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
+				"prefix_bytes", prefixLen, "content_length", header.Get("Content-Length"),
+				"status", status)...)
+	} else {
+		s.log.Info("搭车在途预取层（拼接磁盘前缀+实时增量，上游仅预取一路下载）",
+			labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "key", key,
+				"prefix_bytes", prefixLen, "candidate", truncate(source, 300), "status", status)...)
+	}
 
 	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit 后开始回放即登记
 	// source=ridealong，初始已下载字节 = 已落盘前缀 prefixLen（回放前缀不重复累加，
@@ -576,11 +606,27 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 		}
 	}
 	_ = f.Close()
+	// 显式冲刷：响应头 + 已回放前缀立即落网（net/http 服务端缓冲约 2-4KB，前缀较小时
+	// 不冲刷会在等待首个增量的窗口内滞留，客户端拿不到首字节）
+	flushClient(w)
 
 	// 增量循环：回放预取广播的后续块；等待增量超过活性超时（预取卡死/过慢）即终止。
 	// 每块已是逐订阅者独立 copy，写客户端无需再拷贝。
+	// 每轮等待上限动态取值：早响应路径在执行方快照就绪前不会有任何增量（候选扫描/竞速
+	// 不广播），等待上限用与执行方同源的扫描总预算（blobCandidateScanBudget，随候选数
+	// 与候选级探测预算放大，与 scanResumeCandidate / selectCandidate 的放弃阈值一致）；
+	// 快照就绪（执行方开始流式广播）后回到常规活性超时。绝不因「扫描还没结束」就把
+	// 已 commit 的搭车响应提前掐断。
+	earlyWait := blobCandidateScanBudget(len(eff.URLRedirect), eff)
+	if earlyWait <= 0 {
+		earlyWait = prefetchHubIdleTimeout // 防御：候选配置异常时退回常规活性超时
+	}
 	total := prefixLen
 	for {
+		idle := prefetchHubIdleTimeout
+		if early && !ent.headerReadyOf() {
+			idle = earlyWait
+		}
 		select {
 		case chunk, chanOK := <-sub.ch:
 			if !chanOK {
@@ -596,17 +642,24 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 						labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "sent", total, "err", terr)...)
 					return true
 				}
-				// done：磁盘前缀 + 增量恰好拼出完整 body，搭车完成
+				// done：磁盘前缀 + 增量恰好拼出完整 body，搭车完成（早响应路径此刻若
+				// 执行方快照已就绪，补记实际命中的候选 URL 供观测）
+				doneSource := source
+				if doneSource == "" {
+					if _, _, late := ent.snapshot(); late != "" {
+						doneSource = late
+					}
+				}
 				s.log.Info("搭车完成（在途预取层已完整回放）",
 					labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "bytes", total,
-						"upstream", source, "cost", time.Since(start).Round(time.Millisecond).String())...)
+						"upstream", doneSource, "cost", time.Since(start).Round(time.Millisecond).String())...)
 				s.log.Info("代理请求完成",
 					labels.attrs(dockerLogSourceRidealong,
 						"method", r.Method,
 						"target", truncate(r.URL.Path, 300),
 						"status", status,
 						"cache", prefetchCacheStatus,
-						"upstream", source,
+						"upstream", doneSource,
 						"rule", eff.Rule,
 						"bytes", total,
 						"cost", time.Since(start).Round(time.Millisecond).String(),
@@ -623,12 +676,16 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 			}
 			total += int64(len(chunk))
 			prog.addBytes(len(chunk)) // 活跃下载周期汇总累加（回放增量；磁盘前缀已计入初始值）
-		case <-time.After(prefetchHubIdleTimeout):
+			// 逐块显式冲刷：执行方增量节奏可能慢于服务端缓冲的填充速度（慢速上游逐块
+			// 广播小增量时），不冲刷的话小块会滞留在 net/http 服务端缓冲里，客户端长时间
+			// 看不到字节进度（立即响应的体验目标就是让进度尽快可见）
+			flushClient(w)
+		case <-time.After(idle):
 			// 预取增量停滞（卡死/过慢）：已 commit，终止本次响应；docker 会以 Range
 			// 断点续传重试（命中已写盘的前缀缓存则 HIT、否则回源 206，都不从 0 拉整层）
 			s.log.Warn("搭车订阅超时（预取增量停滞），终止本次响应（客户端将以 Range 续传重试）",
 				labels.attrs(dockerLogSourceRidealong, "rule", eff.Rule, "sent", total,
-					"idle", prefetchHubIdleTimeout.String())...)
+					"idle", idle.String(), "snapshot_ready", ent.headerReadyOf())...)
 			return true
 		}
 	}

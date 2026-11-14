@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,9 +20,25 @@ import (
 	"proxy-cache/config"
 )
 
-// captureLogger 返回把日志写入 buf 的 slog.Logger，用于断言日志输出内容。
+// syncBuf 互斥保护的 bytes.Buffer：slog 的 TextHandler 不锁输出 Writer，而测试夹具里
+// 多个 goroutine（客户端执行方 / 宽限计时器 / 搭车订阅 / 上游 handler）会并发写同一份
+// 日志缓冲，直接共用裸 bytes.Buffer 会丢行/交叉覆写，让「按行断言日志内容」的测试
+// 出现与被测逻辑无关的偶发失败。
+type syncBuf struct {
+	mu sync.Mutex
+	b  *bytes.Buffer
+}
+
+func (w *syncBuf) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+// captureLogger 返回把日志写入 buf 的 slog.Logger，用于断言日志输出内容（并发安全：
+// 见 syncBuf）。
 func captureLogger(buf *bytes.Buffer) *slog.Logger {
-	return slog.New(slog.NewTextHandler(buf, nil))
+	return slog.New(slog.NewTextHandler(&syncBuf{b: buf}, nil))
 }
 
 // newServeServer 构建用于 serveEntry 测试的 Server：

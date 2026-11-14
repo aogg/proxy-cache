@@ -80,6 +80,7 @@ type resumeUpstream struct {
 	short        map[string]int64         // digest -> 206 只发剩余区间前 N 字节后干净 EOF
 	abort        map[string]int           // digest -> 200 全量写出前 N 字节后断连
 	hold         map[string]chan struct{} // digest -> 首路「首块后阻塞」闸门
+	holdHeaders  map[string]chan struct{} // digest -> 「响应头写出前阻塞」闸门（慢上游候选模拟）
 	bad416       map[string]bool          // digest -> Range 探测回 416 且不带 Content-Range（模拟不合规镜像源，防毒缓存回归用）
 	fake416Total map[string]int64         // digest -> Range 探测回 416 且 Content-Range 总长伪造为该值（模拟总长与半截不符）
 	poisonTail   map[string][]byte        // digest -> Range 剩余区间回毒内容（长度与原文尾段一致；模拟同一 digest 内容错误的异常镜像源，防毒缓存回归用）
@@ -100,6 +101,7 @@ func newResumeUpstream() *resumeUpstream {
 		short:        make(map[string]int64),
 		abort:        make(map[string]int),
 		hold:         make(map[string]chan struct{}),
+		holdHeaders:  make(map[string]chan struct{}),
 		bad416:       make(map[string]bool),
 		fake416Total: make(map[string]int64),
 		poisonTail:   make(map[string][]byte),
@@ -174,6 +176,42 @@ func (u *resumeUpstream) armHold(digest string) chan struct{} {
 	return c
 }
 
+// armHoldHeaders 布防「响应头写出前阻塞」闸门并返回通道（测试 close 放行）：模拟慢/
+// 挂死的上游候选——扫描阶段迟迟拿不到响应头，供「立即响应先于上游命中」的时序断言
+// （对任意请求生效，不限首路）。
+func (u *resumeUpstream) armHoldHeaders(digest string) chan struct{} {
+	c := make(chan struct{})
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.holdHeaders[digest] = c
+	return c
+}
+
+// holdHeadersClose 返回闸门的幂等放行函数（重复调用不 panic——显式放行与 defer 收尾
+// 共用同一份 sync.Once）。
+func (u *resumeUpstream) holdHeadersClose(c chan struct{}) func() {
+	var once sync.Once
+	return func() { once.Do(func() { close(c) }) }
+}
+
+// headerGateOpen 返回某 digest 的响应头闸门是否已放行（未布防视为已放行）：立即响应
+// 时序断言用——闸门未放行 = 上游响应头不可能到达，此刻客户端已拿到响应头即证明
+// 「首字节先于上游命中」。
+func (u *resumeUpstream) headerGateOpen(digest string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	hh, ok := u.holdHeaders[digest]
+	if !ok || hh == nil {
+		return true
+	}
+	select {
+	case <-hh:
+		return true
+	default:
+		return false
+	}
+}
+
 // rangesOf 返回某 digest 逐次收到的 Range 头快照（并发安全拷贝）。
 func (u *resumeUpstream) rangesOf(digest string) []string {
 	u.mu.Lock()
@@ -240,8 +278,17 @@ func (u *resumeUpstream) serveBlob(w http.ResponseWriter, r *http.Request) {
 	body := u.content[digest]
 	ig, short, abort := u.ignore[digest], u.short[digest], u.abort[digest]
 	hold, chunk, delay := u.hold[digest], u.chunkSize, u.delay
+	hh := u.holdHeaders[digest]
 	u.mu.Unlock()
 	u.addRange(digest, r.Header.Get("Range")) // 先记录再分流：断言续传请求形状用
+	// 「响应头写出前阻塞」闸门（慢/挂死上游候选模拟）：close 前不写任何响应字节
+	if hh != nil {
+		select {
+		case <-hh:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	if len(body) == 0 {
 		http.NotFound(w, r)
 		return
@@ -429,6 +476,12 @@ func (fx *resumeFixture) effFor(r *http.Request, target string) config.Options {
 	return fx.s.cfg.ResolveOptions(r.Host, target, false)
 }
 
+// setManifestSize 在 manifest blob size 索引登记 digest→total（模拟生产「manifest 先于
+// blob 回源被解析」的真实时序——立即响应的 Content-Length 依据，见 blob_size_index.go）。
+func (fx *resumeFixture) setManifestSize(digest string, total int64) {
+	fx.s.blobSizeIndex().put(digest, total)
+}
+
 // waitUntil 轮询等待 cond 成立（超时 fatal），供续传时序窗口观察。
 func resumeWaitUntil(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
 	t.Helper()
@@ -586,9 +639,9 @@ func TestBlobResumeMainScenario(t *testing.T) {
 	content := hubBlobContent(0xa3, 4096)
 	half := 1000
 	fx.reg.setContent(digest, content)
-	fx.reg.setChunkConfig(3096, 0) // 剩余区间整段一次写出
+	fx.reg.setChunkConfig(3096, 0)                  // 剩余区间整段一次写出
+	fx.setManifestSize(digest, int64(len(content))) // manifest 先行：立即响应的 CL 依据
 
-	target := "v2/" + name + "/blobs/" + digest
 	key := prefetchBlobKey(name, digest)
 
 	// 白盒预置半截（模拟上次下载中断保留的前缀）
@@ -598,6 +651,7 @@ func TestBlobResumeMainScenario(t *testing.T) {
 	fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
 
 	// 客户端视角：一次完整 200，docker 无需支持 Range、完全无感知
+	//（立即响应：响应头在候选扫描命中前已合成 commit，Content-Length=总长）
 	if w.Code != http.StatusOK {
 		t.Fatalf("Code = %d, want %d（续传对客户端回一次完整 200）, body: %s", w.Code, http.StatusOK, w.Body.String())
 	}
@@ -607,9 +661,13 @@ func TestBlobResumeMainScenario(t *testing.T) {
 	if got := w.Header().Get("Content-Length"); got != strconv.Itoa(len(content)) {
 		t.Errorf("Content-Length = %q, want 总长 %q", got, strconv.Itoa(len(content)))
 	}
-	wantUpstream := fx.upstream.URL + "/" + target
-	if got := w.Header().Get("X-Proxy-Upstream"); got != wantUpstream {
-		t.Errorf("X-Proxy-Upstream = %q, want 续传命中的候选 %q", got, wantUpstream)
+	// 立即响应：commit 发生在候选扫描命中之前，X-Proxy-Upstream（命中候选）此刻未知，
+	// 不再随响应头给出（候选信息由 source=resume 日志链留痕）
+	if got := w.Header().Get("X-Proxy-Upstream"); got != "" {
+		t.Errorf("X-Proxy-Upstream = %q, want 空（立即响应时上游候选尚未命中）", got)
+	}
+	if got := w.Header().Get("Docker-Content-Digest"); got != digest {
+		t.Errorf("Docker-Content-Digest = %q, want %q（合成头即目标 digest）", got, digest)
 	}
 	if got := w.Body.Bytes(); !bytes.Equal(got, content) {
 		t.Errorf("body 与上游完整原文不一致（got %d 字节, want %d 字节）——本地前缀+剩余区间应恰好拼出完整 blob",
@@ -650,8 +708,11 @@ func TestBlobResumeMainScenario(t *testing.T) {
 
 // //////////////////  B4/B5/B6：失败降级与边界语义  ////////////////////////////////////////////
 
-// TestBlobResumeFallbackOnNon206 覆盖点 4：上游对 Range 回 200 全量（明确不支持按断点
-// 续传）→ 丢弃半截走既有全量回源，客户端拿到完整正确 body（前缀回放与全量绝不拼接错位）。
+// TestBlobResumeFallbackOnNon206 覆盖点 4（立即响应语义）：上游对 Range 回 200 全量
+// （明确不支持按断点续传）→ 立即响应路径已 commit + 回放前缀，按「安全中断」截断本次
+// 响应并丢弃半截——已发出的前缀字节是合法内容前缀、绝无错位；docker 重试（无半截）走
+// 干净全量回源拿到完整正确 body（旧时序的「本请求内降级全量回源」不再存在：从 0 的
+// 全量与已回放前缀拼接必然错位）。
 func TestBlobResumeFallbackOnNon206(t *testing.T) {
 	fx := newResumeFixture(t, nil)
 	name, digest := prefetchName, prefetchDigestLayer2
@@ -660,6 +721,7 @@ func TestBlobResumeFallbackOnNon206(t *testing.T) {
 	fx.reg.setContent(digest, content)
 	fx.reg.setIgnore(digest) // 对 Range 也回 200 全量：明确不支持断点续传
 	fx.reg.setChunkConfig(1024, 0)
+	fx.setManifestSize(digest, int64(len(content)))
 
 	key := prefetchBlobKey(name, digest)
 	fx.s.savePartialPart(fx.disk, key, content[:half])
@@ -667,33 +729,53 @@ func TestBlobResumeFallbackOnNon206(t *testing.T) {
 	w := httptest.NewRecorder()
 	fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
 
-	// 客户端拿到完整正确 body（降级全量回源，绝无错位）
+	// 立即响应：200 已 commit（X-Cache: RESUME、Content-Length=总长），body 截断为
+	// 已回放的本地前缀（Content-Length 与实际字节数不符 → 客户端按截断失败处理重试）
 	if w.Code != http.StatusOK {
-		t.Fatalf("Code = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+		t.Fatalf("Code = %d, want %d（响应头已先行 commit）, body: %s", w.Code, http.StatusOK, w.Body.String())
 	}
-	if got := w.Header().Get("X-Cache"); got == resumeCacheStatus {
-		t.Errorf("X-Cache = %q, 降级全量回源不应标 RESUME", got)
+	if got := w.Header().Get("X-Cache"); got != resumeCacheStatus {
+		t.Errorf("X-Cache = %q, want %q（立即响应头已固化）", got, resumeCacheStatus)
 	}
-	if got := w.Body.Bytes(); !bytes.Equal(got, content) {
-		t.Errorf("降级 body 与上游原文不一致（got %d 字节, want %d 字节）——绝不产生错位拼接", len(got), len(content))
+	if got := w.Header().Get("Content-Length"); got != strconv.Itoa(len(content)) {
+		t.Errorf("Content-Length = %q, want 总长 %q", got, strconv.Itoa(len(content)))
+	}
+	if got := w.Body.Bytes(); !bytes.Equal(got, content[:half]) {
+		t.Errorf("截断 body 应为已回放的本地前缀 content[:%d]（got %d 字节）——绝无错位字节", half, len(got))
 	}
 
-	// 上游两路：第一路 Range 尝试被 200 拒绝（载荷判无效），第二路全量回源
-	if n := fx.reg.rec.calls(digest); n != 2 {
-		t.Errorf("上游 blob 回源 %d 次, want 2（Range 尝试 + 降级全量）", n)
+	// 上游仅 1 路 Range 探测（被 200 拒绝判 invalid）；不再有「本请求内」的降级全量
+	if n := fx.reg.rec.calls(digest); n != 1 {
+		t.Errorf("上游 blob 回源 %d 次, want 1（Range 探测被拒后安全中断，全量由重试触发）", n)
 	}
-	want := []string{fmt.Sprintf("bytes=%d-", half), ""}
+	want := []string{fmt.Sprintf("bytes=%d-", half)}
 	if got := fx.reg.rangesOf(digest); !rangesEqual(got, want) {
-		t.Errorf("上游收到的 Range 头 = %v, want %v（首路续传、次路全量）", got, want)
+		t.Errorf("上游收到的 Range 头 = %v, want %v", got, want)
 	}
 
-	// 半截已丢弃；全量成功后写缓存
+	// invalid：半截已丢弃、绝不写缓存（半截数据绝不入库）
 	if _, err := os.Stat(fx.disk.PartPath(key)); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("上游明确拒绝续传后半截应被丢弃, stat err = %v", err)
 	}
+	if _, ok := fx.disk.Get(key); ok {
+		t.Error("安全中断的截断响应不得写缓存")
+	}
+
+	// docker 重试（无半截）：干净全量回源拿到完整正确 body 并写缓存（自愈闭环）
+	w2 := httptest.NewRecorder()
+	fx.s.ServeHTTP(w2, prefetchBlobTestRequest(name, digest))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("重试 Code = %d, want %d, body: %s", w2.Code, http.StatusOK, w2.Body.String())
+	}
+	if got := w2.Body.Bytes(); !bytes.Equal(got, content) {
+		t.Errorf("重试 body 与上游原文不一致（got %d 字节, want %d 字节）——绝无错位拼接", len(got), len(content))
+	}
+	if n := fx.reg.rec.calls(digest); n != 2 {
+		t.Errorf("重试后上游 blob 回源 %d 次, want 2（Range 探测 + 重试全量）", n)
+	}
 	e, ok := fx.disk.Get(key)
 	if !ok || !bytes.Equal(e.Body, content) {
-		t.Error("降级回源成功后应写缓存且内容一致")
+		t.Error("重试全量成功后应写缓存且内容一致")
 	}
 }
 
@@ -745,28 +827,28 @@ func TestBlobResumeCompleteOn416(t *testing.T) {
 // Range 一律回不带合规 Content-Range 的 416，旧逻辑据此把 12875538 字节半截固化为
 // 133611458 字节 blob 的「正式缓存」，此后每次 pull 都命中毒缓存报 short read）：
 // 416 缺合规 `Content-Range: bytes */<total>` 或总长 ≠ 半截长度 → 绝不证实「半截已完整」，
-// 按 invalid 降级全量回源——半截丢弃、缓存内容 = 完整原文、客户端拿到完整 body。
+// 按 invalid 安全中断（立即响应路径已 commit + 回放前缀：截断本次响应、丢弃半截、不写
+// 缓存），docker 重试走干净全量回源——缓存内容 = 完整原文、客户端拿到完整 body。
 func TestBlobResumeDistrustsUnverifiable416(t *testing.T) {
 	name, digest := prefetchName, prefetchDigestOther
 	content := hubBlobContent(0xb1, 4096)
 
-	assertFullRefetch := func(t *testing.T, fx *resumeFixture, key string, w *httptest.ResponseRecorder) {
+	assertSafeAbort := func(t *testing.T, fx *resumeFixture, half int, key string, w *httptest.ResponseRecorder) {
 		t.Helper()
 		if w.Code != http.StatusOK {
-			t.Fatalf("Code = %d, want %d, body: %s", w.Code, http.StatusOK, w.Body.String())
+			t.Fatalf("Code = %d, want %d（立即响应头已 commit）, body: %s", w.Code, http.StatusOK, w.Body.String())
 		}
-		if got := w.Header().Get("X-Cache"); got == resumeCacheStatus {
-			t.Errorf("X-Cache = %q，不可信 416 绝不能走「半截已完整」整体回放", got)
+		if got := w.Header().Get("X-Cache"); got != resumeCacheStatus {
+			t.Errorf("X-Cache = %q, want %q（不可信 416 绝不能走「半截已完整」整体回放收尾）", got, resumeCacheStatus)
 		}
-		if got := w.Body.Bytes(); !bytes.Equal(got, content) {
-			t.Errorf("客户端应拿到完整 body（got %d 字节, want %d 字节）", len(got), len(content))
+		if got := w.Body.Bytes(); !bytes.Equal(got, content[:half]) {
+			t.Errorf("截断 body 应为已回放的本地前缀 content[:%d]（got %d 字节）——绝无错位字节", half, len(got))
 		}
 		if _, err := os.Stat(fx.disk.PartPath(key)); !errors.Is(err, fs.ErrNotExist) {
-			t.Error("invalid 降级后半截应被丢弃")
+			t.Error("invalid 安全中断后半截应被丢弃")
 		}
-		e, ok := fx.disk.Get(key)
-		if !ok || !bytes.Equal(e.Body, content) {
-			t.Errorf("降级全量回源后缓存应为完整原文 %d 字节（绝不把半截固化为正式缓存）", len(content))
+		if _, ok := fx.disk.Get(key); ok {
+			t.Error("invalid 安全中断不得写缓存（绝不把半截固化为正式缓存）")
 		}
 	}
 
@@ -774,24 +856,45 @@ func TestBlobResumeDistrustsUnverifiable416(t *testing.T) {
 		fx := newResumeFixture(t, nil)
 		fx.reg.setContent(digest, content)
 		fx.reg.setBad416(digest) // 对任意 Range 回 416 且不带 Content-Range
+		fx.setManifestSize(digest, int64(len(content)))
 
 		key := prefetchBlobKey(name, digest)
 		fx.s.savePartialPart(fx.disk, key, content[:1000])
 		w := httptest.NewRecorder()
 		fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
-		assertFullRefetch(t, fx, key, w)
+		assertSafeAbort(t, fx, 1000, key, w)
+
+		// docker 重试：干净全量回源拿到完整原文并入库（自愈闭环）
+		w2 := httptest.NewRecorder()
+		fx.s.ServeHTTP(w2, prefetchBlobTestRequest(name, digest))
+		if got := w2.Body.Bytes(); !bytes.Equal(got, content) {
+			t.Errorf("重试应拿到完整原文（got %d 字节, want %d 字节）", len(got), len(content))
+		}
+		if e, ok := fx.disk.Get(key); !ok || !bytes.Equal(e.Body, content) {
+			t.Error("重试全量回源后缓存应为完整原文")
+		}
 	})
 
 	t.Run("416总长与半截不符", func(t *testing.T) {
 		fx := newResumeFixture(t, nil)
 		fx.reg.setContent(digest, content)
 		fx.reg.setFake416Total(digest, int64(len(content))+1000) // 416 总长伪造为大于半截
+		fx.setManifestSize(digest, int64(len(content)))
 
 		key := prefetchBlobKey(name, digest)
 		fx.s.savePartialPart(fx.disk, key, content[:1000])
 		w := httptest.NewRecorder()
 		fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
-		assertFullRefetch(t, fx, key, w)
+		assertSafeAbort(t, fx, 1000, key, w)
+
+		w2 := httptest.NewRecorder()
+		fx.s.ServeHTTP(w2, prefetchBlobTestRequest(name, digest))
+		if got := w2.Body.Bytes(); !bytes.Equal(got, content) {
+			t.Errorf("重试应拿到完整原文（got %d 字节, want %d 字节）", len(got), len(content))
+		}
+		if e, ok := fx.disk.Get(key); !ok || !bytes.Equal(e.Body, content) {
+			t.Error("重试全量回源后缓存应为完整原文")
+		}
 	})
 }
 
@@ -1115,6 +1218,7 @@ func TestBlobResumeBoundaries(t *testing.T) {
 		half := 1000
 		fx.reg.setContent(digest, content)
 		fx.reg.setChunkConfig(4096, 0)
+		fx.setManifestSize(digest, int64(len(content))) // manifest 先行：立即响应的 CL 依据
 
 		key := prefetchBlobKey(name, digest)
 		fx.s.savePartialPart(fx.disk, key, content[:half])
@@ -1548,17 +1652,19 @@ func TestFinalizeRejectsBlobDigestMismatch(t *testing.T) {
 	}
 }
 
-// TestBlobResumeCompletePoisonPartDiscardedAndRefetched 端到端回归（2026-11-07 现场
-// 2f1083db 事故形态）：毒半截（长度==总长、内容错误）经「416 证实完整」路径回放——
-// finalize 摘要强校验拒绝入库并丢弃毒半截，随后安全降级全量回源：客户端最终拿到
-// 正确原文、缓存=正确原文、无半截残留。
-func TestBlobResumeCompletePoisonPartDiscardedAndRefetched(t *testing.T) {
+// TestBlobResumeCompletePoisonPartDiscardedAndSelfHealOnRetry 端到端回归（2026-11-07 现场
+// 2f1083db 事故形态 + 立即响应语义）：毒半截（长度==总长、内容错误）经「416 证实完整」
+// 路径收尾——立即响应下前缀已先回放给客户端，finalize 摘要强校验拒绝入库并丢弃毒半截，
+// 按安全中断截断本次响应（客户端已收的毒前缀由 docker 摘要校验兜底），重试走干净全量
+// 回源自愈：客户端拿到正确原文、缓存=正确原文、无半截残留。
+func TestBlobResumeCompletePoisonPartDiscardedAndSelfHealOnRetry(t *testing.T) {
 	fx := newResumeFixture(t, nil)
 	fx.s.blobDigestVerify = nil
 	content := hubBlobContent(0xf3, 8192)
 	digest := realDigestOf(content)
 	poison := hubBlobContent(0xf4, 8192) // 同长度毒内容
 	fx.reg.setContent(digest, content)
+	fx.setManifestSize(digest, int64(len(content)))
 	key := prefetchBlobKey(prefetchName, digest)
 	// 预置毒半截：长度 == 真实总长（416 的 Content-Range 总长与半截一致、可「证实完整」）
 	if err := os.WriteFile(fx.disk.PartPath(key), poison, 0o644); err != nil {
@@ -1568,19 +1674,20 @@ func TestBlobResumeCompletePoisonPartDiscardedAndRefetched(t *testing.T) {
 	w := httptest.NewRecorder()
 	fx.s.ServeHTTP(w, prefetchBlobTestRequest(prefetchName, digest))
 
-	// 客户端最终拿到正确原文（拒绝入库后降级全量回源）
+	// 立即响应头已 commit（毒前缀已回放给客户端——docker 将因摘要不符重试）
 	if w.Code != http.StatusOK {
-		t.Fatalf("Code = %d, want %d", w.Code, http.StatusOK)
+		t.Fatalf("Code = %d, want %d（响应头已先行 commit）", w.Code, http.StatusOK)
 	}
-	if !bytes.Equal(w.Body.Bytes(), content) {
-		t.Errorf("客户端应拿到正确原文（got %d 字节, want %d 字节）", len(w.Body.Bytes()), len(content))
+	if got := w.Header().Get("X-Cache"); got != resumeCacheStatus {
+		t.Errorf("X-Cache = %q, want %q", got, resumeCacheStatus)
 	}
-	// 缓存 = 正确原文（毒内容绝不入库）
-	e, ok := fx.disk.Get(key)
-	if !ok || !bytes.Equal(e.Body, content) {
-		t.Error("缓存应为完整正确原文（毒内容不得入库）")
+	if !bytes.Equal(w.Body.Bytes(), poison) {
+		t.Errorf("截断 body 应为已回放的毒前缀 %d 字节（got %d 字节）", len(poison), w.Body.Len())
 	}
-	// 毒半截已丢弃
+	// 毒内容绝不入库；毒半截已随守卫丢弃
+	if _, ok := fx.disk.Get(key); ok {
+		t.Error("毒内容不得入库")
+	}
 	if _, err := os.Stat(fx.disk.PartPath(key)); !errors.Is(err, fs.ErrNotExist) {
 		t.Error("毒半截应已丢弃")
 	}
@@ -1588,9 +1695,19 @@ func TestBlobResumeCompletePoisonPartDiscardedAndRefetched(t *testing.T) {
 	if !strings.Contains(fx.logBuf.String(), "摘要不符") {
 		t.Error("应留痕「blob 回源内容摘要不符」日志")
 	}
-	// 上游恰 2 路：1 路 Range 探测（416 证实完整）+ 1 路降级全量回源
-	if n := fx.reg.rec.calls(digest); n != 2 {
-		t.Errorf("上游 blob 回源 %d 次, want 2（Range 探测 + 降级全量）", n)
+	// 上游恰 1 路：Range 探测（416 证实完整）；安全中断后不再本请求内降级，全量由重试触发
+	if n := fx.reg.rec.calls(digest); n != 1 {
+		t.Errorf("上游 blob 回源 %d 次, want 1（Range 探测；全量由重试触发）", n)
+	}
+
+	// docker 重试：无半截 → 干净全量回源拿到正确原文并入库（自愈闭环）
+	w2 := httptest.NewRecorder()
+	fx.s.ServeHTTP(w2, prefetchBlobTestRequest(prefetchName, digest))
+	if !bytes.Equal(w2.Body.Bytes(), content) {
+		t.Errorf("重试应拿到正确原文（got %d 字节, want %d 字节）", w2.Body.Len(), len(content))
+	}
+	if e, ok := fx.disk.Get(key); !ok || !bytes.Equal(e.Body, content) {
+		t.Error("重试后缓存应为完整正确原文")
 	}
 }
 

@@ -450,14 +450,14 @@ func TestPrefetchHubMultiClientRideAlong(t *testing.T) {
 }
 
 // TestPrefetchHubFailureBroadcast 预取失败广播的三种确定性时序：
-//  1. 未 commit 订阅者（等待响应头快照阶段）收到 failed 广播 → tryServeFromPrefetchHub
-//     返回 false 走原回源路径，条目从 hub 移除、临时文件已删；
+//  1. 快照未就绪的立即响应订阅者（合成头已 commit）收到 failed 广播 → 本次搭车响应按
+//     截断终止（tryServeFromPrefetchHub 返回 true），条目从 hub 移除、临时文件已删；
 //  2. 预取失败（首路中途断连）移除后客户端 GET → hub 无条目降级原回源，拿到完整 body
 //     （上游第二路成功）；
 //  3. 已 commit 订阅者收到 failed 广播 → 终止本次搭车响应（已回放内容为完整内容的截断
 //     前缀），上游仍仅 1 路，半截数据不入库。
 func TestPrefetchHubFailureBroadcast(t *testing.T) {
-	t.Run("未commit订阅者失败广播返回false并清理", func(t *testing.T) {
+	t.Run("快照未就绪立即响应后失败广播截断并清理", func(t *testing.T) {
 		fx := newHubFixture(t, nil)
 		key := prefetchBlobKey(prefetchName, prefetchDigestLayer1)
 		hub := fx.s.prefetchHubOrInit()
@@ -473,26 +473,38 @@ func TestPrefetchHubFailureBroadcast(t *testing.T) {
 		}
 		ent.attachFile(tmp, tmp.Name())
 
-		// 白盒直接调用搭车入口：条目未 setSnapshot（未 commit 语义 = 卡在等快照阶段）
+		// 白盒直接调用搭车入口：条目未 setSnapshot（快照未就绪 = 执行方仍在候选扫描/
+		// 竞速阶段）——立即响应语义：不再阻塞等快照，合成响应头先 commit（X-Cache:
+		// PREFETCH）并回放本地前缀，随后等增量/终态广播
 		target := "v2/" + prefetchName + "/blobs/" + prefetchDigestLayer1
 		r := prefetchBlobTestRequest(prefetchName, prefetchDigestLayer1)
 		handled := make(chan bool, 1)
+		w := httptest.NewRecorder()
 		go func() {
-			w := httptest.NewRecorder()
 			handled <- fx.s.tryServeFromPrefetchHub(w, r, key, target, fx.effFor(r, target), fx.disk, time.Now())
 		}()
-		hubWaitSubCount(t, ent, 1, 2*time.Second) // 已订阅、阻塞在等待快照
+		hubWaitSubCount(t, ent, 1, 2*time.Second) // 已订阅、已 commit、阻塞在等增量
 
-		ent.finishFailed(errors.New("上游中途断连")) // 失败广播：close changed + 移除 + 清理
+		ent.finishFailed(errors.New("上游中途断连")) // 失败广播：close 订阅 + 移除 + 清理
 
-		if got := <-handled; got {
-			t.Fatal("未 commit 的失败广播应返回 false（降级走原回源路径），got true")
+		if got := <-handled; !got {
+			t.Fatal("立即响应的搭车在 failed 广播后应返回 true（响应已 commit，按截断终止），got false")
+		}
+		if w.Code != http.StatusOK {
+			t.Errorf("立即响应 Code = %d, want %d（合成响应头已 commit）", w.Code, http.StatusOK)
+		}
+		if got := w.Header().Get("X-Cache"); got != prefetchCacheStatus {
+			t.Errorf("立即响应 X-Cache = %q, want %q", got, prefetchCacheStatus)
+		}
+		// 已回放内容必须是前缀文件内容的前缀（commit 与失败广播存在竞态，读到多少算多少）
+		if body := w.Body.String(); !strings.HasPrefix("half", body) {
+			t.Errorf("终止响应的已回放内容不是前缀文件内容的前缀（got %d 字节）", w.Body.Len())
 		}
 		if got := hub.lookup(key); got != nil {
 			t.Error("failed 条目应已从 hub 移除（后续请求查不到 → 走原回源）")
 		}
 		if n := hubSubCount(ent); n != 0 {
-			t.Errorf("搭车放弃后订阅应注销, got %d", n)
+			t.Errorf("搭车终止后订阅应注销, got %d", n)
 		}
 		if _, err := os.Stat(ent.tmpPathOf()); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("failed 收尾应删除临时文件 %s, stat err = %v", ent.tmpPathOf(), err)
@@ -533,27 +545,42 @@ func TestPrefetchHubFailureBroadcast(t *testing.T) {
 			t.Fatalf("失败阶段上游应仅首路 1 次回源, got %d", n)
 		}
 
-		// 客户端 GET：hub 无条目 → 降级走原回源（第二路）→ 拿到完整 body
+		// 客户端 GET #1：hub 无条目 → 撞上半截走续传立即响应（合成头 commit + 回放本地
+		// 前缀）；续传探测被上游 200 拒绝（不支持 Range）→ 安全中断截断本次响应、丢弃
+		// 半截（已回放的前缀字节是合法内容前缀，绝无错位）
 		w := httptest.NewRecorder()
 		fx.s.ServeHTTP(w, prefetchBlobTestRequest(name, digest))
 		if w.Code != http.StatusOK {
-			t.Fatalf("降级回源 Code = %d, want %d", w.Code, http.StatusOK)
+			t.Fatalf("续传立即响应 Code = %d, want %d（响应头已先行 commit）", w.Code, http.StatusOK)
 		}
-		if got := w.Header().Get("X-Cache"); got == prefetchCacheStatus {
-			t.Errorf("降级路径不应标记 X-Cache: %q", got)
+		if got := w.Header().Get("X-Cache"); got != resumeCacheStatus {
+			t.Errorf("续传立即响应 X-Cache = %q, want %q", got, resumeCacheStatus)
 		}
-		if w.Body.String() != string(content) {
-			t.Errorf("降级 body 与上游原文不一致（got %d 字节, want %d 字节）", w.Body.Len(), len(content))
+		if w.Body.Len() == 0 || !strings.HasPrefix(string(content), w.Body.String()) {
+			t.Errorf("截断 body 应为上游原文的已回放前缀（got %d 字节）", w.Body.Len())
 		}
-		// 3 路 = 首路预取失败（半截已保留）+ 客户端 GET 先按断点续传尝试（本假上游不支持
-		// Range、对 bytes=<n>- 回 200 → 判定明确拒绝续传、丢弃半截）+ 降级既有全量回源。
-		// （docker-partial-resume-enabled 默认开启后，预取失败保留半截使客户端 GET 多出
-		// 一路续传探测；客户端拿到的 body / 缓存语义与旧版一致，见 partial_resume.go）
+		if _, err := os.Stat(fx.disk.PartPath(key)); !errors.Is(err, fs.ErrNotExist) {
+			t.Error("续传被 200 拒绝（invalid）后半截应已丢弃")
+		}
+
+		// docker 重试 GET #2（无半截）：干净全量回源拿到完整 body 并写缓存（自愈闭环）
+		w2 := httptest.NewRecorder()
+		fx.s.ServeHTTP(w2, prefetchBlobTestRequest(name, digest))
+		if w2.Code != http.StatusOK {
+			t.Fatalf("重试回源 Code = %d, want %d", w2.Code, http.StatusOK)
+		}
+		if w2.Body.String() != string(content) {
+			t.Errorf("重试 body 与上游原文不一致（got %d 字节, want %d 字节）", w2.Body.Len(), len(content))
+		}
+		// 3 路 = 首路预取失败（半截已保留）+ 客户端 GET #1 的续传探测（被 200 拒绝判
+		// invalid、安全中断截断）+ 重试 GET #2 的干净全量回源。
+		//（docker-partial-resume-enabled 默认开启后，预取失败保留半截使客户端 GET 多出
+		// 一路续传探测；安全中断后由重试拿完整 body，数据语义不变，见 partial_resume.go）
 		if n := fx.reg.rec.calls(digest); n != 3 {
-			t.Errorf("上游应共 3 路回源（首路预取失败 + 续传探测被 200 拒绝 + 降级全量成功）, got %d", n)
+			t.Errorf("上游应共 3 路回源（首路预取失败 + 续传探测被 200 拒绝 + 重试全量成功）, got %d", n)
 		}
 		if _, ok := fx.disk.Get(key); !ok {
-			t.Error("客户端降级回源成功后应写入缓存")
+			t.Error("重试全量回源成功后应写入缓存")
 		}
 	})
 
