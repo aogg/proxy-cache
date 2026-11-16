@@ -150,6 +150,7 @@ var logKeyZh = map[string]string{
 	"range_end":      "区间终点",
 	"range_has_end":  "含终点",
 	"range_last":     "末段起点",
+	"declared_end":   "声明终点",
 
 	// 活跃下载汇总
 	"active":    "活跃下载数",
