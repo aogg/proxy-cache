@@ -1283,7 +1283,7 @@ func validateSlowDownload(where string, speed *Bytes, window *Duration, minRemai
 }
 
 // validateBlobConcurrencyInterval 校验时间驱动的单层 blob 多源并发补充间隔
-//（全局与规则级共用）：
+// （全局与规则级共用）：
 //   - nil = 未配置（沿用全局 / 缺省 5m），合法；
 //   - 负数 = 配置错误（启动快速失败）；
 //   - 0 = 关闭时间驱动补充（合法，判速触发仍独立生效）；

@@ -39,6 +39,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -352,6 +353,36 @@ func progressSummaryTotal(header http.Header) int64 {
 		return v
 	}
 	return 0
+}
+
+// copyBodyWithProgress 分块把读取器里的响应体流式写给客户端，并逐块累加活跃下载进度：
+// 与 writeBodyWithProgress 语义完全一致（顺序写完整 body、遇错立即返回、短写按
+// io.ErrShortWrite 处理，绝不吞字节），区别只在于 body 来自读取器（磁盘区间 / 落盘
+// 临时文件）而不是整块内存——缓存 HIT 回放与区间切片回放都走这里，内存占用恒为一个块。
+func copyBodyWithProgress(w io.Writer, r io.Reader, prog *progressSummaryEntry) error {
+	const chunk = 64 * 1024
+	buf := make([]byte, chunk)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			wn, werr := w.Write(buf[:n])
+			if wn > 0 {
+				prog.addBytes(wn)
+			}
+			if werr != nil {
+				return werr
+			}
+			if wn != n {
+				return io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return nil
+			}
+			return rerr
+		}
+	}
 }
 
 // writeBodyWithProgress 分块写出响应体并逐块累加活跃下载进度：缓存/续传回放原实现一次

@@ -130,7 +130,15 @@ func (s *Server) maybePrefetchImageLayers(r *http.Request, target string, ent *c
 		return // 多平台 manifest list / OCI index / 未知类型不触发（原因见文件头注释）
 	}
 	var body imageManifestBody
-	if err := json.Unmarshal(ent.Body, &body); err != nil {
+	// manifest body 可能以磁盘流式承载（大 body 落盘语义，见 cache.Entry.BodyStream）：
+	// 按需读回（manifest / config 都是小对象，不会落到落盘阈值以上）
+	manifestBytes, berr := ent.BodyBytes()
+	if berr != nil {
+		s.log.Debug("docker manifest 读取失败，跳过 layer 预取",
+			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "ref", truncate(ref, 128), "err", berr)...)
+		return
+	}
+	if err := json.Unmarshal(manifestBytes, &body); err != nil {
 		// body 已在缓存、客户端响应早已完成：解析失败只降级留痕（Debug）
 		s.log.Debug("docker manifest 解析失败，跳过 layer 预取",
 			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "ref", truncate(ref, 128), "err", err)...)
@@ -220,9 +228,14 @@ func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, dig
 	// 保证 flight 合并与缓存命中都对得上客户端的真实 blob 请求
 	blobKey := cache.Key(config.BuildMatchStr(r.Host, blobTarget))
 
-	// 已有未过期缓存命中 → 跳过（Get 内含过期惰性删除语义，不重复下载）
-	if _, ok := disk.Get(blobKey); ok {
-		s.log.Debug("预取跳过：blob 缓存已命中", dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest)...)
+	// 已有未过期缓存命中 → 跳过（Open 内含过期惰性删除语义，不重复下载）。
+	// 只取元信息即关闭：绝不为了「判是否存在」把整份 blob 读进内存（旧版 disk.Get
+	// 对大条目会整份物化，1.32GiB 层光这一下就能打爆内存）
+	if e, oerr := disk.Open(blobKey); oerr == nil {
+		bytes := e.BodySize()
+		_ = e.Close()
+		s.log.Debug("预取跳过：blob 缓存已命中",
+			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest, "bytes", bytes)...)
 		return
 	}
 	// 该 blob 已在预取在途集合 → 跳过（防止重复排队）
@@ -283,9 +296,9 @@ func (s *Server) prefetchOneBlob(ctx context.Context, r *http.Request, name, dig
 			dockerLogAttrs(dockerLogSourcePrefetch, name, "rule", eff.Rule, "digest", digest)...)
 	default:
 		// 本调用为执行方且回源成功：留痕实际落盘文件（bytes 为 0 的防御分支仅兜 nil）
-		bytes := 0
+		bytes := int64(0)
 		if e != nil {
-			bytes = len(e.Body)
+			bytes = e.BodySize()
 		}
 		s.log.Info("预取 blob 写入缓存完成", dockerLogAttrs(dockerLogSourcePrefetch, name,
 			"rule", eff.Rule, "digest", digest, "bytes", bytes, "file", disk.FilePath(blobKey))...)

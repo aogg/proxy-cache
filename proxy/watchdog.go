@@ -67,7 +67,21 @@ func (w *progressWatchdog) onFire() {
 	}
 	w.mu.Unlock()
 	if since := time.Since(time.Unix(0, w.lastProgressAt.Load())); since < w.timeout {
-		return // 刚有进度：本次回调过期，不触发
+		// 刚有进度：本次回调过期，不触发。**必须重新武装**——定时器此刻已经耗尽，
+		// 若之后不再有新的 Reset（上游彻底静默正是 read-timeout 要处理的场景），
+		// 看门狗将永不再触发、整条请求永久挂死（历史 flake：token dance 重试读 body
+		// 静默时 go test 10 分钟超时；根因是 monotonic 定时器比墙钟 since 早到几毫秒，
+		// 命中 198.7ms < 200ms 的早触发分支，而最后一次 Reset 早已发生）。
+		w.mu.Lock()
+		if !w.stopped && w.timer != nil {
+			remain := w.timeout - since
+			if remain <= 0 {
+				remain = time.Millisecond // 防御：至少再判一次，绝不空转丢唤醒
+			}
+			w.timer.Reset(remain)
+		}
+		w.mu.Unlock()
+		return
 	}
 	w.mu.Lock()
 	w.fired = true

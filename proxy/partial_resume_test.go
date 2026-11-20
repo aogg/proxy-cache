@@ -959,12 +959,13 @@ func TestBlobResumeReminderLogsIsolatedGap(t *testing.T) {
 		t.Fatalf("应输出断开续传提醒日志，实际:\n%s", logs)
 	}
 	// captureLogger 无双语键改写（生产由 logging.ReplaceAttr 输出 isolated_gap(隔离时长)），
-	// 这里按原始英文键断言取值正确
-	if !strings.Contains(logs, "isolated_gap=1m30s") {
-		t.Errorf("提醒日志应携带隔离时长 isolated_gap=1m30s，实际:\n%s", logs)
+	// 这里按原始英文键断言取值正确。日志按毫秒四舍五入（如 1m30.001s），而 mtime 回拨与
+	// 日志输出之间必然有亚毫秒级耗时，故断言「1m30 前缀」而非精确字符串（历史 flake）。
+	if !strings.Contains(logs, "isolated_gap=1m30") {
+		t.Errorf("提醒日志应携带隔离时长 isolated_gap=1m30…s，实际:\n%s", logs)
 	}
-	if lines := logLinesOf(logs, "blob 半截续传开始"); len(lines) == 0 || !strings.Contains(lines[0], "isolated_gap=1m30s") {
-		t.Errorf("续传开始日志应携带 isolated_gap=1m30s，实际:\n%s", logs)
+	if lines := logLinesOf(logs, "blob 半截续传开始"); len(lines) == 0 || !strings.Contains(lines[0], "isolated_gap=1m30") {
+		t.Errorf("续传开始日志应携带 isolated_gap=1m30…s，实际:\n%s", logs)
 	}
 }
 

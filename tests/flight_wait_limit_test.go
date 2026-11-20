@@ -1,5 +1,5 @@
 // flight_wait_limit_test.go —— flightWaitLimit（10s 单飞等待上限）超限语义的黑盒回归
-//（缺口#3，session-124a15cf 用户需求起点 / prefetch_hub.go 防重复下载语义核心边界）：
+// （缺口#3，session-124a15cf 用户需求起点 / prefetch_hub.go 防重复下载语义核心边界）：
 //  1. 超限路径本体：同 key 并发回源，执行方流式下载超过 10s 等待上限时，等待方放弃
 //     flight 等待、自行走候选回源（第二路下载）——两路各自完整收敛、缓存原子替换不互
 //     污染（cache.Set 临时文件 + rename），这是「无在途流可搭车时」的文档化兜底语义；

@@ -127,7 +127,8 @@ type Server struct {
 	blobSizes *manifestBlobSizeIndex
 	// blobDigestVerify blob 写缓存前的内容寻址校验钩子（防毒缓存）：入参 (body 原文,
 	// digest "sha256:<hex>" 原文)，返回 (实际摘要 hex, 是否一致)。nil 时使用默认实现
-	//（sha256 全量比对）——生产恒走默认强校验；仅测试注入 stub（既有夹具的 digest
+	//（sha256 全量比对，见 entryDigestMismatch：内存 body 直接比对、落盘 body 流式现算，
+	// 大 blob 不整份读进内存）——生产恒走默认强校验；仅测试注入 stub（既有夹具的 digest
 	// 常量与内容无关，见各 *_test.go 构造器；防毒缓存回归测试还原 nil 走真校验）。
 	blobDigestVerify func(body []byte, digest string) (string, bool)
 }
@@ -621,17 +622,35 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	// 本块必须在 !cacheable 的 BYPASS 分支之前：blobRangeLocal 的 bypassReason 是 blob-range
 	// （不写缓存），但「读缓存」与「半截续传」仍然可用。
 	if blobRangeLocal && disk != nil {
-		// A) 正式缓存 HIT：条目 body 即完整 blob，任意起点本地切片回 206（不发上游）
-		if e, ok := disk.Get(key); ok && e.Status == http.StatusOK && len(e.Body) > 0 {
-			if mismatch, actual := s.entryDigestMismatch(target, e); mismatch {
-				// 毒条目：删除后继续走下方未命中链路（同请求内回源自愈），绝不回放毒字节
-				s.purgePoisonEntry(disk, key, target, eff.Rule, actual)
-			} else {
-				s.log.Info("缓存命中（HIT）并按客户端区间本地切片回 206（不发上游）",
-					labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
-						"file", disk.FilePath(key), "range_start", rangeSpec.start,
-						"range_has_end", rangeSpec.hasEnd, "bytes", len(e.Body))...)
-				s.serveEntryBlobRange(w, r, e, rangeSpec, "HIT", eff, start)
+		// A) 正式缓存 HIT：条目 body 即完整 blob，任意起点本地切片回 206（不发上游）。
+		// 流式打开（cache.Open）：回放按区间从磁盘读，绝不把 blob 整份读进内存——旧版
+		// disk.Get 的 io.ReadAll 就是 2026-11-20 事故里 767MB → 约 1GB 内存峰值的根源
+		if e, oerr := disk.Open(key); oerr == nil {
+			hitReady := e.Status == http.StatusOK && e.BodySize() > 0
+			served := false
+			if hitReady {
+				mismatch, actual, verr := s.entryDigestMismatch(target, e)
+				switch {
+				case verr != nil:
+					// 摘要复核读取失败（临时 IO 错误）：绝不删文件（见 cache.Open 错误分级），
+					// 本次按未命中回源，文件留给下一次请求
+					s.log.Warn("缓存条目摘要复核读取失败（临时 IO 错误，已保留缓存文件），本次按未命中回源",
+						labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+							"file", disk.FilePath(key), "err", verr)...)
+				case mismatch:
+					// 毒条目：删除后继续走下方未命中链路（同请求内回源自愈），绝不回放毒字节
+					s.purgePoisonEntry(disk, key, target, eff.Rule, actual)
+				default:
+					s.log.Info("缓存命中（HIT）并按客户端区间本地切片回 206（不发上游）",
+						labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+							"file", disk.FilePath(key), "range_start", rangeSpec.start,
+							"range_has_end", rangeSpec.hasEnd, "bytes", e.BodySize())...)
+					s.serveEntryBlobRange(w, r, e, rangeSpec, "HIT", eff, start)
+					served = true
+				}
+			}
+			_ = e.Close()
+			if served {
 				return
 			}
 		}
@@ -675,15 +694,28 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 
 	// //////////////////  查缓存：命中直接回放  start  ////////////////////////////////////////////////
 	if disk != nil {
-		if e, ok := disk.Get(key); ok {
-			if mismatch, actual := s.entryDigestMismatch(target, e); mismatch {
+		// 流式打开（cache.Open）：body 不整份读进内存，HIT 回放全程按区间从磁盘流式写客户端
+		if e, oerr := disk.Open(key); oerr == nil {
+			served := false
+			mismatch, actual, verr := s.entryDigestMismatch(target, e)
+			switch {
+			case verr != nil:
+				// 摘要复核读取失败（临时 IO 错误）：保留文件，本次按未命中回源
+				s.log.Warn("缓存条目摘要复核读取失败（临时 IO 错误，已保留缓存文件），本次按未命中回源",
+					labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+						"file", disk.FilePath(key), "err", verr)...)
+			case mismatch:
 				// 毒条目：删除后按未命中继续（下方链路同请求内回源自愈），绝不回放毒字节
 				s.purgePoisonEntry(disk, key, target, eff.Rule, actual)
-			} else {
+			default:
 				// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径
 				s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
-					"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
+					"file", disk.FilePath(key), "bytes", e.BodySize(), "ttl", ttlDisplay(e.TTL))...)
 				s.serveEntry(w, r, e, "HIT", eff, start, zeroArgs...)
+				served = true
+			}
+			_ = e.Close()
+			if served {
 				return
 			}
 		}
@@ -772,6 +804,13 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, target string
 	case streaming && executed:
 		// 本调用是流式执行方：响应头已 commit、body 已边读边写、完成日志已输出，
 		// 无需再走 serveEntry 回放
+	case streaming && (e == nil || (e.BodyStream == nil && len(e.Body) == 0)):
+		// 等待方拿到的执行方条目没有可回放 body（大 body 落盘来源已在毒条目守卫处被
+		// 释放 / 写缓存失败 / 内容为空）：绝不回放毒字节或空 body，自行流式回源
+		s.log.Warn("单飞等待方拿到的条目无可回放 body（执行方内容未入库），自行流式回源",
+			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key, "target", truncate(target, 300))...)
+		_, committed, ferr := s.fetchViaCandidatesStreaming(w, r, target, eff, "MISS", finalize, start, partialSink{key: key, disk: disk})
+		streamingError(ferr, committed)
 	default:
 		s.serveEntry(w, r, e, "MISS", eff, start)
 	}
@@ -794,18 +833,42 @@ func blobDigestMatches(body []byte, digest string) (string, bool) {
 // 写入侧强校验同一校验器）：blob 目标条目在回放给客户端前必须再次通过 sha256 比对——
 // 写入守卫部署之前落盘的历史条目无法追溯验证（2026-11-07 现场：镜像 18 个 blob 中
 // 7 个为毒，连 1-5KB 的 config 小文件都中招，证明普通全量 GET 路径同样投毒过），
-// 只有回放前复核才能拦住。返回 (是否不符, 实际摘要 hex)；非 blob 目标恒 false。
-func (s *Server) entryDigestMismatch(target string, e *cache.Entry) (bool, string) {
+// 只有回放前复核才能拦住。
+//
+// 内存安全：复核走流式 sha256（Entry.SHA256：磁盘条目按区间读文件现算，绝不把
+// 767MB 级 body 读进内存）；磁盘条目恒不复用写入时的摘要结论——复核必须基于磁盘上
+// 的真实字节（毒缓存自愈语义不变）。
+// 返回值：mismatch 是否不符；actual 实际摘要 hex；err 读取/计算失败（临时 IO 错误，
+// 调用方按未命中回源但**不得删除文件**）。非 blob 目标恒 (false, "", nil)。
+func (s *Server) entryDigestMismatch(target string, e *cache.Entry) (mismatch bool, actual string, err error) {
 	dgst, isBlob := parseDockerBlobTarget(target)
 	if !isBlob {
-		return false, ""
+		return false, "", nil
 	}
-	verify := s.blobDigestVerify
-	if verify == nil {
-		verify = blobDigestMatches
+	if s.blobDigestVerify != nil {
+		// 测试注入的校验钩子（签名按完整 body 字节）：只在测试里出现，body 量级小
+		body, berr := e.BodyBytes()
+		if berr != nil {
+			return false, "", berr
+		}
+		actual, ok := s.blobDigestVerify(body, dgst)
+		return !ok, actual, nil
 	}
-	actual, ok := verify(e.Body, dgst)
-	return !ok, actual
+	if e.BodyStream == nil {
+		// 内存 body（小响应）：直接复用既有的 sha256 全量比对实现
+		actual, ok := blobDigestMatches(e.Body, dgst)
+		return !ok, actual, nil
+	}
+	// 落盘 body（大响应）：流式现算 sha256，绝不为校验把整份内容读进内存
+	actual, aerr := e.SHA256()
+	if aerr != nil {
+		return false, "", aerr
+	}
+	hexdig := strings.TrimPrefix(dgst, "sha256:")
+	if hexdig == dgst {
+		return false, actual, nil // 非 sha256 digest：跳过校验（仅 sha256 算法可本地验证）
+	}
+	return actual != hexdig, actual, nil
 }
 
 // purgePoisonEntry 毒条目处置：删除磁盘文件并留痕（Error）。删除失败仅 Warn——后台
@@ -854,30 +917,39 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 		// HTML 候选；这里是「绕过探针判据的直调写缓存路径」（预取 / 半截续传执行方）的
 		// 兜底：registry 路径目标下合法 200 载荷只会是 manifest JSON / blob 二进制，
 		// 绝不可能是 HTML；完整 URL 目标（web / github raw）HTML 是合法载荷，不受影响。
+		bodyBytes := ent.BodySize()
 		poisonSkip := false
 		if isPathTarget(target) && htmlPageContentType(ent.Header.Get("Content-Type")) {
 			s.log.Warn("回源 200 但 Content-Type 为 HTML 页面，拒绝写缓存（防镜像站反爬页毒化缓存）",
 				labels.attrs(logSource, "rule", eff.Rule, "target", truncate(target, 300),
-					"content_type", ent.Header.Get("Content-Type"), "body_bytes", len(ent.Body))...)
+					"content_type", ent.Header.Get("Content-Type"), "body_bytes", bodyBytes)...)
 			poisonSkip = true
 		}
 		if !poisonSkip {
 			if dgst, isBlob := parseDockerBlobTarget(target); isBlob {
-				verify := s.blobDigestVerify
-				if verify == nil {
-					verify = blobDigestMatches
-				}
-				if actual, ok := verify(ent.Body, dgst); !ok {
+				// 写缓存前的 sha256 全量比对（551a505 的防毒缓存语义）：大 body 走流式
+				// 摘要（写入时滚动计算，绝不把整份内容读进内存）；读取/计算失败按「无法
+				// 校验」拒绝入库，但不清半截（内容未必是毒，只是校验不成功）
+				mismatch, actual, verr := s.entryDigestMismatch(target, ent)
+				switch {
+				case verr != nil:
+					s.log.Warn("blob 回源内容摘要复核失败（读取临时错误），拒绝写缓存（不写未经验证的内容）",
+						labels.attrs(logSource, "rule", eff.Rule, "digest", dgst,
+							"body_bytes", bodyBytes, "target", truncate(target, 300), "err", verr)...)
+					return false
+				case mismatch:
 					s.log.Error("blob 回源内容摘要不符，拒绝写缓存（防毒缓存：上游返回了错误内容）",
 						labels.attrs(logSource, "rule", eff.Rule, "digest", dgst,
-							"actual_digest", "sha256:"+actual, "body_bytes", len(ent.Body),
+							"actual_digest", "sha256:"+actual, "body_bytes", bodyBytes,
 							"target", truncate(target, 300))...)
 					poisonSkip = true
 				}
 			}
 		}
 		if poisonSkip {
-			// 毒内容绝不入库；续传写入者的毒半截一并丢弃（理由见上方函数注释）
+			// 毒内容绝不入库；续传写入者的毒半截一并丢弃（理由见上方函数注释）。
+			// 落盘临时 body 同样立即释放（767MB 级临时文件不滞留到后台清理）
+			ent.ReleaseBody()
 			if logSource == dockerLogSourceResume && disk != nil {
 				disk.RemovePart(key)
 			}
@@ -892,7 +964,7 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 			// 写盘成功必须可见：规则名、缓存 key、实际落盘文件路径、body 大小与生效 TTL
 			s.log.Info("写入缓存成功",
 				labels.attrs(logSource, "rule", eff.Rule, "target", truncate(target, 300), "key", key,
-					"file", disk.FilePath(key), "bytes", len(ent.Body), "ttl", ttlDisplay(ent.TTL))...)
+					"file", disk.FilePath(key), "bytes", ent.BodySize(), "ttl", ttlDisplay(ent.TTL))...)
 			// blob 正式缓存条目已落盘：立即删除对应半截文件（其内容已完整入库，
 			// 使命完成；非 blob 目标静默跳过，见 partial_resume.go）
 			if _, isBlob := parseDockerBlobTarget(target); isBlob {
@@ -917,7 +989,7 @@ func (s *Server) finalizeFetchEntry(r *http.Request, key, target string, ent *ca
 	// 回源成功但不满足缓存判据：同样留痕，说明为什么这次没写缓存文件
 	s.log.Info("回源成功但不写缓存（未过成功判据或非 200）",
 		labels.attrs(logSource, "rule", eff.Rule, "status", ent.Status, "check", eff.SuccessCheck,
-			"body_bytes", len(ent.Body), "target", truncate(target, 300))...)
+			"body_bytes", ent.BodySize(), "target", truncate(target, 300))...)
 	return false
 }
 
@@ -946,17 +1018,30 @@ func (s *Server) handleHead(w http.ResponseWriter, r *http.Request, target strin
 		cacheStatus = "BYPASS"
 		headMutableBypass = true
 	} else if disk := s.readableCache(r, eff); disk != nil {
-		if e, ok := disk.Get(key); ok {
-			if mismatch, actual := s.entryDigestMismatch(target, e); mismatch {
+		// 流式打开（cache.Open）：HEAD 只需元信息与长度，body 留在磁盘上（不读进内存）
+		if e, oerr := disk.Open(key); oerr == nil {
+			served := false
+			mismatch, actual, verr := s.entryDigestMismatch(target, e)
+			switch {
+			case verr != nil:
+				// 摘要复核读取失败（临时 IO 错误）：保留文件，本次按未命中回源
+				s.log.Warn("缓存条目摘要复核读取失败（临时 IO 错误，已保留缓存文件），本次按未命中回源",
+					labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
+						"file", disk.FilePath(key), "err", verr)...)
+			case mismatch:
 				// 毒条目：删除后按未命中回源（HEAD 探测同样绝不放行毒条目——错误的
 				// Content-Length / Docker-Content-Digest 会把 docker 引向错误决策）
 				s.purgePoisonEntry(disk, key, target, eff.Rule, actual)
-			} else {
+			default:
 				// 缓存命中是用户最关心的决策结果之一，Info 级输出实际命中的磁盘文件路径；
 				// serveEntry 的 HEAD 分支只回放状态码与响应头（含 Content-Length），不写 body
 				s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
-					"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
+					"file", disk.FilePath(key), "bytes", e.BodySize(), "ttl", ttlDisplay(e.TTL))...)
 				s.serveEntry(w, r, e, "HIT", eff, start)
+				served = true
+			}
+			_ = e.Close()
+			if served {
 				return
 			}
 		}
@@ -1058,7 +1143,7 @@ func (s *Server) fetchViaCandidates(r *http.Request, target string, eff config.O
 	// //////////////////  探测提速管线竞速选定候选  end  /////////////////////////////////////////
 
 	// 胜出候选排干为完整 Entry（缓存条目/回放语义与旧版一致）
-	e, derr := s.drainProbe(res)
+	e, derr := s.drainProbe(res, eff.CachePath)
 	if derr != nil {
 		return nil, derr
 	}
@@ -1184,14 +1269,18 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	wd.reset() // 响应头到达 = 一次进度（read-timeout 计时器重置）
 	defer resp.Body.Close()
 	// HEAD 响应天然无 body（不读 body 语义）：跳过读取，Body 保持为空，
-	// 状态码与响应头（含 Content-Length / Docker-Content-Digest 等）照常透传
-	var buf []byte
+	// 状态码与响应头（含 Content-Length / Docker-Content-Digest 等）照常透传。
+	// 其余响应用 bodyBucket 边读边累积（见 body_bucket.go）：小响应驻留内存，超过
+	// 8MB 整体落盘——旧版 io.ReadAll 会把整份响应体读进内存（2026-11-20 事故根因之一，
+	// 767MB → 约 1GB 峰值），现在内存占用与响应体大小无关。
+	var bucket *bodyBucket
 	if method != http.MethodHead {
+		bucket = newBodyBucket(eff.CachePath)
 		// 经 progressReader 读取：每收到 n>0 字节都算进度并重置看门狗，
 		// 慢速但持续传输的大 blob 不会被 read-timeout 误砍
-		buf, err = io.ReadAll(&progressReader{r: resp.Body, wd: wd})
-		if err != nil {
-			return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, wd.wrapErr(err))
+		if _, cerr := io.CopyBuffer(bucket, &progressReader{r: resp.Body, wd: wd}, make([]byte, streamChunkSize)); cerr != nil {
+			bucket.Close()
+			return nil, fmt.Errorf("读取上游响应失败（%s）: %w", urlStr, wd.wrapErr(cerr))
 		}
 	}
 	// 深拷贝响应头，避免与连接复用的上游对象共享底层数据
@@ -1204,8 +1293,10 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	entry := &cache.Entry{
 		Status:   resp.StatusCode,
 		Header:   hdr,
-		Body:     buf,
 		StoredAt: time.Now(),
+	}
+	if bucket != nil {
+		bucket.Install(entry) // 小响应进 Entry.Body，大响应交给 Entry.BodyStream（落盘）
 	}
 
 	// //////////////////  Docker Registry 401 匿名 token dance  start  ///////////////////////////
@@ -1218,7 +1309,8 @@ func (s *Server) doRequest(r *http.Request, method, urlStr string, body io.Reade
 	// dance 全程共用本次尝试的看门狗（wd.ctx 受 http-timeout 与 read-timeout 共同约束）。
 	if resp.StatusCode == http.StatusUnauthorized && (method == http.MethodGet || method == http.MethodHead) {
 		if e2, ok := s.dockerAuthDance(wd, s.client(eff.HTTPProxy, eff.ConnectTimeout, eff.InsecureSkipVerify), req, resp, urlStr, nil); ok { // 无候选上下文（直连回退），无凭据可用，维持匿名 dance
-			entry = e2 // 重试响应作为最终响应，继续既有的返回 Entry 语义
+			entry.ReleaseBody() // 首个 401 响应的 body 不再需要（落盘临时文件立即释放）
+			entry = e2          // 重试响应作为最终响应，继续既有的返回 Entry 语义
 		}
 	}
 	// //////////////////  Docker Registry 401 匿名 token dance  end  /////////////////////////////
@@ -1279,15 +1371,16 @@ func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *ht
 	}
 	defer resp2.Body.Close()
 
-	// 重试响应按既有语义读取：HEAD 天然无 body 跳过，其余读全文（经 progressReader
-	// 每读到数据都重置看门狗）；读取失败按重试失败兜底（看门狗触发时标注 read-timeout）
-	var buf []byte
-	var err error
+	// 重试响应按既有语义读取：HEAD 天然无 body 跳过，其余用 bodyBucket 边读边累积
+	// （小响应驻留内存，超过 8MB 落盘，绝不整份读进内存——与 doRequest 同一内存安全
+	// 语义）；读取失败按重试失败兜底（看门狗触发时标注 read-timeout）
+	var bucket *bodyBucket
 	if orig.Method != http.MethodHead {
-		buf, err = io.ReadAll(&progressReader{r: resp2.Body, wd: wd})
-		if err != nil {
+		bucket = newBodyBucket("")
+		if _, cerr := io.CopyBuffer(bucket, &progressReader{r: resp2.Body, wd: wd}, make([]byte, streamChunkSize)); cerr != nil {
+			bucket.Close()
 			s.log.Warn("读取匿名 token 重试响应失败，按原始 401 响应返回",
-				"url", truncate(urlStr, 300), "err", wd.wrapErr(err))
+				"url", truncate(urlStr, 300), "err", wd.wrapErr(cerr))
 			return nil, false
 		}
 	}
@@ -1295,12 +1388,15 @@ func (s *Server) dockerAuthDance(wd *progressWatchdog, cl *http.Client, orig *ht
 	for k, vv := range resp2.Header {
 		hdr[k] = append([]string(nil), vv...)
 	}
-	return &cache.Entry{
+	entry := &cache.Entry{
 		Status:   resp2.StatusCode,
 		Header:   hdr,
-		Body:     buf,
 		StoredAt: time.Now(),
-	}, true
+	}
+	if bucket != nil {
+		bucket.Install(entry)
+	}
+	return entry, true
 }
 
 // dockerAuthDanceRetry 是 token dance 的请求/响应阶段核心（缓冲与探测式尝试共用）：
@@ -1613,6 +1709,8 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 	if cacheStatus == "HIT" && len(zr) == 0 && etagNotModified(r, e.Header) {
 		status = http.StatusNotModified
 	}
+	// 响应体长度（内存 body 或磁盘 BodyStream）：全程用它替代 len(e.Body)
+	size := e.BodySize()
 	switch {
 	case status == http.StatusNotModified:
 		// 304（HIT ETag 命中，或上游对无条件 GET 仍回 304 的兜底透传）：
@@ -1623,21 +1721,29 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 		if cl := e.Header.Get("Content-Length"); cl != "" {
 			h.Set("Content-Length", cl)
 		} else {
-			h.Set("Content-Length", strconv.Itoa(len(e.Body)))
+			h.Set("Content-Length", strconv.FormatInt(size, 10))
 		}
 		w.WriteHeader(status)
 	default:
-		h.Set("Content-Length", strconv.Itoa(len(e.Body)))
+		h.Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(status)
-		if len(e.Body) > 0 {
+		if size > 0 {
 			// 活跃下载进度登记（周期汇总，见 progress_summary.go）：缓存命中 / 单飞等待
 			// 回放 / BYPASS 回放同样是把内容传给客户端，按 source=client（续传链路回放为
 			// resume）登记，分块写逐块 addBytes——大 blob 一次 Write 会让 3 分钟汇总在
-			// 传输期间只能看到 0 字节。写失败/成功返回都 defer 注销，不留幽灵条目
-			prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, int64(len(e.Body)))
+			// 传输期间只能看到 0 字节。写失败/成功返回都 defer 注销，不留幽灵条目。
+			// body 从 Section 流式读（磁盘条目按区间读，绝不整份进内存）
+			prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, size)
 			defer prog.unregister()
-			if err := writeBodyWithProgress(w, e.Body, prog); err != nil {
-				s.log.Warn("写响应体失败", labels.attrs(logSource, "target", truncate(r.URL.Path, 200), "err", err)...)
+			src, serr := e.Section(0, -1)
+			if serr != nil {
+				s.log.Warn("读取缓存体失败（响应头已写出，终止本次响应）",
+					labels.attrs(logSource, "target", truncate(r.URL.Path, 200), "err", serr)...)
+			} else {
+				if err := copyBodyWithProgress(w, src, prog); err != nil {
+					s.log.Warn("写响应体失败", labels.attrs(logSource, "target", truncate(r.URL.Path, 200), "err", err)...)
+				}
+				_ = src.Close()
 			}
 		}
 	}
@@ -1651,10 +1757,10 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 		// 最终 304（HIT ETag 命中或上游 304 透传）也是成功：客户端用本地缓存副本正常渲染
 		s.log.Info("内容未变更（304），客户端缓存副本有效",
 			labels.attrs(logSource, "rule", eff.Rule, "upstream", e.Source, "cache", cacheStatus)...)
-	case status == http.StatusOK && len(e.Body) > 0 && r.Method != http.MethodHead:
+	case status == http.StatusOK && size > 0 && r.Method != http.MethodHead:
 		s.log.Info("成功返回内容",
 			labels.attrs(logSource, "rule", eff.Rule, "upstream", e.Source, "status", status,
-				"bytes", len(e.Body), "cache", cacheStatus)...)
+				"bytes", size, "cache", cacheStatus)...)
 	}
 	// //////////////////  成功返回日志  end  ////////////////////////////////////////////////
 
@@ -1666,7 +1772,7 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 			"cache", cacheStatus,
 			"upstream", e.Source,
 			"rule", eff.Rule,
-			"bytes", len(e.Body),
+			"bytes", size,
 			"cost", time.Since(start).Round(time.Millisecond).String(),
 		)...)
 }
@@ -1780,7 +1886,9 @@ func checkSuccess(e *cache.Entry, check, method string) bool {
 		if check == config.SuccessCheckStatus || method == http.MethodHead {
 			return true
 		}
-		return len(e.Body) > 0
+		// 内容判据只看「响应体非空」：大量级 body 以磁盘流式承载（BodyStream），
+		// 长度取 BodySize 而不是 len(Body)（后者对落盘条目恒为 0）
+		return e.BodySize() > 0
 	default:
 		return false
 	}

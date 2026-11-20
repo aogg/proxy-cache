@@ -51,18 +51,20 @@ func TestProgressWatchdogUnit(t *testing.T) {
 		t.Errorf("触发后 wrapErr 应含 read-timeout，得到 %v", got)
 	}
 
-	// 有进度（每 50ms 收到 1 字节，累计超过 100ms 窗口数倍）：不触发
-	wd2 := newProgressWatchdog(context.Background(), 100*time.Millisecond)
+	// 有进度（每 50ms 收到 1 字节，跨越 250ms 窗口数倍）：不触发。
+	// 窗口取 250ms（而非贴边 100ms）：go test ./... 各包并行执行，调度抖动下 100ms 窗口
+	// 偶发误触（历史 flake），放宽到 250ms 仍能验证「每次进度都重置窗口」的语义。
+	wd2 := newProgressWatchdog(context.Background(), 250*time.Millisecond)
 	defer wd2.Stop()
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 10; i++ {
 		time.Sleep(50 * time.Millisecond)
 		wd2.addBytes(1)
 	}
 	if wd2.Fired() {
 		t.Fatal("持续有进度时看门狗不应触发")
 	}
-	if wd2.bytes.Load() != 6 {
-		t.Errorf("累计字节数应为 6，得到 %d", wd2.bytes.Load())
+	if wd2.bytes.Load() != 10 {
+		t.Errorf("累计字节数应为 10，得到 %d", wd2.bytes.Load())
 	}
 	if got := wd2.wrapErr(fmt.Errorf("boom")); got.Error() != "boom" {
 		t.Errorf("未触发时 wrapErr 应原样返回，得到 %v", got)

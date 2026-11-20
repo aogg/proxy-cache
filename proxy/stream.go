@@ -33,7 +33,6 @@
 package proxy
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -84,6 +83,16 @@ func (s *Server) commitStreamingHeader(w http.ResponseWriter, res *probeResult, 
 		h.Set("Content-Length", cl)
 	}
 	w.WriteHeader(res.status)
+}
+
+// streamSpoolDir 返回流式回源累积缓冲的落盘目录：优先缓存实例目录（与缓存写入同盘、
+// 由同一后台清理兜底 .tmp- 残留），其次生效缓存路径，最后空串（bodyBucket 回退系统
+// 临时目录）。
+func streamSpoolDir(sink *partialSink, eff config.Options) string {
+	if sink != nil && sink.disk != nil {
+		return sink.disk.Dir()
+	}
+	return eff.CachePath
 }
 
 // fetchViaCandidatesStreaming GET 路径目标的流式回源：
@@ -236,7 +245,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	// //////////////////  边读上游边写客户端与累积缓冲  start  ///////////////////////////////////
 	clientOK := true    // 客户端写失败（docker 已断开）后置 false：不再写客户端
 	var clientErr error // 客户端断开错误（writeOut/writeFirst 检测到写失败时置值，非 nil = 断开即停）
-	accum := bytes.NewBuffer(make([]byte, 0, len(res.first)+streamChunkSize))
+	// accum 是响应体累积缓冲（body_bucket.go）：小响应驻留内存，超过阈值整体落盘，
+	// 内存峰值与 blob 大小无关（现场 767MB 层不再在内存里累积整份内容）
+	accum := newBodyBucket(streamSpoolDir(sink, eff))
 	total := 0
 	// 重复区间内容对账（slowMerger.verify，见 slowdownload.go 的 verifyStaleAgainstConfirmed）：
 	// 补充源的过期缓冲字节与已确认输出（accum = [0..已写游标) 的权威字节）同偏移逐字节
@@ -244,7 +255,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	// 客户端流与缓存。闭包在合并循环 goroutine 内调用（与 writeOut 同 goroutine 串行），
 	// 读 accum 无数据竞争。
 	staleVerify := func(off int64, stale []byte) bool {
-		return verifyStaleAgainstConfirmed(accum.Bytes(), off, stale)
+		return verifyStaleAgainstConfirmed(func(off int64, n int) ([]byte, error) {
+			return accum.Section(off, int64(n))
+		}, off, stale)
 	}
 	if blobTrack != nil {
 		blobConc.verify = staleVerify // 建合并器时挂到 slowMerger.verify（见 timeBlobSupplement）
@@ -257,7 +270,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	//（半截保留成功时 savePartialPart 已复用既有「blob 半截前缀已保留」日志）。
 	clientGoneAbort := func() error {
 		res.Close() // 幂等：多源合并场景的源已由 abortAll 逐路关闭，此处兜底胜者自身
-		kept := s.captureStreamPartial(sink, r, target, accum.Bytes())
+		kept := s.captureStreamPartialFrom(sink, r, target, accum)
 		s.log.Warn("客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）",
 			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
 				"status", res.status, "bytes", total, "client", "disconnected", "partial", kept,
@@ -431,7 +444,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 				// commit 后上游读取失败：blob 半截保留（仅 blob + 开关开启 + 无 Range 的
 				// 缓存可读主路径；进度不回退，见 partial_resume.go）、终止本次响应、不写缓存
 				res.Close()
-				s.captureStreamPartial(sink, r, target, accum.Bytes())
+				s.captureStreamPartialFrom(sink, r, target, accum)
 				s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
 					labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
 						"status", res.status, "bytes", total, "err", rerr)...)
@@ -474,7 +487,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		} else if merr != nil {
 			// 多源合并失败（非断开，既有语义不变）：blob 半截保留（同上——accum 即按序
 			// 合并出的已送前缀）、终止本次响应、不写缓存
-			s.captureStreamPartial(sink, r, target, accum.Bytes())
+			s.captureStreamPartialFrom(sink, r, target, accum)
 			s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
 				labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
 					"status", res.status, "bytes", total, "err", merr)...)
@@ -489,9 +502,15 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	entry = &cache.Entry{
 		Status:   res.status,
 		Header:   res.header,
-		Body:     accum.Bytes(),
 		StoredAt: time.Now(),
 		Source:   source,
+	}
+	// 响应体交给条目：小响应走内存，大响应保持落盘（BodyStream），回放与写缓存全程流式
+	accum.Install(entry)
+	if finalize == nil && entry.BodyStream != nil {
+		// BYPASS（不写缓存、也不会有单飞等待方回放该条目）：落盘临时 body 用完即释放，
+		// 避免 MB 级临时文件在缓存目录滞留到下次后台清理
+		entry.ReleaseBody()
 	}
 	if finalize != nil {
 		finalize(entry) // 既有条件（仅 200 且过判据）内用 cache.Set 原子写缓存并留痕

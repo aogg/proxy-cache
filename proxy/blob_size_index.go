@@ -24,7 +24,7 @@ import "sync"
 
 // manifestBlobSizeCapacity manifest blob size 索引的最大条目数（FIFO 淘汰最旧插入项）。
 // 一个镜像一般 10-200 层，8192 条可覆盖几十个并发镜像的 manifest，量级足够且内存可控
-//（8192 × 约百字节 ≈ 1MB 以内）。
+// （8192 × 约百字节 ≈ 1MB 以内）。
 const manifestBlobSizeCapacity = 8192
 
 // manifestBlobSizeIndex digest → 对象字节数 的进程内有界索引（并发安全）。

@@ -16,9 +16,9 @@ package tests
 
 import (
 	"fmt"
-	"strings"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 

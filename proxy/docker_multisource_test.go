@@ -215,9 +215,9 @@ func multiSourceDigest(pair string) string {
 func TestMultiSourceTagsMerge(t *testing.T) {
 	t.Run("三源并集去重排序", func(t *testing.T) {
 		fx := newMultiSourceFixture(t, nil, nil)
-		fx.fakes[0].tags = []string{"v1", "latest"}          // A
-		fx.fakes[1].tags = []string{"v2", "latest", "v3"}    // B（含与 A 重复的 latest）
-		fx.fakes[2].tags = []string{"v0", "v1"}              // C（v1 与 A 重复）
+		fx.fakes[0].tags = []string{"v1", "latest"}       // A
+		fx.fakes[1].tags = []string{"v2", "latest", "v3"} // B（含与 A 重复的 latest）
+		fx.fakes[2].tags = []string{"v0", "v1"}           // C（v1 与 A 重复）
 
 		w := fx.get("v2/adockero/proxy-cache/tags/list")
 		if w.Code != http.StatusOK {
@@ -284,7 +284,7 @@ func TestMultiSourceTagsMerge(t *testing.T) {
 }
 
 // TestMultiSourcePagedTagsSkipsMerge 覆盖点 2：tags/list 带分页参数不做多源合并
-//（跨源页码语义不一致），退回既有顺序管线——首发候选原文透传（乱序保留），其余候选零请求。
+// （跨源页码语义不一致），退回既有顺序管线——首发候选原文透传（乱序保留），其余候选零请求。
 func TestMultiSourcePagedTagsSkipsMerge(t *testing.T) {
 	fx := newMultiSourceFixture(t, nil, nil)
 	fx.fakes[0].tags = []string{"v2", "latest"} // 故意乱序：合并路径会排序，顺序管线保原文
@@ -308,7 +308,7 @@ func TestMultiSourcePagedTagsSkipsMerge(t *testing.T) {
 }
 
 // TestMultiSourcePoisonSourceRejected 覆盖点 3：HTML 反爬毒源被现有成功判据拒判
-//（html-error-page 同款），合并只使用合法源。
+// （html-error-page 同款），合并只使用合法源。
 func TestMultiSourcePoisonSourceRejected(t *testing.T) {
 	fx := newMultiSourceFixture(t, nil, nil)
 	fx.fakes[0].tags = []string{"v1"}
@@ -470,7 +470,7 @@ func TestMultiSourceReferrersMergeDedup(t *testing.T) {
 
 // TestMultiSourceAllFailFallsBackToSequential 覆盖点 6：全部源失败 → 退回既有顺序管线，
 // 继承其 4xx 透传语义（referrers 404 透传，docker 自带容错），每源共 2 次请求
-//（多源并发 1 次 + 顺序管线回退探测 1 次）。
+// （多源并发 1 次 + 顺序管线回退探测 1 次）。
 func TestMultiSourceAllFailFallsBackToSequential(t *testing.T) {
 	fx := newMultiSourceFixture(t, nil, nil)
 	for _, fake := range fx.fakes {
@@ -545,6 +545,13 @@ func TestMultiSourceClientDisconnectCancelsUpstream(t *testing.T) {
 	fx.s.ServeHTTP(w, r)
 	elapsed := time.Since(begin)
 
+	// 「客户端断开 → 在途上游请求被取消」是跨进程异步事件：cancel 返回时对端 handler
+	// 还需被调度到才能观测 ctx.Done 并置位。断言前轮询等待一小段窗口（≤2s，远小于
+	// 慢源 10s 延迟），避免调度抖动导致的假失败（本用例历史上约 5% 概率抖动红）。
+	cancelledBy := time.Now().Add(2 * time.Second)
+	for !fx.fakes[2].wasCancelled() && time.Now().Before(cancelledBy) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !fx.fakes[2].wasCancelled() {
 		t.Error("慢源的在途上游请求未被客户端断开取消（断开即停失效）")
 	}

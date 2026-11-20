@@ -207,7 +207,7 @@ func TestCorrectSupplementNotPruned(t *testing.T) {
 
 // TestWinnerConflictWarnsOnceNotReversePruned 缺口#1-c：胜者对账不符只 Warn 不反向剪。
 // 用「静默空窗 + 前缀正确毒源」精确构造已确认输出被抢先出数污染的确定性场景
-//（合并器约束「非胜者源不得抢在胜者首次出数之前出数」，故纯错位载荷在胜者首块前
+// （合并器约束「非胜者源不得抢在胜者首次出数之前出数」，故纯错位载荷在胜者首块前
 // 必然被挡住或按过期区间对账剪枝——能真实触发胜者对账冲突的形态是：毒源与已确认
 // 输出一致的前缀过期丢弃、其后首个新鲜块在胜者缓冲空窗携带错位字节进入输出）：
 //   - 胜者 200ms/块送满块 11（游标恰为升级窗口触发的 352KB）后进入 channel 门控的
@@ -220,14 +220,14 @@ func TestCorrectSupplementNotPruned(t *testing.T) {
 //     alive_sources=2）；补充源后续块以慢节拍续供，保证冲突先于流完成；
 //   - 被污染的累积内容被写缓存前的 sha256 强校验拒绝入库（毒内容绝不入库）。
 func TestWinnerConflictWarnsOnceNotReversePruned(t *testing.T) {
-	gapStarted := make(chan struct{})  // 胜者块 11 写毕：静默空窗开始（等待补充源并入）
-	arrived := make(chan struct{})     // 补充源请求已到（胜者可安全送出块 12）
-	proceed := make(chan struct{})     // 污染成立（客户端收满 416KB）：放行胜者块 13
+	gapStarted := make(chan struct{}) // 胜者块 11 写毕：静默空窗开始（等待补充源并入）
+	arrived := make(chan struct{})    // 补充源请求已到（胜者可安全送出块 12）
+	proceed := make(chan struct{})    // 污染成立（客户端收满 416KB）：放行胜者块 13
 	winnerURL, winnerHits := gatedWinner(t, blobData, winnerChunkDelay, gapStarted, arrived, proceed)
 	cw := &countingWriter{ResponseWriter: httpRecorder()}
 	poison := make([]byte, 0, len(blobData))
-	poison = append(poison, blobData[:12*chunk32K]...)                    // 前缀 [0,384K) 与原文一致
-	poison = append(poison, wrongPattern(blobData[12*chunk32K:])...)      // [384K,末尾) 错位
+	poison = append(poison, blobData[:12*chunk32K]...)               // 前缀 [0,384K) 与原文一致
+	poison = append(poison, wrongPattern(blobData[12*chunk32K:])...) // [384K,末尾) 错位
 	suppURL, suppHits := gatedPoisonSupplement(t, blobData, poison, cw.Bytes, gapStarted, arrived, proceed)
 	env := slowEscalationEnv(t, winnerURL, suppURL)
 

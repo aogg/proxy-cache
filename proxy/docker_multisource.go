@@ -2,7 +2,7 @@
 // 多源并发回源与合并（开关 docker-multi-source-enabled，默认开）：
 //
 // 背景：可变目标不缓存、每次回源（docker_mutable.go），此前走单候选顺序轮询
-//（url-redirect 多轮多尝试）：先命中的源直接把响应透传给 docker。镜像站之间同步有
+// （url-redirect 多轮多尝试）：先命中的源直接把响应透传给 docker。镜像站之间同步有
 // 快慢，先命中的源可能 tags/list 还没刷新、manifest 还是旧 digest——docker 拿不到
 // 最新 tag / 拉到旧镜像。本文件把可变目标的 BYPASS 回源改为「并发请求全部候选源 +
 // 按端点类型合并/共识」：
@@ -16,14 +16,14 @@
 // 同一 push 事务产生，多数源给出的 Docker-Content-Digest 即最新内容寻址结果；blob
 // 按 digest 寻址、内容不可变——共识摘要确定后，任意源取同 digest 的 manifest 与
 // blob 内容都一致，不存在「后续请求漂移到旧源」的问题，故无需把共识源固定下来
-//（README「docker 可变目标多源并发回源与合并」同款说明）。
+// （README「docker 可变目标多源并发回源与合并」同款说明）。
 //
 // 合并/共识之外的边界（全部刻意收窄，避免语义漂移）：
 //   - 仅 bypassReason=="docker-mutable" 的 GET/HEAD 启用多源；其余 BYPASS
-//    （request-range / request-no-cache / cache-disabled / negative-ttl 等）维持
+//     （request-range / request-no-cache / cache-disabled / negative-ttl 等）维持
 //     现有顺序管线不变；
 //   - tags/list 带分页参数（?n= / ?last=）时不做多源合并：跨源页码语义不一致
-//    （各源 tag 集合不同，同一 (n,last) 指向不同窗口），合并会产生错页/丢页，
+//     （各源 tag 集合不同，同一 (n,last) 指向不同窗口），合并会产生错页/丢页，
 //     退回现有顺序管线；
 //   - 候选数 <2（单候选）无合并/共识意义，维持顺序管线；
 //   - 成功判据复用现有判据（probePassed）：HTML 反爬页等未过判据的源被拒之于合并
@@ -42,7 +42,7 @@
 //     维持既有 206 透传；manifest 共识语义不受 Range 影响。
 //
 // 应答形态：合并/共识必须收齐各源完整响应，无法边收边发，故本路径为缓冲应答
-//（经 serveEntry 回放，X-Cache: BYPASS；GET/HEAD 同一入口，HEAD 只回放响应头）。
+// （经 serveEntry 回放，X-Cache: BYPASS；GET/HEAD 同一入口，HEAD 只回放响应头）。
 // 可变目标（manifest JSON / tags 列表 / referrers 列表）响应体量级小，可接受。
 package proxy
 
@@ -63,7 +63,7 @@ import (
 
 // dockerMultiSourceMaxConcurrency docker 可变目标多源并发回源的并发上限：
 // 候选全并发但超出的排队放行，防止候选列表过长时瞬间打满上游连接与内存
-//（每个在途源缓冲一份完整响应）。
+// （每个在途源缓冲一份完整响应）。
 const dockerMultiSourceMaxConcurrency = 8
 
 // dockerMutableKind docker 可变目标的多源处理类型（dockerMultiSourceKind 的解析结果）。
@@ -162,7 +162,7 @@ func dockerTagsPaged(target string) bool {
 //     HEAD 传可变目标分支标志）——false 直接放行（其余 BYPASS / MISS 维持顺序管线）；
 //   - 返回 true 表示已接管本次响应（含错误出口：客户端断开低调收尾、成功应答）；
 //     返回 false 表示未接管（条件不满足或全部源失败），调用方退回既有顺序候选管线
-//    （继承其 4xx 透传 / 502 语义）。
+//     （继承其 4xx 透传 / 502 语义）。
 func (s *Server) serveDockerMultiSource(w http.ResponseWriter, r *http.Request, target string, eff config.Options, mutableBypass bool, start time.Time) bool {
 	// //////////////////  校验参数（接管条件闸门）  start  ////////////////////////////////////////
 	if !mutableBypass {
@@ -327,7 +327,7 @@ func (s *Server) fetchMultiSourceConcurrent(r *http.Request, candidates []candid
 			}
 			// 排干为完整 Entry（tags/referrers/manifest 响应体量级小，缓冲可接受；
 			// 合并/共识语义必须收齐完整响应，无法流式）
-			e, derr := s.drainProbe(res)
+			e, derr := s.drainProbe(res, eff.CachePath)
 			if derr != nil {
 				s.log.Debug("docker 多源并发回源候选读取响应体失败",
 					"candidate", truncate(cand.url, 300), "status", res.status, "err", derr)
@@ -387,7 +387,7 @@ func (s *Server) mergeMultiSourceTags(successes []dockerMultiSourceSuccess, eff 
 		if err := json.Unmarshal(suc.entry.Body, &env); err != nil || env == nil {
 			s.log.Debug("docker 多源合并：tags/list body 非 JSON 对象，该源拒之于合并之外",
 				labels.attrs(dockerLogSourceClient, "rule", eff.Rule,
-					"upstream", truncate(suc.url, 300), "body_bytes", len(suc.entry.Body))...)
+					"upstream", truncate(suc.url, 300), "body_bytes", suc.entry.BodySize())...)
 			continue
 		}
 		rawTags, ok := env["tags"]
@@ -464,7 +464,7 @@ func (s *Server) mergeMultiSourceReferrers(successes []dockerMultiSourceSuccess,
 		if err := json.Unmarshal(suc.entry.Body, &env); err != nil || env == nil {
 			s.log.Debug("docker 多源合并：referrers body 非 JSON 对象，该源拒之于合并之外",
 				labels.attrs(dockerLogSourceClient, "rule", eff.Rule,
-					"upstream", truncate(suc.url, 300), "body_bytes", len(suc.entry.Body))...)
+					"upstream", truncate(suc.url, 300), "body_bytes", suc.entry.BodySize())...)
 			continue
 		}
 		rawManifests, ok := env["manifests"]

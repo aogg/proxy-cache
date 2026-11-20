@@ -427,29 +427,39 @@ func (s *Server) probeCandidateAttempt(parent context.Context, r *http.Request, 
 }
 
 // drainProbe 把探测结果排干为完整缓存条目（HEAD / 完整 URL 缓冲回放路径使用；
-// 语义与旧版 doRequest 的「整包读进内存」一致，仅探测阶段前置）。返回前后都会
-// Close 探测结果（缓冲路径不再需要活体 body）。读 body 阶段触发 read-timeout 时
-// 错误经 wd.wrapErr 标注（含 "read-timeout" 字样，便于日志辨认）并留 Warn 日志。
-func (s *Server) drainProbe(res *probeResult) (*cache.Entry, error) {
+// 探测阶段前置，随后排干活体 body）。返回前后都会 Close 探测结果（缓冲路径不再需要
+// 活体 body）。读 body 阶段触发 read-timeout 时错误经 wd.wrapErr 标注（含 "read-timeout"
+// 字样，便于日志辨认）并留 Warn 日志。
+//
+// 内存安全：body 经 bodyBucket 累积（spoolDir 为落盘目录，传空串回退系统临时目录）——
+// 小响应仍驻留内存（与旧版整包缓冲语义完全一致），超过 8MB 整体落盘，内存占用与
+// 响应体大小无关（旧版 io.ReadAll 会把完整 URL 目标的大 web 响应整份读进内存）。
+func (s *Server) drainProbe(res *probeResult, spoolDir string) (*cache.Entry, error) {
 	defer res.Close()
-	var rest []byte
+	bucket := newBodyBucket(spoolDir)
+	if len(res.first) > 0 {
+		if _, werr := bucket.Write(res.first); werr != nil {
+			bucket.Close()
+			err := fmt.Errorf("读取上游响应失败（%s）: %w", res.url, werr)
+			s.log.Warn("选定候选后读取响应体失败", "candidate", truncate(res.url, 300),
+				"status", res.status, "err", err)
+			return nil, err
+		}
+	}
 	if res.body != nil {
-		b, err := io.ReadAll(&progressReader{r: res.body, wd: res.wd})
-		if err != nil {
+		if _, err := io.CopyBuffer(bucket, &progressReader{r: res.body, wd: res.wd}, make([]byte, streamChunkSize)); err != nil {
+			bucket.Close()
 			err = fmt.Errorf("读取上游响应失败（%s）: %w", res.url, res.wd.wrapErr(err))
 			s.log.Warn("选定候选后读取响应体失败", "candidate", truncate(res.url, 300),
 				"status", res.status, "err", err)
 			return nil, err
 		}
-		rest = b
 	}
-	body := make([]byte, 0, len(res.first)+len(rest))
-	body = append(body, res.first...)
-	body = append(body, rest...)
-	return &cache.Entry{
+	entry := &cache.Entry{
 		Status:   res.status,
 		Header:   res.header,
-		Body:     body,
 		StoredAt: time.Now(),
-	}, nil
+	}
+	bucket.Install(entry)
+	return entry, nil
 }

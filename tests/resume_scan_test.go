@@ -39,7 +39,7 @@ func resumeBlobPath() string { return "/" + resumeTarget() }
 
 // TestResumeScanBudgetDoesNotKillLiveStream 缺口#2-a：命中 206 后活体流不被扫描预算杀。
 // 半截 64KB；上游对 Range bytes=65536- 回 206 并按 32KB/400ms 慢速流出剩余 448KB
-//（≈5.6s 活体窗口，远超扫描函数毫秒级返回）。断言：客户端收到全量且逐字节正确、
+// （≈5.6s 活体窗口，远超扫描函数毫秒级返回）。断言：客户端收到全量且逐字节正确、
 // 日志有「候选命中」且全程无 context canceled、缓存写入 + 半截删除、goroutine 收敛。
 func TestResumeScanBudgetDoesNotKillLiveStream(t *testing.T) {
 	up := upstreamPacedRange(t, resumeData, chunk32K, 400*time.Millisecond)
@@ -175,8 +175,8 @@ func TestResumeScan416UntrustedTotalMatrix(t *testing.T) {
 		contentRange  string // 空串 = 不带 Content-Range
 		wantTotalLine string // 期望日志中的不可信总长值（缺失时记 -1）
 	}{
-		{"总长多一字节不可信", "bytes */" + itoa(64*1024+1), itoa(64*1024+1)},
-		{"总长少一字节不可信", "bytes */" + itoa(64*1024-1), itoa(64*1024-1)},
+		{"总长多一字节不可信", "bytes */" + itoa(64*1024+1), itoa(64*1024 + 1)},
+		{"总长少一字节不可信", "bytes */" + itoa(64*1024-1), itoa(64*1024 - 1)},
 		{"缺Content-Range不可信", "", "-1"},
 	}
 	for _, tc := range cases {
@@ -228,7 +228,7 @@ func TestResumeScan416UntrustedTotalMatrix(t *testing.T) {
 }
 
 // assertEntryBody 断言指定路径目标的正式缓存条目已落盘且 body 与 data 逐字节一致
-//（缓存文件 = 8B 头 + JSON 元信息 + body 尾段）。
+// （缓存文件 = 8B 头 + JSON 元信息 + body 尾段）。
 func assertEntryBody(t *testing.T, env *testEnv, target string, data []byte) {
 	t.Helper()
 	raw, err := os.ReadFile(env.entryPath(target))

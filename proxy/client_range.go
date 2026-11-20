@@ -269,7 +269,7 @@ func (s *Server) serveEntryBlobRange(w http.ResponseWriter, r *http.Request, e *
 	if cacheStatus == resumeCacheStatus {
 		logSource = dockerLogSourceResume
 	}
-	total := int64(len(e.Body))
+	total := e.BodySize()
 	h := w.Header()
 	for k, vv := range e.Header {
 		if skipResponseHeader(k) {
@@ -315,10 +315,19 @@ func (s *Server) serveEntryBlobRange(w http.ResponseWriter, r *http.Request, e *
 	// 描述这次要发的区间而不是完整对象），不输出超区间语义
 	prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, n)
 	defer prog.unregister()
-	if err := writeBodyWithProgress(w, e.Body[int(spec.start):int(last)+1], prog); err != nil {
-		s.log.Warn("写响应体失败（客户端可能已断开）",
+	// 区间切片按磁盘偏移流式读（io.SectionReader），绝不为了一个区间把完整 blob 读进内存
+	src, serr := e.Section(spec.start, n)
+	if serr != nil {
+		s.log.Warn("读取缓存区间失败（响应头已写出，终止本次响应）",
 			labels.attrs(logSource, "cache", cacheStatus,
-				"target", truncate(r.URL.Path, 200), "err", err)...)
+				"target", truncate(r.URL.Path, 200), "err", serr)...)
+	} else {
+		if err := copyBodyWithProgress(w, src, prog); err != nil {
+			s.log.Warn("写响应体失败（客户端可能已断开）",
+				labels.attrs(logSource, "cache", cacheStatus,
+					"target", truncate(r.URL.Path, 200), "err", err)...)
+		}
+		_ = src.Close()
 	}
 	s.log.Info("成功返回内容（本地完整内容按客户端区间切片回 206，不发上游）",
 		labels.attrs(logSource, "rule", eff.Rule, "cache", cacheStatus,

@@ -163,10 +163,10 @@ const (
 
 // slowEscalationTargetWithFallback slowEscalationTarget 的「总长可兜底」版本：
 // 上游 200 响应没有 Content-Length 时用 manifest 记录的 layer size 兜底 knownTotal
-//（线上故障：1.32GiB 单层上游 200 无 Content-Length → 判速升级被静默跳过，只有一路
+// （线上故障：1.32GiB 单层上游 200 无 Content-Length → 判速升级被静默跳过，只有一路
 // 53KB/s 硬拉 19 分钟）。返回的 totalSource 标注总长来源（upstream / manifest；
 // ok=false 时视为 unknown）。206 分支语义不变：起点与区间终点只能来自 Content-Range
-//（上游 206 必带可解析 Content-Range 才算合规，见 validateResumeResponse）。
+// （上游 206 必带可解析 Content-Range 才算合规，见 validateResumeResponse）。
 func slowEscalationTargetWithFallback(status int, header http.Header, manifestTotal int64) (winnerStart, knownTotal, end int64, totalSource string, ok bool) {
 	winnerStart, knownTotal, end, ok = slowEscalationTarget(status, header)
 	if ok {
@@ -198,7 +198,7 @@ func blobConcurrencyOffReason(eff config.Options) string {
 // blobConcurrencyTrack 时间驱动的多源并发补充判定节拍（每层 blob 下载一个）：
 // 首次触发 = 该层下载开始（客户端主路径 commit / 续传执行方 commit）后满 interval，
 // 之后每满 interval 再判一次；读循环因上游停滞阻塞较久而错过时间点时只补一次判定
-//（不做补偿轮次），下一轮从当前时刻重新计时。
+// （不做补偿轮次），下一轮从当前时刻重新计时。
 type blobConcurrencyTrack struct {
 	// interval 判定间隔（blob-concurrency-interval 生效值）。
 	interval time.Duration
@@ -448,22 +448,29 @@ func validateResumeResponse(status int, header http.Header, offset int64) error 
 }
 
 // verifyStaleAgainstConfirmed 重复区间对账的纯逻辑实现：把源的过期缓冲字节 stale
-// （绝对偏移 off 起、本就不会写给客户端）与已确认输出 confirmed（同一偏移处已写给
-// 客户端与 accum 的内容，即 [0..游标) 的权威字节）重叠部分逐字节比对。重叠 = 区间
-// [off, off+len(stale)) 与 [0, len(confirmed)) 的交集；交集为空（该段尚无权威字节）
-// 视为通过（无可比样本，不冤枉源）。不符 = 该源的实际字节与其 206 起点声明错位。
-func verifyStaleAgainstConfirmed(confirmed []byte, off int64, stale []byte) bool {
+// （绝对偏移 off 起、本就不会写给客户端）与已确认输出（同一偏移处已写给客户端的内容，
+// 即 [0..游标) 的权威字节）重叠部分逐字节比对。重叠 = 区间 [off, off+len(stale)) 与
+// 权威输出的交集；交集为空（该段尚无权威字节）视为通过（无可比样本，不冤枉源）。
+// 不符 = 该源的实际字节与其 206 起点声明错位。
+//
+// confirmedAt 按偏移读取权威字节（内存累积 bodyBucket 或半截文件，见 body_bucket.go /
+// partial_resume.go）：大 blob 的权威输出已落盘，绝不为了对账把整份内容读进内存。
+// 读取失败按不符处理（宁可剪枝一个源，也不把无法核对的字节拼进客户端流）。
+func verifyStaleAgainstConfirmed(confirmedAt func(off int64, want int) ([]byte, error), off int64, stale []byte) bool {
 	if off < 0 || len(stale) == 0 {
 		return true
 	}
-	avail := int64(len(confirmed)) - off
-	if avail <= 0 {
+	confirmed, err := confirmedAt(off, len(stale))
+	if err != nil {
+		return false
+	}
+	if len(confirmed) == 0 {
 		return true // 权威输出尚未覆盖该偏移：无可比样本
 	}
-	if avail > int64(len(stale)) {
-		avail = int64(len(stale))
+	if len(confirmed) > len(stale) {
+		confirmed = confirmed[:len(stale)]
 	}
-	return bytes.Equal(confirmed[off:int64(off)+avail], stale[:int(avail)])
+	return bytes.Equal(confirmed, stale[:len(confirmed)])
 }
 
 // //////////////////  源与有序合并  //////////////////////////////////////////////////////////
@@ -867,7 +874,7 @@ func (m *slowMerger) aliveLocked() int {
 // finalAlive 返回「收尾时刻」的存活源数（供完成日志的 alive_sources 字段）：
 // run 收场时 closeAll 会把全部源置剪枝，之后的 aliveCount 恒为 0——那不是运维想看的
 // 数字（「收尾时还剩几路源在跑」才有意义），因此在收场前记一份快照；run 尚未收场
-//（如被中断）时回落到当前存活数。
+// （如被中断）时回落到当前存活数。
 func (m *slowMerger) finalAlive() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1029,7 +1036,7 @@ func resumeRangeHeaderTail(offset, end int64) string {
 //     dance、看门狗、read/http-timeout、候选级 insecure），严禁另复制一份 dance 逻辑。
 //
 // offset 为「下一个期望的绝对偏移」（胜者起点 + 已消费字节数）；end 为续传区间终点
-//（<0 = 开区间到对象末尾）。返回的合并器已开始异步填充（胜者与已定局续传源的 pump
+// （<0 = 开区间到对象末尾）。返回的合并器已开始异步填充（胜者与已定局续传源的 pump
 // 运行中，未定局源保持 pending）。加入动作的 Info 日志由 joinSlowSources 统一输出。
 func (s *Server) escalateSlowSources(r *http.Request, winner *probeResult, offset int64, others []candidate, eff config.Options, knownTotal, end int64, labels dockerLogInfo, logSource string, extra ...any) *slowMerger {
 	sources := make([]*slowSource, 0, len(others)+1)

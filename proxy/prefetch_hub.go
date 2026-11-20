@@ -694,12 +694,13 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 // servePrefetchHubDoneHit done 条目的兜底出口：此刻缓存已写盘，直接走既有 HIT 回放；
 // 缓存意外缺失（写盘失败等异常）返回 false 让调用方走既有回源路径。
 func (s *Server) servePrefetchHubDoneHit(w http.ResponseWriter, r *http.Request, key string, eff config.Options, disk *cache.Cache, start time.Time) bool {
-	if e, ok := disk.Get(key); ok {
+	if e, oerr := disk.Open(key); oerr == nil {
 		// done 条目的兜底 HIT 仍是客户端请求触发的缓存命中回放：source=client
 		labels := parseDockerLogInfo(r.URL.Path)
 		s.log.Info("缓存命中（HIT）", labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "key", key,
-			"file", disk.FilePath(key), "bytes", len(e.Body), "ttl", ttlDisplay(e.TTL))...)
+			"file", disk.FilePath(key), "bytes", e.BodySize(), "ttl", ttlDisplay(e.TTL))...)
 		s.serveEntry(w, r, e, "HIT", eff, start)
+		_ = e.Close()
 		return true
 	}
 	return false
@@ -862,19 +863,19 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 	}
 	res.Close()
 
-	// EOF：读回临时文件构造完整 Entry，复用既有缓存写入语义（判据 / TTL 固化 / 日志 /
-	// 预取触发全复用——blob 目标非 manifest，maybePrefetchImageLayers 内部静默返回）；
-	// 写缓存日志按本路来源标注 source=prefetch（预取写者，与客户端主路径区分）
-	data, err := os.ReadFile(tmp.Name())
-	if err != nil {
-		return fail(fmt.Errorf("读回预取临时文件失败: %w", err))
-	}
+	// EOF：临时文件就是完整 body，作为流式 body 来源构造 Entry（不再 os.ReadFile 整份读回
+	// 内存——1.32GiB 级 layer 的旧版读回本身就是一次内存峰值），复用既有缓存写入语义
+	//（判据 / TTL 固化 / 日志 / 预取触发全复用——blob 目标非 manifest，
+	// maybePrefetchImageLayers 内部静默返回）；写缓存日志按本路来源标注 source=prefetch
+	//（预取写者，与客户端主路径区分）。临时文件归 hub 条目所有（订阅者可能仍在读前缀），
+	// 因此 BodyStream.Temp=false：cache.Set 复制完成后只改指向、不删除该文件。
+	written := ent.writtenOf()
 	entry := &cache.Entry{
-		Status:   res.status,
-		Header:   res.header,
-		Body:     data,
-		StoredAt: time.Now(),
-		Source:   res.url,
+		Status:     res.status,
+		Header:     res.header,
+		BodyStream: &cache.BodyStream{Path: tmp.Name(), Offset: 0, Size: written},
+		StoredAt:   time.Now(),
+		Source:     res.url,
 	}
 	s.finalizeFetchEntry(req, key, target, entry, eff, disk, dockerLogSourcePrefetch)
 
