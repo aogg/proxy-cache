@@ -24,8 +24,15 @@
 | 18   | /dev/null 被换成文件  | 已解决              | 被换成普通文件致工具写失败；已用mknod恢复              |
 | 19   | 可变目标被缓存        | 已解决（97fef24）   | tag与manifest旧内容被缓存；现合并并跳过缓存            |
 | 20   | 上游证书不受信        | 已解决（5b13a52）   | x509不受信每轮空烧4次重试；现三级忽略开关              |
+| 21   | 缓存文件属主错乱      | 已解决              | 9p盘上缓存文件属主为root，app用户读不了；现以root运行  |
+| 22   | 上游源回错内容        | 部分解决            | 个别镜像站回错字节，落盘前有校验，直传仍无校验         |
 
 ## 本次（2026-11-20）新增发现
+
+- 复现时补充发现：容器以镜像内 app（uid 1000）运行时，缓存目录 /app/cache-data 是 Windows D 盘的 9p（drvfs）挂载，服务写入的缓存文件属主为 root 且权限 0600，app 用户读不了 → 每次读取都 permission denied（旧代码会当成损坏删掉，新代码保留但仍然读不到）。按历史线上行为（旧容器实际以 root 运行）改为 `--user 0:0` 重新创建容器后恢复可读。
+- 当前容器的创建参数（重建时照抄，注意 `--user 0:0` 与两个 bind 挂载）：`docker run -d --name proxy-cache --network common-all -p 5480:8080 --user 0:0 -v /data-linux/data/docker/sync/proxy-cache/config.yaml:/app/config.yaml:ro -v /data/docker/proxy-cache/cache-data:/app/cache-data --restart always adockero/proxy-cache:latest`
+- 复现时还观察到：个别上游镜像站（如某次 hub.rat.dev 链路）会返回与请求摘要不符的字节，写缓存前的 sha256 校验能拦住入库，但已直传给客户端的那一段无法回收，客户端表现为 `failed commit ... unexpected commit digest`；重试一次即正常。
+
 
 - 现场：2026-11-20 16:03:40，gs-mac-dind（10.8.7.22）经 registry-proxy-cache 拉取镜像，767MB 那一层的缓存文件被本服务自己删除，日志为 `缓存文件损坏，删除后按未命中处理`，错误是 `read: cannot allocate memory`。
 - 直接原因（读取侧）：`cache/cache.go` 的 `readEntry` 用 `io.ReadAll` 把整个缓存文件读进内存，767MB 的层按此计算约需 1GB 峰值内存；读取失败后该错误被一律当成「文件损坏」，直接删除缓存文件。
