@@ -170,18 +170,3 @@
 **对应的问题：**
 - **#8 预取搭车重复下载**｜✅ 已修好 —— 同一层被下了两遍，白白慢一倍。
 - **#13 TTL 与 gzip 回放**｜✅ 已修好 —— ttl:0 被偷偷改成 30 分钟，乱码其实正常。
-
-## 附：2026-11-20 那天出了什么事
-
-- 那天有人在 gs-mac-dind 上拉一个 767MB 的大镜像。
-- 服务把整个缓存文件一次性读进内存，内存不够，报 `read: cannot allocate memory`。
-- 程序以为文件坏了，就把缓存删掉。
-- 越删越要重新下载，回源的站只有约 40KB/s，5 分钟才下了 11MB，最后没拉完。
-- 现在改成边读边发、边收边写，不再整块塞进内存。
-- 只有真坏了才删；临时读不出来会保留文件，再试一次。
-
-以后重做这个容器，照抄这一行：
-
-```
-docker run -d --name proxy-cache --network common-all -p 5480:8080 --user 0:0 -v /data-linux/data/docker/sync/proxy-cache/config.yaml:/app/config.yaml:ro -v /data/docker/proxy-cache/cache-data:/app/cache-data --restart always adockero/proxy-cache:latest
-```
