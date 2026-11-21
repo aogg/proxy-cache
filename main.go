@@ -98,6 +98,10 @@ func run() error {
 	// log.progress-summary-interval（默认 3m，<=0 关闭）在内部判定；goroutine 随上方
 	// signal ctx 取消退出（与 cache.StartJanitor 同一生命周期模式，进程退出无泄漏）
 	srv.StartProgressSummary(ctx)
+	// 下载面板（LOG_TYPE=line|json，见 proxy/log_panel.go）：每个活跃 docker 下载一块
+	//（客户端进度 / 代理侧进度 / 轮询 / 分块远端 / 拼接），末尾总总结；text 模式不启动。
+	// 间隔 log.panel-interval（默认 30s，<=0 关闭）在内部判定，ctx 取消即退出。
+	srv.StartLogPanel(ctx)
 
 	httpSrv := &http.Server{
 		Handler:           srv,
@@ -206,6 +210,7 @@ func loadConfig(path string, logger *slog.Logger) (*config.Config, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			logger.Warn("配置文件不存在，使用内置默认配置启动", "path", path)
 			def := config.Default()
+			def.ApplyEnvOverrides() // 无配置文件时 LOG_TYPE 同样生效
 			if verr := def.Validate(); verr != nil {
 				return nil, verr
 			}

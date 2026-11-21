@@ -586,6 +586,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	prog := s.progressRegister(dockerLogSourceRidealong, labels.image, labels.digest, r.Method,
 		prefixLen, progressSummaryTotal(header))
 	defer prog.unregister()
+	prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUpstream, newRequestID())
 
 	// 读磁盘前缀（0..prefixLen）：预取写者按「先写文件后推进字节数」推进，读到的字节
 	// 一定是已完整写入的；文件极小竞态窗口（订阅后预取即失败清理）按已 commit 终止处理
@@ -819,6 +820,7 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 	prog := s.progressRegister(dockerLogSourcePrefetch, labels.image, labels.digest, req.Method,
 		ent.writtenOf(), progressSummaryTotal(res.header))
 	defer prog.unregister()
+	prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUpstream, newRequestID())
 
 	// 首块先行写入并广播（与客户端流式路径同一节拍：探测阶段已缓冲的首块直接入列）
 	if len(res.first) > 0 {
@@ -882,6 +884,7 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 	// 缓存已原子落盘：置 done 并关闭订阅（搭车方收完 channel 缓冲内的最后增量即完整）；
 	// 条目滞留 hub 一小段时间供并发 MISS 兜底检出「done → 直接 HIT」，到期自动移除
 	ent.finishDone()
+	prog.finish("完成") // 面板：预取完成的收尾统计
 	return entry, nil
 }
 

@@ -33,6 +33,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -131,6 +132,12 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	}
 
 	// //////////////////  竞速选定候选（commit 前，可自由切换）  start  /////////////////////////
+	// 面板模式：候选尝试记录器经 ctx 传给 selectCandidate（面板「轮询」段的数据源）；
+	// text 模式不创建（零开销），createPanelRecorderIfNeeded 返回 nil。
+	rec := s.newPanelRecorderIfNeeded()
+	if rec != nil {
+		r = r.WithContext(context.WithValue(r.Context(), panelRecorderKey{}, rec))
+	}
 	res, serr := s.selectCandidate(r, candidates, eff, target)
 	if serr != nil {
 		// 路径目标没有完整原始 URL 可直连：fallback-direct 不适用，候选全败直接报错
@@ -199,6 +206,16 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	// knownTotal=0，判定按 reason=content_length_unknown 留痕。
 	winnerStartAt, knownTotalAt, rangeEndAt, totalSourceAt, escalatable :=
 		slowEscalationTargetWithFallback(res.status, res.header, blobManifestTotal)
+	// 面板元信息：通道（规则/候选级代理已合并进 eff.HTTPProxy，空 = 直连）、总长来源、
+	// 请求关联 id；候选尝试记录器同步挂上（面板「轮询」段从这里取）。
+	if prog != nil {
+		src := totalSourceAt
+		if contentLength <= 0 && blobManifestTotal <= 0 {
+			src = blobTotalSourceUnknown
+		}
+		prog.setPanelMeta(eff.HTTPProxy, src, newRequestID())
+		prog.attachRecorder(rec)
+	}
 	if labels.digest != "" {
 		// 单层下载开始（blob 目标才输出）：total 取上游声明值（206 取 Content-Range 的
 		// 对象总长），拿不到用 manifest size 兜底，都没有则 unknown（total 不可知时判速/
@@ -271,6 +288,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	clientGoneAbort := func() error {
 		res.Close() // 幂等：多源合并场景的源已由 abortAll 逐路关闭，此处兜底胜者自身
 		kept := s.captureStreamPartialFrom(sink, r, target, accum)
+		if prog != nil {
+			prog.finish("客户端断开")
+		}
 		s.log.Warn("客户端已断开，终止上游读取（不再继续读完填缓存，客户端将以断点续传或缓存重试）",
 			labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
 				"status", res.status, "bytes", total, "client", "disconnected", "partial", kept,
@@ -373,7 +393,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			// xxMB/342.7MB 进度感），间隔内整条流已完成则一条都不出（最终日志已有成败留痕）。
 			// 用循环内时间检查而非定时器 goroutine 实现：上游停滞无新数据时读循环阻塞、
 			// 自然不输出进度（属预期，间隔内的沉默即「无进度」本身）
-			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
+			if progressInterval > 0 && !s.panelActive() && time.Since(lastProgressAt) >= progressInterval {
 				emitProgress(time.Now())
 			}
 			// 慢速升级触发判定（与进度日志同一节拍；rerr==nil 才判，EOF 同拍到达时走正常收尾）：
@@ -404,6 +424,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 						slowMerger = s.escalateSlowSources(r, res, offset, others, eff, knownTotalAt, rangeEndAt,
 							labels, dockerLogSourceClient,
 							"total_source", totalSourceAt, "elapsed", time.Since(committedAt).Round(time.Millisecond).String())
+						if prog != nil {
+							prog.attachMerger(slowMerger) // 面板：分块段/代理侧进度取自合并器
+						}
 						slowMerger.verify = staleVerify // 重复区间对账（时间触发通道同一套）
 						// 回填时间驱动判定的输入（合并阶段：res 连接已移交合并器，只做增量加源）
 						blobConc.merger = slowMerger
@@ -432,6 +455,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 					blobConc.clientGone = clientErr != nil
 					if s.timeBlobSupplement(&blobConc) {
 						slowMerger = blobConc.merger
+						if prog != nil {
+							prog.attachMerger(slowMerger) // 面板：分块段/代理侧进度取自合并器
+						}
 						blobConc.res = nil // 胜者连接已移交合并器：后续判定只做增量加源
 						break
 					}
@@ -445,6 +471,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 				// 缓存可读主路径；进度不回退，见 partial_resume.go）、终止本次响应、不写缓存
 				res.Close()
 				s.captureStreamPartialFrom(sink, r, target, accum)
+				if prog != nil {
+					prog.finish("失败")
+				}
 				s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
 					labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
 						"status", res.status, "bytes", total, "err", rerr)...)
@@ -463,7 +492,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		if _, merr := slowMerger.run(writeOut, func(now time.Time, live int) {
 			// 与单源读循环同一节拍：仅到 progress-interval 间隔才输出；
 			// 升级后追加 sources 字段输出当前存活源数
-			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
+			if progressInterval > 0 && !s.panelActive() && time.Since(lastProgressAt) >= progressInterval {
 				emitProgress(now, "sources", live)
 			}
 			if blobTrack != nil {
@@ -488,6 +517,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 			// 多源合并失败（非断开，既有语义不变）：blob 半截保留（同上——accum 即按序
 			// 合并出的已送前缀）、终止本次响应、不写缓存
 			s.captureStreamPartialFrom(sink, r, target, accum)
+			if prog != nil {
+				prog.finish("失败")
+			}
 			s.log.Error("流式回源读上游失败，终止本次响应且不写缓存（半截数据绝不入库）",
 				labels.attrs(dockerLogSourceClient, "rule", eff.Rule, "candidate", truncate(source, 300),
 					"status", res.status, "bytes", total, "err", merr)...)
@@ -516,6 +548,9 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 		finalize(entry) // 既有条件（仅 200 且过判据）内用 cache.Set 原子写缓存并留痕
 	}
 
+	if prog != nil {
+		prog.finish("完成") // 面板收尾块/汇总完成计数
+	}
 	// //////////////////  成功返回日志（字段与 serveEntry 兼容）  start  /////////////////////////
 	// 多源并发补充过的流：完成日志补充 sources / alive_sources（源总数与收尾时存活源数），
 	// 与剪枝日志同一组字段名，便于聚合「一次下载总共用了几路源、收尾时还剩几路」。

@@ -510,6 +510,11 @@ type slowSource struct {
 	delivered bool
 	// pruned 非空 = 已剪枝（剪枝 reason，用于留痕与去重）。
 	pruned string
+	// end 本源请求区间的绝对结束偏移（含；0 = 开区间/未知）——面板分块段渲染 [start-end]。
+	end int64
+	// panelLastPos / panelLastAt 面板速率基线（只在面板线程、m.mu 下读写）。
+	panelLastPos int64
+	panelLastAt  time.Time
 }
 
 // mismatchSample 把本源缓冲中与区间 [off, off+len(p)) 重叠的字节作为对账样本，与 p
@@ -1041,7 +1046,7 @@ func resumeRangeHeaderTail(offset, end int64) string {
 func (s *Server) escalateSlowSources(r *http.Request, winner *probeResult, offset int64, others []candidate, eff config.Options, knownTotal, end int64, labels dockerLogInfo, logSource string, extra ...any) *slowMerger {
 	sources := make([]*slowSource, 0, len(others)+1)
 	// 胜者源：既有连接不中断（编号首位，合并时天然优先持有下一期望偏移）
-	sources = append(sources, &slowSource{name: winner.url, start: offset, readPos: offset, res: winner})
+	sources = append(sources, &slowSource{name: winner.url, start: offset, readPos: offset, res: winner, end: end})
 	m := newSlowMerger(sources, offset, knownTotal, eff.SlowDownloadMaxBehind, s.log)
 	if len(others) > 0 {
 		s.joinSlowSources(r, m, others, eff, offset, end, labels, logSource, extra...)
@@ -1067,7 +1072,7 @@ func (s *Server) joinSlowSources(r *http.Request, m *slowMerger, cands []candida
 		if m.hasSourceLocked(cand.url) {
 			continue // 已在合并中（含已被剪枝的）：不重复加入
 		}
-		src := &slowSource{name: cand.url, start: offset, readPos: offset, pending: true}
+		src := &slowSource{name: cand.url, start: offset, readPos: offset, pending: true, end: end}
 		m.sources = append(m.sources, src)
 		picked = append(picked, cand)
 		fresh = append(fresh, src)

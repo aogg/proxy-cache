@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"proxy-cache/config"
+	"proxy-cache/logging"
 )
 
 // progressRegistry Server 级活跃下载注册表：下载 ID -> 条目。
@@ -67,6 +68,12 @@ type progressRegistry struct {
 	started uint64
 	// m 活跃下载条目表（登记即入表，注销即删除）。
 	m map[uint64]*progressSummaryEntry
+	// panelEnabled 面板模式（LOG_TYPE=line|json 且面板间隔>0）：开启时注销会把带结果的
+	// 下载追加进 finishedBlocks（面板收尾块与完成/失败计数用）；text 模式恒 false，
+	// 不产生任何额外内存或行为（默认路径零回归）。
+	panelEnabled atomic.Bool
+	// finishedBlocks 自上次面板快照以来结束的下载收尾块（面板消费一次即清空）。
+	finishedBlocks []logging.DownloadBlock
 }
 
 // progressSummaryEntry 一条活跃下载的登记条目（下载 ID -> 条目）。
@@ -96,6 +103,38 @@ type progressSummaryEntry struct {
 	lastWritten int64
 	// lastAt 上次汇总快照时刻（区间速率的分母；首轮为登记时刻）。
 	lastAt time.Time
+
+	// //// 以下为 LOG_TYPE=line/json 面板附加状态（text 模式不读取，热路径只读原子量） ////
+	// panelMu 保护面板侧字段（via/totalSrc/requestID/partial/merger/recorder/result 与
+	// 「上次面板快照」基线）：面板线程与下载线程并发，锁粒度只在每条下载内部。
+	panelMu sync.Mutex
+	// via 本次回源生效的代理地址（空串 = 直连），渲染为 via=direct。
+	via string
+	// totalSrc 总长来源：upstream / manifest / unknown。
+	totalSrc string
+	// requestID 请求关联 id（8 位十六进制，同一客户端请求的日志可据此串起来）。
+	requestID string
+	// partial 半截续传信息（仅 resume 且有半截前缀时 Present）。
+	partial logging.PartialInfo
+	// merger 多源合并器（非 nil 时面板的分块段/代理侧进度取自它）。
+	merger *slowMerger
+	// mergerBase 挂上合并器时已写给客户端的字节数（合并器内各源的 got 只统计挂上之后
+	// 的读取量，代理侧总进度 = mergerBase + Σgot）。
+	mergerBase int64
+	// recorder 候选尝试记录器（渲染轮询段用；nil = 无记录）。
+	recorder *panelRecorder
+	// result 收尾结果（空 = 进行中；由各下载流在成功/失败出口标记，见 finish）。
+	result string
+	// panelPrev 上次面板快照的字节数与时刻（面板速率基线）。
+	panelPrev struct {
+		written  int64
+		upstream int64
+		at       time.Time
+	}
+	// lastPanelFingerprint 上次已输出的面板指纹（变化检测：无变化整轮跳过）。
+	lastPanelFingerprint string
+	// lastPanelPolls 上次面板输出时已展示的轮询条数（只输出本周期新增尝试）。
+	lastPanelPolls int
 }
 
 // progressSummaryRow 一轮汇总快照的一行：锁内算好 bytes/total/区间速率素材，锁外只做
@@ -216,7 +255,29 @@ func (e *progressSummaryEntry) setTotal(total int64) {
 
 // unregister 注销本条下载（defer 调用；幂等——重复调用只是再删一次不存在的键）。
 func (e *progressSummaryEntry) unregister() {
+	// 面板收尾块：仅在面板模式下追加（text 模式零额外行为），带结果才追加
+	var fb *logging.DownloadBlock
+	if e.resultTagged() && e.reg.panelEnabled.Load() {
+		via, totalSrc, requestID, result, partial, _, _, _ := e.panelState()
+		b := logging.DownloadBlock{
+			ID: e.id, Mode: e.source, Image: e.image, Digest: e.digest, Method: e.method,
+			Req: requestID, Via: via, TotalSrc: totalSrc,
+			ClientBytes: e.written.Load(), UpstreamBytes: e.written.Load(),
+			ClientState: "ok", Partial: partial, Result: result,
+			Elapsed: time.Since(e.startedAt),
+		}
+		if b.Total = e.totalLength(); b.Total > 0 {
+			b.UpstreamBytes = b.Total
+		}
+		fb = &b
+	}
 	e.reg.mu.Lock()
+	if fb != nil {
+		if len(e.reg.finishedBlocks) >= 32 { // 有界：面板异常长时间未消费时丢弃最早的
+			e.reg.finishedBlocks = e.reg.finishedBlocks[1:]
+		}
+		e.reg.finishedBlocks = append(e.reg.finishedBlocks, *fb)
+	}
 	delete(e.reg.m, e.id)
 	e.reg.mu.Unlock()
 }
@@ -241,7 +302,13 @@ func (s *Server) progressRegister(source, image, digest, method string, initial,
 // cache.StartJanitor 的 ctx 模式）：log.progress-summary-enabled=false 或间隔<=0 时不
 // 启动；协程随 ctx 取消退出（进程退出 signal ctx 取消 → goroutine 退出，无泄漏）。
 // 幂等：重复调用只启动一个协程（Server 级 sync.Once）。
+//
+// 面板模式（LOG_TYPE=line|json）下不启动：三条逐条进度日志由面板替换，避免同一份数据
+// 既刷逐条日志又刷面板（也避免两个消费者争抢注册表的 started 计数）。
 func (s *Server) StartProgressSummary(ctx context.Context) {
+	if s.panelActive() {
+		return
+	}
 	if ctx == nil {
 		ctx = context.Background() // 防御：与 cache.Manager 的 nil ctx 兜底同风格
 	}
@@ -276,6 +343,9 @@ func (s *Server) progressSummaryLoop(ctx context.Context, interval time.Duration
 // 让运维在 3 分钟周期里稳定看到「本轮有下载」的统计。
 // 只读快照、不持注册表锁写日志（见文件头并发说明）。
 func (s *Server) emitProgressSummary(now time.Time, interval time.Duration) {
+	if s.panelActive() {
+		return // 面板模式：进度输出统一走 log_panel.go（防御：正常路径不会启动本循环）
+	}
 	rows, started := s.progressOrInit().snapshotTick(now)
 	if len(rows) == 0 && started == 0 {
 		return // 本轮没有访问（无活跃下载、也无新登记）：整轮静默

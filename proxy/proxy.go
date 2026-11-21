@@ -116,6 +116,10 @@ type Server struct {
 	progressReg *progressRegistry
 	// progressOnce 保证周期汇总 goroutine 只启动一次（StartProgressSummary 幂等）。
 	progressOnce sync.Once
+	// panelOnce 保证下载面板 goroutine 只启动一次（StartLogPanel 幂等，见 log_panel.go）。
+	panelOnce sync.Once
+	// panelOut 面板输出目标（默认 os.Stderr；测试可 SetPanelWriter 注入 buffer）。
+	panelOut io.Writer
 	// blobSizeMu 保护 blobSizes 的并发访问/惰性补建（manifest layer size 索引，见
 	// blob_size_index.go）。
 	blobSizeMu sync.Mutex
@@ -1735,6 +1739,7 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 			// body 从 Section 流式读（磁盘条目按区间读，绝不整份进内存）
 			prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, size)
 			defer prog.unregister()
+			prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUpstream, newRequestID())
 			src, serr := e.Section(0, -1)
 			if serr != nil {
 				s.log.Warn("读取缓存体失败（响应头已写出，终止本次响应）",

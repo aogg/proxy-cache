@@ -43,6 +43,21 @@ const DefaultProgressLogInterval = 10 * time.Second
 // progress-interval（10s 节拍）分工不同，取 3 分钟避免汇总日志淹没单流进度。
 const DefaultProgressSummaryInterval = 3 * time.Minute
 
+// DefaultLogPanelInterval log.panel-interval 未配置时的面板输出间隔：LOG_TYPE=line/json
+// 下每 30s 输出一轮「每个活跃下载一块 + 末尾汇总」。比单流 progress-interval（10s）
+// 稀疏，因为面板是多行块（一个块约 1KB），10s 会让日志体积翻倍；排障时可临时调小。
+const DefaultLogPanelInterval = 30 * time.Second
+
+// 日志输出模式（log.type / 环境变量 LOG_TYPE）。
+const (
+	// LogTypeText 逐条结构化文本（默认，与旧版逐字节一致）。
+	LogTypeText = "text"
+	// LogTypeLine 多行下载面板（每个活跃 docker 下载一块 + 末尾总总结）。
+	LogTypeLine = "line"
+	// LogTypeJSON 与 line 相同的数据，改为每块一行 JSON（JSONL）。
+	LogTypeJSON = "json"
+)
+
 // DefaultDockerPrefetchConcurrency docker 层预取并发数未配置时的缺省值：
 // docker daemon 默认 max-concurrent-downloads=3，预取并发略高于它即可在客户端逐层
 // 请求前把 layer 备好，同时不与客户端请求争抢过多上游带宽。
@@ -594,6 +609,15 @@ type LogConfig struct {
 	// 不报错，风格同 progress-interval）。与 progress-interval 的分工：前者是单条流的
 	// 10s 节拍，本项是全局活跃下载的 3 分钟汇总视图。
 	ProgressSummaryInterval *Duration `yaml:"progress-summary-interval"`
+	// Type 日志输出模式（环境变量 LOG_TYPE 优先于本项）：
+	//   - text（默认）：逐条结构化文本，与旧版逐字节一致；
+	//   - line：多行下载面板——每个活跃 docker 下载一块（客户端进度 / 代理进度 /
+	//     轮询 / 分块远端 / 拼接游标），每轮末尾一个总总结块；
+	//   - json：与 line 相同的数据，改为每块一行 JSON（JSONL），供 jq / 日志平台消费。
+	Type string `yaml:"type"`
+	// PanelInterval 下载面板的输出间隔（仅 type=line|json 生效）：nil（未配置）默认
+	// 30s（DefaultLogPanelInterval）；显式 <=0 关闭面板（负数归一化为 0，Validate 不报错）。
+	PanelInterval *Duration `yaml:"panel-interval"`
 }
 
 // CacheConfig 全局缓存配置。
@@ -978,6 +1002,9 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件 %s 失败: %w", path, err)
 	}
+	// 环境变量覆盖（LOG_TYPE）在 Validate 之前应用：非法值同样由 Validate 拦下，
+	// 保证「启动快速失败」口径与 log.level 一致
+	cfg.ApplyEnvOverrides()
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("配置文件 %s 校验失败: %w", path, err)
 	}
@@ -1025,6 +1052,17 @@ func (c *Config) Validate() error {
 	if c.Log.ProgressSummaryInterval != nil && c.Log.ProgressSummaryInterval.D() < 0 {
 		v := Duration(0)
 		c.Log.ProgressSummaryInterval = &v
+	}
+	// log.type 归一化：trim + 小写；空串默认 text（逐条文本，完全兼容旧行为）
+	c.Log.Type = strings.ToLower(strings.TrimSpace(c.Log.Type))
+	if c.Log.Type == "" {
+		c.Log.Type = LogTypeText
+	}
+	// log.panel-interval：nil（未配置）默认 30s（生效值经 LogPanelInterval() 读取）；
+	// 显式负数归一化为 0（关闭面板，风格同 log.progress-interval，Validate 不报错）
+	if c.Log.PanelInterval != nil && c.Log.PanelInterval.D() < 0 {
+		v := Duration(0)
+		c.Log.PanelInterval = &v
 	}
 	// //////////////////  默认值补全  end  ////////////////////////////////////////////////
 
@@ -1086,6 +1124,13 @@ func (c *Config) Validate() error {
 		c.logLevel = slog.LevelError
 	default:
 		return fmt.Errorf("log.level 仅支持 debug/info/warn/error，当前为 %q", c.Log.Level)
+	}
+	// log.type 仅允许三值（LOG_TYPE 环境变量已在 ApplyEnvOverrides 中归一化，非法值同样
+	// 在这里被拦下）：非法值启动快速失败，避免「配了 line 却静默按 text 跑」
+	switch c.Log.Type {
+	case LogTypeText, LogTypeLine, LogTypeJSON:
+	default:
+		return fmt.Errorf("log.type 仅支持 text/line/json，当前为 %q（也可用环境变量 LOG_TYPE 指定，环境变量优先）", c.Log.Type)
 	}
 	// 经上方默认值补全后 TTL 必然非 nil：负数是配置错误（0 = 永不过期，合法）
 	if c.Cache.TTL.D() < 0 {
@@ -1504,6 +1549,43 @@ func (c *Config) ProgressSummaryInterval() time.Duration {
 		return DefaultProgressSummaryInterval
 	}
 	return c.Log.ProgressSummaryInterval.D()
+}
+
+// ApplyEnvOverrides 应用环境变量覆盖（LOG_TYPE），环境变量优先于配置文件中的 log.type：
+// 在 Load 末尾调用一次；未设置该环境变量时零改动。值做 trim + 小写后写回 Log.Type，
+// 非法值由随后的 Validate 拦下（启动快速失败，与 log.level 同样的处理风格）。
+func (c *Config) ApplyEnvOverrides() {
+	if v := strings.TrimSpace(os.Getenv("LOG_TYPE")); v != "" {
+		c.Log.Type = strings.ToLower(v)
+	}
+}
+
+// LogType 返回日志输出模式生效值：text（默认）/ line / json。
+// 未经过 Validate 的构造场景（测试直接拼 Config）按 text 兜底——text 是零回归路径。
+func (c *Config) LogType() string {
+	switch strings.ToLower(strings.TrimSpace(c.Log.Type)) {
+	case LogTypeLine:
+		return LogTypeLine
+	case LogTypeJSON:
+		return LogTypeJSON
+	default:
+		return LogTypeText
+	}
+}
+
+// LogPanelInterval 返回下载面板输出间隔生效值：nil（未配置）= 缺省 30s
+//（DefaultLogPanelInterval）；显式 <=0 = 0（关闭面板）。方法内做 nil 防御。
+func (c *Config) LogPanelInterval() time.Duration {
+	if c.Log.PanelInterval == nil {
+		return DefaultLogPanelInterval
+	}
+	return c.Log.PanelInterval.D()
+}
+
+// LogPanelEnabled 面板是否启用：仅 type=line|json 且间隔 > 0 时启用（text 模式永不启用，
+// 保证默认路径零回归）。
+func (c *Config) LogPanelEnabled() bool {
+	return c.LogType() != LogTypeText && c.LogPanelInterval() > 0
 }
 
 // LogLevel 返回 log.level 对应的 slog.Level。必须在 Validate 之后调用

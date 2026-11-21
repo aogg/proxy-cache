@@ -817,6 +817,15 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		return nil
 	}
 
+	// //////////////////  面板记录器  start  /////////////////////////////////////////////////
+	// 面板模式：候选尝试记录器经 ctx 传给 scanResumeCandidate（面板「轮询」段的数据源）；
+	// text 模式返回 nil（零开销）。
+	rec := s.newPanelRecorderIfNeeded()
+	if rec != nil {
+		r = r.WithContext(context.WithValue(r.Context(), panelRecorderKey{}, rec))
+	}
+	// //////////////////  面板记录器  end  //////////////////////////////////////////////////
+
 	// //////////////////  立即响应（首字节时序优化）  /////////////////////////////////////////
 	// 2026-11 现场：docker pull 长时间零进度的根因——旧时序里客户端响应头被推迟到候选
 	// 扫描命中之后（scanResumeCandidate 逐候选探测 + 401 token dance，预算 60s 起步），
@@ -845,6 +854,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		s.commitResumeHeader(w, hdrEarly, "", earlyTotal, cr...)
 		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, earlyTotal)
 		defer prog.unregister()
+		prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceManifest, newRequestID())
+		prog.setPartial(n, 0, 0)
+		prog.attachRecorder(rec)
 		earlySource := blobTotalSourceManifest
 		if earlyTotal <= 0 {
 			earlySource = blobTotalSourceUnknown // 不设 Content-Length，Go 按 chunked 传输
@@ -1009,6 +1021,13 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 最新前缀，进度不回退；本次响应被截断，docker 重试从更长前缀续传）
 	var paf *os.File // 半截文件追加写句柄（O_APPEND）
 	fail := func(cause error) (*cache.Entry, bool, error) {
+		if prog != nil {
+			if errors.Is(cause, errClientDisconnected) || errors.Is(cause, errResumeGraceAborted) {
+				prog.finish("客户端断开")
+			} else {
+				prog.finish("失败")
+			}
+		}
 		stopGrace()   // 宽限计时器随任一失败收场停掉（幂等；goroutine 不泄漏）
 		upRes.Close() // 幂等：关闭连接、停看门狗、取消超时预算链
 		if paf != nil {
@@ -1133,6 +1152,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	if !earlyCommit {
 		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, total)
 		defer prog.unregister()
+		prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUnknown, newRequestID())
+		prog.setPartial(n, 0, 0)
+		prog.attachRecorder(rec)
 	}
 
 	// 回放半截前缀（仅旧时序路径；立即响应路径已在扫描前经 replayPrefix 回放完毕）：
@@ -1222,7 +1244,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 					return fail(fmt.Errorf("blob 半截续传写半截文件失败（%s）: %w", upRes.url, aerr))
 				}
 			}
-			if progressInterval > 0 && time.Since(lastProgressAt) >= progressInterval {
+			if progressInterval > 0 && !s.panelActive() && time.Since(lastProgressAt) >= progressInterval {
 				emitProgress(time.Now())
 			}
 			if blobTrack != nil && rdErr == nil {
@@ -1301,7 +1323,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 					blobConc.offset = resMerger.cursor()
 					blobConc.merger = resMerger
 					blobConc.clientGone = !clientOK
-					s.timeBlobSupplement(&blobConc)
+					if s.timeBlobSupplement(&blobConc) && prog != nil {
+					prog.attachMerger(blobConc.merger)
+				}
 				}
 			}
 		})
@@ -1389,6 +1413,9 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	if resMerger != nil {
 		// 多源并发补充过的流：完成日志补充 sources / alive_sources（与剪枝日志同一组字段）
 		doneArgs = append(doneArgs, "sources", resMerger.sourceCount(), "alive_sources", resMerger.finalAlive())
+	}
+	if prog != nil {
+		prog.finish("完成")
 	}
 	s.log.Info("blob 半截续传完成（半截前缀+剩余区间拼出完整 blob 并已写缓存）", doneArgs...)
 	s.log.Info("代理请求完成",

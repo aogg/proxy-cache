@@ -27,10 +27,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"proxy-cache/config"
+	"proxy-cache/logging"
 )
 
 // candidateScanBudget 候选扫描总预算（非 blob 目标）：selectCandidate 从首个候选发出到
@@ -205,6 +207,7 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 			s.log.Debug("url-redirect 自引用候选跳过（展开后指向本次请求自身，回源会递归请求本代理）",
 				"round", roundNo, "round_total", totalRounds,
 				"index", idx, "template", tpl, "candidate", cand.url)
+			recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Result: "self-ref"})
 			done <- candidateOutcome{err: candLast, slot: slot}
 			return
 		}
@@ -224,9 +227,15 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 					// 被取消导致的失败（其他候选胜出/预算到期）：降为 Debug，避免噪音
 					s.log.Debug("url-redirect 候选已取消（其他候选胜出或扫描预算到期）",
 						"index", idx, "template", tpl, "candidate", cand.url)
+					recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Cost: cost.String(), Result: "已取消"})
 					break
 				}
 				candLast = err
+				pe := logging.PollEntry{Host: hostOf(cand.url), Cost: cost.String(), Result: "失败"}
+				if hard {
+					pe.Result, pe.HardFail = "hard_fail="+hardReason, hardReason
+				}
+				recordPanelPoll(ctx, pe)
 				s.log.Warn("url-redirect 候选请求失败",
 					"round", roundNo, "round_total", totalRounds,
 					"attempt", attempt, "attempt_total", itemTotalAttempts,
@@ -265,6 +274,12 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 					"attempt", attempt, "attempt_total", itemTotalAttempts,
 					"index", idx, "template", tpl, "candidate", cand.url,
 					"check", eff.SuccessCheck, "status", res.status, "body_bytes", len(res.first))
+				pe := logging.PollEntry{Host: hostOf(cand.url), Status: strconv.Itoa(res.status),
+					Cost: cost.String(), Result: "未过判据"}
+				if hard {
+					pe.Result, pe.HardFail = "hard_fail="+hardReason, hardReason
+				}
+				recordPanelPoll(ctx, pe)
 				res.Close()
 				if hard {
 					s.log.Warn("url-redirect 候选硬失败，跳过原地重试直接下一候选",
@@ -282,6 +297,8 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 				"attempt", attempt, "attempt_total", itemTotalAttempts,
 				"index", idx, "template", tpl, "candidate", cand.url, "status", res.status,
 				"bytes", len(res.first), "cost", cost.String())
+			recordPanelPoll(ctx, logging.PollEntry{OK: true, Host: hostOf(cand.url),
+				Status: strconv.Itoa(res.status), Cost: cost.String(), Result: "选中"})
 			res.onClose(cancel) // 该候选 ctx 的回收随流结束/放弃执行
 			handOff = true
 			done <- candidateOutcome{res: res, won: true, slot: slot}

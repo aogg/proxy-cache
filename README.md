@@ -741,6 +741,34 @@ time(时间)=2026-11-06T18:18:41.188+08:00 level(级别)=INFO msg(消息)=缓存
 
 grep 时按键名原文匹配即可（括号在 grep 基本正则里不是特殊字符），如 `grep 'source(来源)=prefetch'`；只按键名过滤可写 `grep 'source('`。
 
+### 多行下载面板（LOG_TYPE=line / json）
+
+逐条日志在 docker pull 排障时有两个痛点：每行 70% 是恒定前缀（时间/级别/source/image/digest/rule 每 10s 重打一遍），以及「客户端进度」与「代理侧（多源并发/异步预取）进度」分不出来。面板模式把它们合成「一个下载一块」的多行快照：`LOG_TYPE=line`（环境变量优先于配置 `log.type`），或配置 `log.type: line` / `log.type: json`；轮询节拍 `log.panel-interval`（默认 30s，`<=0` 关闭）。
+
+```text
+=============== 下载 dl#3 · resume ===============
+镜像    adockero/opencode-to-openai
+层      sha256:6e4673cf7d63…d547
+模式    resume（半截续传）   通道 via=direct   总长 340.21MB (upstream)
+请求    GET /v2/adockero/opencode-to-openai/blobs/sha256:6e46…
+客户端  ▕████░░░░░░░░░░░░░░░░░░░░▏  16%   55.52MB / 340.21MB
+代理    ▕██████████░░░░░░░░░░░░░░▏  43%   148.22MB / 340.21MB  多源已收（领先 92.7MB）
+速率    客户端 74KB/s · 上游合计 98KB/s · 平均 103KB/s · ETA 48m · 已耗时 9m32s
+轮询    #1 ✔ docker.1panel.live 206 0.31s 选中
+        #2 ✘ docker.1ms.run — 5.00s probe-timeout
+分块    #1 [0B – 30.9MB]  ← docker.1panel.live  ● 74KB/s  已收 30.9MB  EOF
+        #2 [30.9MB – 61.8MB]  ← docker.1ms.run  ● 82KB/s  已收 30.4MB  下载中
+拼接    连续 [0 – 55.52MB] · 下一块 55.52MB · 缺口 无
+===============
+```
+
+- **客户端 / 代理两行**：客户端 = 已发给 docker 的字节；代理 = 已从上游收到的字节（多源并发与异步预取会领先客户端，领先量单独标注）。预取块没有客户端，客户端行写「—（后台预取，无客户端）」。
+- **分块行写明远端**：每个源一行，`← host` 即该路当前连接的远端；状态含 下载中 / EOF / 停滞 / 剪枝 reason=… / 待定；末尾「拼接」给连续区间与缺口。
+- **轮询行**：每个候选尝试一行（带远端 host、状态码、耗时、判定），只打本周期新增的尝试；没有新增时折叠成「本轮无新增 · 累计 N 次 · 最近 …」。
+- **汇总块**：每轮末尾一条，列活跃数（按 source 分布）、吞吐、本轮新登记/完成/失败、缓存写入量。
+- **json 模式**：同一批数据每块一行 JSON（`{"type":"download",...}` / `{"type":"summary",...}`），数值保持原始字节，便于 `jq` 聚合。
+- **兼容**：`line|json` 模式替换掉「流式透传进度 / 活跃下载进度 / 活跃下载进度汇总」三条逐条进度；HIT、断开、502、写缓存等事件仍逐条输出。`text`（默认）与旧版逐字节一致，现有 grep 习惯不受影响。
+
 | 级别 | 能看到什么 |
 | --- | --- |
 | `info` | 每次决策结果全留痕：规则匹配结果（`规则匹配结果`，含入站 `host` 字段）、GET 绕过缓存原因（`GET 请求绕过缓存（BYPASS）`，`reason(原因)=cache-disabled/request-range/request-no-cache/...`）、url-redirect 轮询展开（`url-redirect 轮询展开`：本轮起始下标 `start_index(起始下标)` + 按尝试顺序的 `模板[下标] 模板 -> 占位符替换后最终URL` 明细）、候选命中并作为最终返回（含模板下标/模板/最终 URL/状态码/耗时）、候选硬失败快切（`url-redirect 候选硬失败，跳过原地重试直接下一候选`，`hard_fail(硬失败原因)=upstream-403/dance-still-401/probe-timeout`）、流式透传开始（`流式透传开始（已向客户端写出响应头）`：commit 的候选/状态码/Content-Length）、流式透传进度（`流式透传进度`：按 `log.progress-interval` 周期输出，含已传字节数/上游声明大小与百分比/区间速率/自 commit 起耗时/客户端是否仍在接收；间隔 `<=0` 关闭）、docker blob 单层下载开始（`docker blob 单层下载开始（客户端主路径）`：`total(总长)` 与 `total_source(总长来源)=upstream|manifest|unknown`、`candidates(候选数)`）、时间驱动的多源并发补充（`blob 下载 N 分钟未完成，评估多源并发补充` / `补充多源并发下载` / `未补充多源并发`（带 `reason(原因)` 枚举），见「[时间驱动的多源并发补充](#时间驱动的多源并发补充blob-concurrency-interval)」）、活跃下载周期汇总（`活跃下载进度汇总` 一条 + 每个活跃下载一条 `活跃下载进度`：按 `log.progress-summary-interval` 周期输出，覆盖 client（含缓存/回放）/ridealong/resume/prefetch，本轮无任何下载登记时静默，见下文「[活跃下载周期汇总](#活跃下载周期汇总)」）、全败回退直连、缓存命中（`缓存命中（HIT）`：缓存 key 与实际命中的文件路径 `file(文件)`）、写入缓存成功（`写入缓存成功`：规则名/缓存 key/落盘文件路径/body 大小/ttl）、成功返回内容（`成功返回内容`：200/206 时输出来源/状态码/字节数/缓存状态；多源并发补充过的流追加 `sources(源数量)`/`alive_sources(存活源数)`）、内容未变更（`内容未变更（304），客户端缓存副本有效`，最终 304 时输出）、blob 半截续传宽限终止（`blob 半截续传客户端断开且无搭车订阅者，宽限终止续传（半截保留，下次从断点再续）`：续传执行方客户端断开且宽限期内无搭车订阅者的运维事件而非故障，绝不 Error）、每条访问完成日志（`代理请求完成`） |
