@@ -172,7 +172,7 @@ func (s *Server) fetchViaCandidatesStreaming(w http.ResponseWriter, r *http.Requ
 	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：commit（响应头已写出）后
 	// 开始写即登记 source=client，defer 注销——任何返回路径（EOF / 断开 / 读上游失败）
 	// 都不留幽灵条目；每写一块经 addBytes 累加，total 取上游声明总长
-	prog := s.progressRegister(dockerLogSourceClient, labels.image, labels.digest, r.Method, 0, contentLength)
+	prog := s.progressRegister(dockerLogSourceClient, labels.image, labels.digest, r.Method, r.URL.Path, 0, contentLength)
 	defer prog.unregister()
 
 	// 慢速升级多源并发续传（slow-download escalation）门控与状态：

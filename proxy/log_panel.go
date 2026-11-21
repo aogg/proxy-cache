@@ -409,7 +409,7 @@ func (s *Server) buildDownloadBlock(e *progressSummaryEntry, now time.Time) (log
 	}
 	block := logging.DownloadBlock{
 		ID: e.id, Mode: e.source, Image: e.image, Digest: e.digest,
-		Method: e.method, Target: "", Req: requestID,
+		Method: e.method, Target: e.target, Req: requestID,
 		Via: via, Total: e.totalLength(), TotalSrc: totalSrc,
 		ClientBytes: written, UpstreamBytes: upstream,
 		ClientState: "ok", Partial: partial,

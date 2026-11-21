@@ -313,7 +313,7 @@ func (s *Server) serveEntryBlobRange(w http.ResponseWriter, r *http.Request, e *
 	// 活跃下载进度登记（周期汇总，见 progress_summary.go）：区间回放同样是客户端下载
 	//（source 与上方日志派生一致），分块写逐块 addBytes；total 取本次区间长度（percent
 	// 描述这次要发的区间而不是完整对象），不输出超区间语义
-	prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, n)
+	prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, r.URL.Path, 0, n)
 	defer prog.unregister()
 	prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUpstream, newRequestID())
 	// 区间切片按磁盘偏移流式读（io.SectionReader），绝不为了一个区间把完整 blob 读进内存

@@ -852,7 +852,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 		// 搭车订阅者立即拿到同一份响应头快照（不再等扫描完成才 setSnapshot）
 		ent.setSnapshot(http.StatusOK, hdrEarly, "")
 		s.commitResumeHeader(w, hdrEarly, "", earlyTotal, cr...)
-		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, earlyTotal)
+		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, r.URL.Path, n, earlyTotal)
 		defer prog.unregister()
 		prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceManifest, newRequestID())
 		prog.setPartial(n, 0, 0)
@@ -1150,7 +1150,7 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 	// 已下载字节同样 = 半截前缀 n（进度不回退，percent 直接对总长），defer 注销——失败/
 	// 成功/panic 返回都不留幽灵条目；每追加一块经 addBytes 累加
 	if !earlyCommit {
-		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, n, total)
+		prog = s.progressRegister(dockerLogSourceResume, labels.image, labels.digest, r.Method, r.URL.Path, n, total)
 		defer prog.unregister()
 		prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUnknown, newRequestID())
 		prog.setPartial(n, 0, 0)

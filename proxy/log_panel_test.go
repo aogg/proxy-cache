@@ -68,7 +68,7 @@ func TestMergerPanelSnapshotChunks(t *testing.T) {
 // 被 panelSnapshot 取走一次即清空（收尾块每个下载只输出一次）。
 func TestPanelRegistryFinishedBlock(t *testing.T) {
 	s := panelTestServer(t)
-	prog := s.progressRegister(dockerLogSourceClient, "foxhui/webai-2api", "sha256:9f2c4a1e", "GET", 0, 500)
+	prog := s.progressRegister(dockerLogSourceClient, "foxhui/webai-2api", "sha256:9f2c4a1e", "GET", "/v2/foxhui/webai-2api/blobs/sha256:9f2c4a1e", 0, 500)
 	prog.setPanelMeta("", "upstream", "abcd1234")
 	prog.addBytes(500)
 	prog.finish("完成")
@@ -81,6 +81,9 @@ func TestPanelRegistryFinishedBlock(t *testing.T) {
 	}
 	if len(finished) != 1 || finished[0].Result != "完成" {
 		t.Fatalf("收尾块不符: %+v", finished)
+	}
+	if finished[0].Target != "/v2/foxhui/webai-2api/blobs/sha256:9f2c4a1e" {
+		t.Fatalf("收尾块应带上请求路径 target, got %q", finished[0].Target)
 	}
 	// 再取一次：收尾队列已清空
 	if _, _, again := reg.panelSnapshot(time.Now()); len(again) != 0 {
@@ -98,7 +101,8 @@ func TestEmitLogPanelClientVsProxy(t *testing.T) {
 	// 一条 resume 下载：客户端已收 55.5MB，代理侧（3 源）已收 130MB
 	prog := reg.register(dockerLogSourceResume, "adockero/opencode-to-openai",
 		"sha256:6e4673cf7d63579467ba6ee2e885b161cc66975f6fbf7bb4b3c67998e0a0d547",
-		"GET", 58216448, 356731507, now)
+		"GET", "/v2/adockero/opencode-to-openai/blobs/sha256:6e4673cf7d63579467ba6ee2e885b161cc66975f6fbf7bb4b3c67998e0a0d547",
+		58216448, 356731507, now)
 	prog.setPanelMeta("", blobTotalSourceUpstream, "7c1a2b3f")
 	prog.setPartial(58216448, 0, 0)
 	rec := newPanelRecorder()
@@ -122,6 +126,7 @@ func TestEmitLogPanelClientVsProxy(t *testing.T) {
 	for _, want := range []string{
 		"=============== 下载 dl#",
 		"镜像    adockero/opencode-to-openai",
+		"请求    GET /v2/adockero/opencode-to-openai/blobs/sha256:6e4673cf7d63579467ba6ee2e885b161cc66975f6fbf7bb4b3c67998e0a0d547",
 		"客户端  ▕",
 		"代理    ▕",
 		"多源已收（领先",
@@ -158,7 +163,7 @@ func TestEmitLogPanelJSON(t *testing.T) {
 	s := panelTestServer(t)
 	reg := s.progressOrInit()
 	now := time.Now()
-	prog := reg.register(dockerLogSourceClient, "foxhui/webai-2api", "sha256:9f2c4a1e", "GET", 125829120, 524288000, now)
+	prog := reg.register(dockerLogSourceClient, "foxhui/webai-2api", "sha256:9f2c4a1e", "GET", "/v2/foxhui/webai-2api/blobs/sha256:9f2c4a1e", 125829120, 524288000, now)
 	prog.setPanelMeta("http://v2raya.common-all:20171", blobTotalSourceUpstream, "3f9a2c1d")
 	prog.addBytes(0)
 
@@ -178,6 +183,9 @@ func TestEmitLogPanelJSON(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], `"via":"http://v2raya.common-all:20171"`) {
 		t.Fatalf("download 行未带代理通道: %s", lines[0])
+	}
+	if !strings.Contains(lines[0], `"method":"GET"`) || !strings.Contains(lines[0], `"target":"/v2/foxhui/webai-2api/blobs/sha256:9f2c4a1e"`) {
+		t.Fatalf("download 行应同时带 method 与 target: %s", lines[0])
 	}
 	if !strings.Contains(lines[1], `"type":"summary"`) {
 		t.Fatalf("第二行应为 summary: %s", lines[1])

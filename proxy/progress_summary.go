@@ -90,6 +90,9 @@ type progressSummaryEntry struct {
 	digest string
 	// method 本次下载对应的客户端请求方法（GET / HEAD；预取为合成的 GET）。
 	method string
+	// target 本次下载的请求路径（/v2/<name>/blobs/sha256:…）：面板「请求」行显示
+	// method + path，登记时按字符截断到 panelTargetMaxLen（异常长路径不撑爆面板行）。
+	target string
 	// startedAt 登记时刻：elapsed 起点，同时是首轮速率基线的起点。
 	startedAt time.Time
 	// reg 所属注册表（注销 / setTotal 加锁用）。
@@ -142,11 +145,12 @@ type progressSummaryEntry struct {
 type progressSummaryRow struct {
 	// id 下载 ID（排序用）。
 	id uint64
-	// source / image / digest / method 与登记条目同名同义。
+	// source / image / digest / method / target 与登记条目同名同义。
 	source string
 	image  string
 	digest string
 	method string
+	target string
 	// bytes 快照时的已下载字节数。
 	bytes int64
 	// total 总长（0 = 不可得）。
@@ -168,12 +172,13 @@ func newProgressRegistry() *progressRegistry {
 // initial 为登记时已完成的字节数（续传前缀 / 搭车已落盘前缀；其余场景 0），
 // total 为已知总长（Content-Length / 续传扫描总长；不可得传 0，可后经 setTotal 补）。
 // 条目字段在入表前一次性填好，保证首轮快照即读到正确基线。
-func (r *progressRegistry) register(source, image, digest, method string, initial, total int64, now time.Time) *progressSummaryEntry {
+func (r *progressRegistry) register(source, image, digest, method, target string, initial, total int64, now time.Time) *progressSummaryEntry {
 	ent := &progressSummaryEntry{
 		source:    source,
 		image:     image,
 		digest:    digest,
 		method:    method,
+		target:    truncateTarget(target, panelTargetMaxLen),
 		startedAt: now,
 		reg:       r,
 		total:     total,
@@ -221,6 +226,7 @@ func (r *progressRegistry) snapshotTick(now time.Time) ([]progressSummaryRow, ui
 			image:   e.image,
 			digest:  e.digest,
 			method:  e.method,
+			target:  e.target,
 			bytes:   written,
 			total:   e.total,
 			delta:   written - e.lastWritten,
@@ -261,7 +267,7 @@ func (e *progressSummaryEntry) unregister() {
 		via, totalSrc, requestID, result, partial, _, _, _ := e.panelState()
 		b := logging.DownloadBlock{
 			ID: e.id, Mode: e.source, Image: e.image, Digest: e.digest, Method: e.method,
-			Req: requestID, Via: via, TotalSrc: totalSrc,
+			Target: e.target, Req: requestID, Via: via, TotalSrc: totalSrc,
 			ClientBytes: e.written.Load(), UpstreamBytes: e.written.Load(),
 			ClientState: "ok", Partial: partial, Result: result,
 			Elapsed: time.Since(e.startedAt),
@@ -294,8 +300,8 @@ func (s *Server) progressOrInit() *progressRegistry {
 }
 
 // progressRegister 登记一条活跃下载（各下载流共用入口，语义见 progressRegistry.register）。
-func (s *Server) progressRegister(source, image, digest, method string, initial, total int64) *progressSummaryEntry {
-	return s.progressOrInit().register(source, image, digest, method, initial, total, time.Now())
+func (s *Server) progressRegister(source, image, digest, method, target string, initial, total int64) *progressSummaryEntry {
+	return s.progressOrInit().register(source, image, digest, method, target, initial, total, time.Now())
 }
 
 // StartProgressSummary 启动活跃下载周期进度汇总协程（main.go 在启动期调用，参照
@@ -411,6 +417,22 @@ func progressSummaryPercent(bytes, total int64) int {
 		return 100
 	}
 	return pct
+}
+
+// panelTargetMaxLen 面板「请求」行显示的请求路径最大字符数（超出按字符截断后加 `...`）。
+const panelTargetMaxLen = 200
+
+// truncateTarget 按字符（rune）截断请求目标：不超过 max 时原样返回，超出保留前 max 个
+// 字符并追加 `...`。按 rune 而非字节截断，避免把多字节 UTF-8 字符切成坏串。
+func truncateTarget(s string, max int) string {
+	if max <= 0 || len(s) <= max { // 字节数已不超限，必然不超字符数
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "..."
 }
 
 // progressSummaryTotal 从响应头取 Content-Length 作为总长：解析失败 / 非正数返回 0

@@ -583,7 +583,7 @@ func (s *Server) tryServeFromPrefetchHub(w http.ResponseWriter, r *http.Request,
 	// source=ridealong，初始已下载字节 = 已落盘前缀 prefixLen（回放前缀不重复累加，
 	// 只对随后消费的增量 addBytes），total 取预取响应头快照的 Content-Length；
 	// defer 注销——完成/断开/超时终止都不留幽灵条目
-	prog := s.progressRegister(dockerLogSourceRidealong, labels.image, labels.digest, r.Method,
+	prog := s.progressRegister(dockerLogSourceRidealong, labels.image, labels.digest, r.Method, r.URL.Path,
 		prefixLen, progressSummaryTotal(header))
 	defer prog.unregister()
 	prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUpstream, newRequestID())
@@ -817,7 +817,7 @@ func (s *Server) prefetchBlobStreaming(req *http.Request, key, target, digest st
 	// commit 点）后即登记 source=prefetch，total 取 Content-Length（不可得则不输出
 	// percent）；defer 注销——EOF 写缓存 / 失败 / panic 都不留幽灵条目。初始已下载
 	// 字节取条目既有 written（登记时通常为 0），随后每写一块经 addBytes 累加
-	prog := s.progressRegister(dockerLogSourcePrefetch, labels.image, labels.digest, req.Method,
+	prog := s.progressRegister(dockerLogSourcePrefetch, labels.image, labels.digest, req.Method, req.URL.Path,
 		ent.writtenOf(), progressSummaryTotal(res.header))
 	defer prog.unregister()
 	prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUpstream, newRequestID())

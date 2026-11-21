@@ -32,6 +32,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"proxy-cache/config"
 )
@@ -147,8 +148,8 @@ func TestProgressRegistrySnapshot(t *testing.T) {
 	}
 
 	t0 := time.Now()
-	client := r.register(dockerLogSourceClient, "demo/app", "sha256:aaaa", http.MethodGet, 100, 0, t0)
-	prefetch := r.register(dockerLogSourcePrefetch, "", "", http.MethodGet, 0, 0, t0)
+	client := r.register(dockerLogSourceClient, "demo/app", "sha256:aaaa", http.MethodGet, "/v2/demo/app/blobs/sha256:aaaa", 100, 0, t0)
+	prefetch := r.register(dockerLogSourcePrefetch, "", "", http.MethodGet, "/v2/demo/app/manifests/latest", 0, 0, t0)
 	if client.id == 0 || prefetch.id <= client.id {
 		t.Fatalf("下载 ID 应自 1 递增（client=%d, prefetch=%d）", client.id, prefetch.id)
 	}
@@ -172,7 +173,7 @@ func TestProgressRegistrySnapshot(t *testing.T) {
 	}
 	wantClient := progressSummaryRow{
 		id: client.id, source: dockerLogSourceClient, image: "demo/app", digest: "sha256:aaaa",
-		method: http.MethodGet, bytes: 1000, total: 1000,
+		method: http.MethodGet, target: "/v2/demo/app/blobs/sha256:aaaa", bytes: 1000, total: 1000,
 		delta: 900, window: time.Second, elapsed: time.Second,
 	}
 	if rows[0] != wantClient {
@@ -180,7 +181,7 @@ func TestProgressRegistrySnapshot(t *testing.T) {
 	}
 	wantPrefetch := progressSummaryRow{
 		id: prefetch.id, source: dockerLogSourcePrefetch, image: "", digest: "",
-		method: http.MethodGet, bytes: 300, total: 0,
+		method: http.MethodGet, target: "/v2/demo/app/manifests/latest", bytes: 300, total: 0,
 		delta: 300, window: time.Second, elapsed: time.Second,
 	}
 	if rows[1] != wantPrefetch {
@@ -229,11 +230,33 @@ func TestProgressRegistrySnapshot(t *testing.T) {
 	}
 }
 
+// TestTruncateTarget 请求路径按字符截断到 200：短路径原样返回；超长路径保留前 200
+// 个字符并追加 ...；多字节字符不被切坏（按 rune 而非字节）。
+func TestTruncateTarget(t *testing.T) {
+	short := "/v2/demo/app/blobs/sha256:aaaa"
+	if got := truncateTarget(short, panelTargetMaxLen); got != short {
+		t.Fatalf("短路径应原样返回, got %q", got)
+	}
+	long := "/v2/" + strings.Repeat("a", 300)
+	got := truncateTarget(long, panelTargetMaxLen)
+	if !strings.HasPrefix(got, "/v2/") || !strings.HasSuffix(got, "...") {
+		t.Fatalf("超长路径应保留前缀并加 ...（got %q）", got)
+	}
+	if n := len([]rune(strings.TrimSuffix(got, "..."))); n != panelTargetMaxLen {
+		t.Fatalf("超长路径应保留 %d 个字符, got %d", panelTargetMaxLen, n)
+	}
+	// 多字节字符：按 rune 截断后仍是合法 UTF-8（不出现半个汉字）
+	utf8Path := "/v2/" + strings.Repeat("层", 300)
+	if got := truncateTarget(utf8Path, panelTargetMaxLen); !utf8.ValidString(got) {
+		t.Fatalf("按 rune 截断后的中文路径应是合法 UTF-8: %q", got)
+	}
+}
+
 // TestProgressRegistryConcurrentAddBytes 并发 addBytes 不丢更新：8 路 × 2000 次各加 1，
 // 期间另一 goroutine 持续快照（原子累加与注册表锁并发路径，-race 覆盖）。
 func TestProgressRegistryConcurrentAddBytes(t *testing.T) {
 	r := newProgressRegistry()
-	e := r.register(dockerLogSourceClient, "demo/app", "sha256:bbbb", http.MethodGet, 0, 0, time.Now())
+	e := r.register(dockerLogSourceClient, "demo/app", "sha256:bbbb", http.MethodGet, "/v2/demo/app/blobs/sha256:bbbb", 0, 0, time.Now())
 
 	const writers, perWriter = 8, 2000
 	var wg sync.WaitGroup
@@ -335,8 +358,8 @@ func TestProgressSummaryPeriodicOutput(t *testing.T) {
 	defer cancel()
 	s.StartProgressSummary(ctx)
 
-	client := s.progressRegister(dockerLogSourceClient, "demo/app", "sha256:aaaa", http.MethodGet, 0, 1000)
-	prefetch := s.progressRegister(dockerLogSourcePrefetch, "demo/app", "sha256:bbbb", http.MethodGet, 0, 2000)
+	client := s.progressRegister(dockerLogSourceClient, "demo/app", "sha256:aaaa", http.MethodGet, "/v2/demo/app/blobs/sha256:aaaa", 0, 1000)
+	prefetch := s.progressRegister(dockerLogSourcePrefetch, "demo/app", "sha256:bbbb", http.MethodGet, "/v2/demo/app/blobs/sha256:bbbb", 0, 2000)
 	defer func() {
 		client.unregister()
 		prefetch.unregister()
@@ -374,7 +397,7 @@ func TestProgressSummaryPeriodicOutput(t *testing.T) {
 	cancel()
 	time.Sleep(3 * interval)
 	marker := sb.Len()
-	sentinel := s.progressRegister(dockerLogSourceClient, "after-cancel/app", "sha256:cccc", http.MethodGet, 0, 10)
+	sentinel := s.progressRegister(dockerLogSourceClient, "after-cancel/app", "sha256:cccc", http.MethodGet, "/v2/after-cancel/app/blobs/sha256:cccc", 0, 10)
 	defer sentinel.unregister()
 	sentinel.addBytes(5)
 	time.Sleep(5 * interval)
@@ -408,7 +431,7 @@ func TestProgressSummaryStartedAfterShortDownload(t *testing.T) {
 	defer cancel()
 	s.StartProgressSummary(ctx)
 
-	e := s.progressRegister(dockerLogSourceClient, "short/app", "sha256:1234", http.MethodGet, 0, 100)
+	e := s.progressRegister(dockerLogSourceClient, "short/app", "sha256:1234", http.MethodGet, "/v2/short/app/blobs/sha256:1234", 0, 100)
 	e.addBytes(100)
 	e.unregister() // tick 前已结束
 
@@ -437,7 +460,7 @@ func TestProgressSummaryStartedAfterShortDownload(t *testing.T) {
 func TestProgressSummarySnapshotTickStarted(t *testing.T) {
 	r := newProgressRegistry()
 	t0 := time.Now()
-	e := r.register(dockerLogSourceClient, "demo/app", "sha256:aaaa", http.MethodGet, 0, 100, t0)
+	e := r.register(dockerLogSourceClient, "demo/app", "sha256:aaaa", http.MethodGet, "/v2/demo/app/blobs/sha256:aaaa", 0, 100, t0)
 
 	rows, started := r.snapshotTick(t0.Add(time.Second))
 	if len(rows) != 1 || started != 1 {
@@ -457,7 +480,7 @@ func TestProgressSummarySnapshotTickStarted(t *testing.T) {
 // 短写返回 io.ErrShortWrite 且不吞未写字节。
 func TestWriteBodyWithProgress(t *testing.T) {
 	r := newProgressRegistry()
-	e := r.register(dockerLogSourceClient, "demo/app", "sha256:bbbb", http.MethodGet, 0, 0, time.Now())
+	e := r.register(dockerLogSourceClient, "demo/app", "sha256:bbbb", http.MethodGet, "/v2/demo/app/blobs/sha256:bbbb", 0, 0, time.Now())
 	var buf bytes.Buffer
 	body := make([]byte, 200*1024)
 	if err := writeBodyWithProgress(&buf, body, e); err != nil {
@@ -504,7 +527,7 @@ func TestProgressSummaryNotStartedWhenDisabled(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			s.StartProgressSummary(ctx)
-			e := s.progressRegister(dockerLogSourceClient, "demo/app", "sha256:dddd", http.MethodGet, 0, 100)
+			e := s.progressRegister(dockerLogSourceClient, "demo/app", "sha256:dddd", http.MethodGet, "/v2/demo/app/blobs/sha256:dddd", 0, 100)
 			defer e.unregister()
 			e.addBytes(50)
 			time.Sleep(4 * interval)
@@ -522,7 +545,7 @@ func TestNewPrefillsProgressRegistry(t *testing.T) {
 	if s.progressReg == nil {
 		t.Fatal("New 应预构建 progressReg（各登记点依赖）")
 	}
-	e := s.progressRegister(dockerLogSourceClient, "demo/app", "sha256:eeee", http.MethodGet, 0, 100)
+	e := s.progressRegister(dockerLogSourceClient, "demo/app", "sha256:eeee", http.MethodGet, "/v2/demo/app/blobs/sha256:eeee", 0, 100)
 	defer e.unregister()
 	e.addBytes(10)
 	time.Sleep(60 * time.Millisecond) // 3 个 interval
@@ -545,7 +568,7 @@ func TestProgressSummaryStartOnce(t *testing.T) {
 	s.StartProgressSummary(ctx1)
 	s.StartProgressSummary(ctx2) // Once：不启动第二个协程（ctx2 被忽略）
 
-	e := s.progressRegister(dockerLogSourceClient, "once/app", "sha256:ffff", http.MethodGet, 0, 100)
+	e := s.progressRegister(dockerLogSourceClient, "once/app", "sha256:ffff", http.MethodGet, "/v2/once/app/blobs/sha256:ffff", 0, 100)
 	defer e.unregister()
 	e.addBytes(50)
 	waitLogContains(t, sb, 2*time.Second, func(log string) bool {

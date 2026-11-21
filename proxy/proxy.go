@@ -1737,7 +1737,7 @@ func (s *Server) serveEntry(w http.ResponseWriter, r *http.Request, e *cache.Ent
 			// resume）登记，分块写逐块 addBytes——大 blob 一次 Write 会让 3 分钟汇总在
 			// 传输期间只能看到 0 字节。写失败/成功返回都 defer 注销，不留幽灵条目。
 			// body 从 Section 流式读（磁盘条目按区间读，绝不整份进内存）
-			prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, 0, size)
+			prog := s.progressRegister(logSource, labels.image, labels.digest, r.Method, r.URL.Path, 0, size)
 			defer prog.unregister()
 			prog.setPanelMeta(eff.HTTPProxy, blobTotalSourceUpstream, newRequestID())
 			src, serr := e.Section(0, -1)
