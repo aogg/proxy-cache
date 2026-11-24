@@ -111,6 +111,7 @@ import (
 
 	"proxy-cache/cache"
 	"proxy-cache/config"
+	"proxy-cache/logging"
 )
 
 // resumeCacheStatus 续传执行方路径 X-Cache 观测头的取值：与 MISS / BYPASS / HIT /
@@ -485,18 +486,40 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 	// 活体 body 的出口显式 Stop + cancel()，绝不泄漏。
 	scanBudget := resumeScanBudgetFor(n, eff)
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
-	scanTimer := time.AfterFunc(scanBudget, func() { cancel() }) // 预算到期：未命中才生效（命中出口已 Stop）
+	cause := &scanCancelCause{}                      // 面板「已取消/未放行」原因的数据源
+	scanTimer := time.AfterFunc(scanBudget, func() { // 预算到期：未命中才生效（命中出口已 Stop）
+		cause.setBudget(scanBudget) // 先记原因再 cancel：被取消者一定读得到
+		cancel()
+	})
+
+	// skipped 补记「未放行」候选（扫描提前结束时调用）：续传扫描是串行轮询，中途命中/预算
+	// 到期时后面的候选一次都没打过上游，不补记的话面板「轮询」段会比配置的候选数少
+	//（用户要求：候选全量列出，未轮到的也要写清为什么没轮到）
+	skipped := func(from int) {
+		why := cause.text()
+		for i := from; i < n; i++ {
+			cand := candidates[(start+i)%n]
+			recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url),
+				Result: logging.PollResultSkipped, Reason: "扫描在轮到本候选前结束：" + why})
+		}
+	}
 
 	var lastErr error
+	attempted := 0 // 已真正发起过上游尝试的候选数（「未放行」补记起点）
 	for i := 0; i < n; i++ {
 		if ctx.Err() != nil {
 			break // 扫描预算耗尽：按超时类失败收场
 		}
 		idx := (start + i) % n
 		cand := candidates[idx]
+		attempted = i + 1
+		candStart := time.Now()
 		upRes, uerr := s.startUpstream(ctx, r, cand, eff, rangeHeader, nil, nil)
+		cost := time.Since(candStart).Round(time.Millisecond)
 		if uerr != nil {
 			lastErr = uerr
+			recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Cost: cost.String(),
+				Result: logging.PollResultFailed, Reason: candidateFailureReason(uerr, "")})
 			s.log.Debug("blob 半截续传候选请求失败，轮询下一候选",
 				labels.attrs(dockerLogSourceResume, "index", idx, "candidate", truncate(cand.url, 300), "range", rangeHeader, "err", uerr)...)
 			continue // 网络/超时类失败：半截保留
@@ -521,6 +544,10 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 					t416 = -1
 				}
 				lastErr = fmt.Errorf("候选 416 不可信（Content-Range 总长 %d 缺失或 ≠ 半截长度 %d）", t416, partSize)
+				recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Status: strconv.Itoa(upRes.status),
+					Cost: cost.String(), Result: logging.PollResultFailed,
+					Reason: fmt.Sprintf("上游 416 不可信：Content-Range 总长 %d 与半截长度 %d 不符（无法证实半截已完整）",
+						t416, partSize)})
 				s.log.Debug("blob 半截续传 416 缺合规 Content-Range，不可证实半截完整，轮询下一候选",
 					labels.attrs(dockerLogSourceResume, "index", idx,
 						"candidate", truncate(cand.url, 300), "part_bytes", partSize,
@@ -528,8 +555,14 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 				continue
 			}
 			upRes.Close()
+			pollN := recordPanelPoll(ctx, logging.PollEntry{OK: true, Host: hostOf(cand.url),
+				Status: strconv.Itoa(upRes.status), Cost: cost.String(),
+				Result: logging.PollResultSelected,
+				Reason: fmt.Sprintf("上游 416 且 Content-Range 总长 %d 与半截长度一致（证实半截已完整）", t416)})
 			scanTimer.Stop() // 命中出口（完整收场）：停掉预算 timer，绝不遗留到期触发
-			cancel()         // 416 出口不返回活体 body：ctx 就地回收（重复取消幂等无害）
+			cause.setWinner(pollN, hostOf(cand.url))
+			skipped(i + 1) // 命中后未轮到的候选：补「未放行」并写明原因
+			cancel()       // 416 出口不返回活体 body：ctx 就地回收（重复取消幂等无害）
 			s.log.Info("blob 半截续传发现半截已完整（上游 416 且 Content-Range 总长与半截一致）",
 				labels.attrs(dockerLogSourceResume,
 					"candidate", truncate(cand.url, 300), "part_bytes", partSize, "total", t416)...)
@@ -539,6 +572,9 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 			upRes.Close()
 			invalid = true
 			lastErr = verr
+			recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Status: strconv.Itoa(upRes.status),
+				Cost: cost.String(), Result: logging.PollResultFailed,
+				Reason: fmt.Sprintf("状态码 %d 不合规（上游明确拒绝按断点续传）：%v", upRes.status, verr)})
 			s.log.Debug("blob 半截续传响应不合规（上游明确拒绝按断点续传），轮询下一候选",
 				labels.attrs(dockerLogSourceResume, "index", idx, "candidate", truncate(cand.url, 300),
 					"status", upRes.status, "part_bytes", partSize, "err", verr)...)
@@ -558,19 +594,28 @@ func (s *Server) scanResumeCandidate(r *http.Request, candidates []candidate, ef
 		if ctx.Err() != nil {
 			upRes.Close()
 			lastErr = errors.New("续传扫描预算到期（206 命中窗口内被预算终止）")
+			recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Status: strconv.Itoa(upRes.status),
+				Cost: cost.String(), Result: logging.PollResultCanceled, Reason: cause.text()})
 			continue
 		}
 		s.log.Info("blob 半截续传候选命中",
 			labels.attrs(dockerLogSourceResume, "index", idx, "candidate", truncate(cand.url, 300), "status", upRes.status,
 				"part_bytes", partSize, "total", t)...)
+		pollN := recordPanelPoll(ctx, logging.PollEntry{OK: true, Host: hostOf(cand.url),
+			Status: strconv.Itoa(upRes.status), Cost: cost.String(),
+			Result: logging.PollResultSelected,
+			Reason: fmt.Sprintf("206 且 Content-Range 起点匹配（从断点 %d 字节继续）", partSize)})
+		cause.setWinner(pollN, hostOf(cand.url))
+		skipped(i + 1)        // 命中后未轮到的候选：补「未放行」并写明原因
 		upRes.onClose(cancel) // 命中出口返回活体 body：扫描 ctx 取消权随流移交调用方（Close 时释放）
 		return upRes, t, false, false, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("全部续传候选均未产生结果")
 	}
-	scanTimer.Stop() // 收场出口（全败/预算耗尽/不合规轮完）：停掉预算 timer（幂等）
-	cancel()         // 扫描收场（全败/预算耗尽/不合规轮完）：本出口无活体 body，ctx 就地回收
+	skipped(attempted) // 预算耗尽/提前收场时未轮到的候选：补「未放行」并写明原因
+	scanTimer.Stop()   // 收场出口（全败/预算耗尽/不合规轮完）：停掉预算 timer（幂等）
+	cancel()           // 扫描收场（全败/预算耗尽/不合规轮完）：本出口无活体 body，ctx 就地回收
 	return nil, -1, false, invalid, lastErr
 }
 
@@ -1324,8 +1369,8 @@ func (s *Server) resumeBlobStreaming(w http.ResponseWriter, r *http.Request, key
 					blobConc.merger = resMerger
 					blobConc.clientGone = !clientOK
 					if s.timeBlobSupplement(&blobConc) && prog != nil {
-					prog.attachMerger(blobConc.merger)
-				}
+						prog.attachMerger(blobConc.merger)
+					}
 				}
 			}
 		})

@@ -106,8 +106,10 @@ func TestEmitLogPanelClientVsProxy(t *testing.T) {
 	prog.setPanelMeta("", blobTotalSourceUpstream, "7c1a2b3f")
 	prog.setPartial(58216448, 0, 0)
 	rec := newPanelRecorder()
-	rec.record(logging.PollEntry{OK: true, Host: "docker.1panel.live", Status: "206", Cost: "0.31s", Result: "选中"})
-	rec.record(logging.PollEntry{Host: "docker.1ms.run", Cost: "5.00s", Result: "probe-timeout"})
+	rec.record(logging.PollEntry{OK: true, Host: "docker.1panel.live", Status: "206", Cost: "0.31s",
+		Result: logging.PollResultSelected, Reason: "第一个通过 success-check=content 的候选（状态码 206）"})
+	rec.record(logging.PollEntry{Host: "docker.1ms.run", Cost: "5.00s",
+		Result: logging.PollResultFailed, Reason: "超时：probe-timeout（候选探测预算 5s 内响应头未就绪）"})
 	prog.attachRecorder(rec)
 	m := newSlowMerger([]*slowSource{
 		{name: "https://docker.1panel.live/v2/adockero/opencode-to-openai/blobs/sha256:6e46", start: 0, readPos: 32400998, end: 32400998, eof: true},
@@ -130,8 +132,9 @@ func TestEmitLogPanelClientVsProxy(t *testing.T) {
 		"客户端  ▕",
 		"代理    ▕",
 		"多源已收（领先",
-		"轮询    #1 ✔ docker.1panel.live 206 0.31s 选中",
-		"#2 ✘ docker.1ms.run — 5.00s probe-timeout",
+		"轮询    共 2 · 成功 1 · 失败 1 · 取消 0",
+		"#1 ✔ docker.1panel.live 206 0.31s 选中  reason=第一个通过 success-check=content 的候选",
+		"#2 ✘ docker.1ms.run — 5.00s 失败  reason=超时：probe-timeout",
 		"分块    #1 [0B – 30.9MB]  ← docker.1panel.live",
 		"#3 [61.8MB – 92.7MB]  ← hk.gh-proxy.org",
 		"拼接    连续 [0 – 55.52MB]",
@@ -191,4 +194,107 @@ func TestEmitLogPanelJSON(t *testing.T) {
 		t.Fatalf("第二行应为 summary: %s", lines[1])
 	}
 	t.Logf("JSON 模式真实输出:\n%s", buf.String())
+}
+
+// //////////////////  轮询段全量输出（不折叠、不截断）  //////////////////////////////////////
+
+// TestPanelRecorderKeepsAllPolls 记录器不再设上限：旧版 maxPanelPolls=64 会在候选多 /
+// 重试多（候选 11 × item 重试 4 × 整轮 2 ≈ 88 条）时把第 65 条起悄悄丢掉，正是「信息
+// 丢失」的一部分。条目数天然有界（候选数 × 尝试数 + 未放行补记），无需丢弃。
+func TestPanelRecorderKeepsAllPolls(t *testing.T) {
+	rec := newPanelRecorder()
+	const total = 120 // 故意超过旧版上限 64
+	for i := 0; i < total; i++ {
+		if n := rec.record(logging.PollEntry{Host: "h.example", Result: logging.PollResultFailed}); n != i+1 {
+			t.Fatalf("第 %d 条的面板序号应为 %d，实际 %d（序号必须跨轮次递增）", i+1, i+1, n)
+		}
+	}
+	if got := len(rec.snapshot()); got != total {
+		t.Fatalf("记录器应保留全部 %d 条（不截断），实际 %d 条", total, got)
+	}
+}
+
+// TestBuildDownloadBlockListsAllPolls 每个面板周期都把全部候选尝试列出来：第二帧没有任何
+// 新增尝试时也照样全量输出（旧版这时会折叠成「本轮无新增 · 累计 N 次 · 最近 …」），
+// 且超过 8 条也不截断。
+func TestBuildDownloadBlockListsAllPolls(t *testing.T) {
+	s := panelTestServer(t)
+	reg := s.progressOrInit()
+	now := time.Now()
+	prog := reg.register(dockerLogSourceClient, "adockero/tinc",
+		"sha256:17977f56026a1758cabf2eea1e3430a4269a6724ab7249f48b97efe2d60ee11d",
+		"GET", "/v2/adockero/tinc/blobs/sha256:17977f56026a", 1000, 45880718, now)
+	prog.setPanelMeta("", blobTotalSourceUpstream, "a1b2c3d4")
+
+	rec := newPanelRecorder()
+	rec.record(logging.PollEntry{Host: "registry-proxy-cache.linkease.net:5480",
+		Result: logging.PollResultFailed, Reason: "自引用候选（展开后指向本次请求自身），已跳过本节候选"})
+	rec.record(logging.PollEntry{Host: "mirror.houlang.cloud", Status: "200", Cost: "89ms",
+		Result: logging.PollResultFailed, HardFail: "html-error-page",
+		Reason: "hard_fail=html-error-page：状态码 200 未过 success-check=content"})
+	rec.record(logging.PollEntry{OK: true, Host: "docker.1ms.run", Status: "206", Cost: "4.304s",
+		Result: logging.PollResultSelected, Reason: "第一个通过 success-check=content 的候选（状态码 206）"})
+	for i := 0; i < 10; i++ { // 超过 8 条，验证不截断
+		rec.record(logging.PollEntry{Host: "docker.1panel.live", Cost: "213ms",
+			Result: logging.PollResultCanceled, Reason: "其他候选胜出（#3 docker.1ms.run 已命中）"})
+	}
+	prog.attachRecorder(rec)
+
+	first, _ := s.buildDownloadBlock(prog, now)
+	if len(first.Polls) != 13 || first.PollTotal != 13 {
+		t.Fatalf("首帧应带全部 13 条候选尝试，实际 polls=%d poll_total=%d", len(first.Polls), first.PollTotal)
+	}
+	// 第二帧：没有新增尝试，也必须全量输出（不折叠、不截断）
+	second, _ := s.buildDownloadBlock(prog, now.Add(time.Second))
+	if len(second.Polls) != 13 {
+		t.Fatalf("第二帧应仍输出全部 13 条（不折叠），实际 %d 条", len(second.Polls))
+	}
+	out := logging.RenderDownload(second)
+	if strings.Contains(out, "本轮无新增") {
+		t.Fatalf("不应再出现「本轮无新增」折叠行:\n%s", out)
+	}
+	for _, want := range []string{
+		"轮询    共 13 · 成功 1 · 失败 2 · 取消 10",
+		"#3 ✔ docker.1ms.run 206 4.304s 选中  reason=第一个通过 success-check=content 的候选",
+		"#13 ✘ docker.1panel.live — 213ms 已取消  reason=其他候选胜出（#3 docker.1ms.run 已命中）",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("面板输出缺少 %q:\n%s", want, out)
+		}
+	}
+	prog.finish("完成")
+	prog.unregister()
+}
+
+// TestFinishedBlockCarriesPolls 收尾块同样要带全部候选尝试：下载一结束就只剩进度数字的话，
+// 「谁试过、谁失败、谁被取消、为什么」就永久丢了（用户抱怨的信息丢失点）。
+func TestFinishedBlockCarriesPolls(t *testing.T) {
+	s := panelTestServer(t)
+	reg := s.progressOrInit()
+	prog := reg.register(dockerLogSourceClient, "adockero/tinc", "sha256:17977f56026a",
+		"GET", "/v2/adockero/tinc/blobs/sha256:17977f56026a", 45880718, 45880718, time.Now())
+	rec := newPanelRecorder()
+	rec.record(logging.PollEntry{OK: true, Host: "docker.1ms.run", Status: "206", Cost: "4.304s",
+		Result: logging.PollResultSelected, Reason: "第一个通过 success-check=content 的候选（状态码 206）"})
+	rec.record(logging.PollEntry{Host: "docker.1panel.live", Cost: "213ms",
+		Result: logging.PollResultCanceled, Reason: "其他候选胜出（#1 docker.1ms.run 已命中）"})
+	prog.attachRecorder(rec)
+	prog.finish("完成")
+	prog.unregister()
+
+	_, _, finished := reg.panelSnapshot(time.Now())
+	if len(finished) != 1 {
+		t.Fatalf("应有一个收尾块，实际 %d", len(finished))
+	}
+	if len(finished[0].Polls) != 2 || finished[0].PollTotal != 2 {
+		t.Fatalf("收尾块应带全部 2 条候选尝试，实际 polls=%d poll_total=%d",
+			len(finished[0].Polls), finished[0].PollTotal)
+	}
+	out := logging.RenderDownload(finished[0])
+	if !strings.Contains(out, "轮询    共 2 · 成功 1 · 失败 0 · 取消 1") {
+		t.Fatalf("收尾块轮询段汇总行不符:\n%s", out)
+	}
+	if !strings.Contains(out, "reason=其他候选胜出（#1 docker.1ms.run 已命中）") {
+		t.Fatalf("收尾块轮询段缺少取消原因:\n%s", out)
+	}
 }

@@ -40,7 +40,7 @@ type PartialInfo struct {
 	Gap int64
 }
 
-// PollEntry 一次候选尝试（轮询段一行）。
+// PollEntry 一次候选尝试（轮询段一行；每个面板周期全量输出，不折叠、不截断）。
 type PollEntry struct {
 	// N 尝试序号（按发生顺序，1 基）。
 	N int
@@ -52,11 +52,29 @@ type PollEntry struct {
 	Status string
 	// Cost 本次尝试耗时（人类可读，如 0.31s）。
 	Cost string
-	// Result 判定：选中 / probe-timeout / hard_fail=… / self-ref / 已取消 / 未过判据。
+	// Result 判定（固定枚举，面板状态汇总按它归类）：PollResultSelected / PollResultFailed /
+	// PollResultCanceled / PollResultSkipped，见下面四个常量。
 	Result string
-	// HardFail 硬失败原因（Result 为 hard_fail 时同值，便于 JSON 单独取）。
+	// Reason 为什么是这个结果（面向人的一句话）：选中 / 超时 / EOF / 状态码未过
+	// success-check / hard_fail=… / 其他候选胜出（带 #N host）/ 扫描总预算到期（带秒数）/
+	// 客户端断开或请求结束 / 未放行。面板渲染为 reason=…，JSON 用独立 reason 键。
+	// 规范：每个候选都必须带原因，禁止只给结果不给原因。
+	Reason string
+	// HardFail 硬失败原因（Result=PollResultFailed 且属硬失败时同值，便于 JSON 单独取）。
 	HardFail string
 }
+
+// 轮询段结果枚举（PollEntry.Result 的取值；面板状态汇总按这四个分类统计）。
+const (
+	// PollResultSelected 通过成功判据并成为最终返回（面板归类「成功」）。
+	PollResultSelected = "选中"
+	// PollResultFailed 尝试过但没有通过（含硬失败、自引用候选、未过 success-check）。
+	PollResultFailed = "失败"
+	// PollResultCanceled 被取消（其他候选胜出 / 扫描总预算到期 / 客户端断开或请求结束）。
+	PollResultCanceled = "已取消"
+	// PollResultSkipped 未放行（扫描已结束，本候选一次都没轮到）。
+	PollResultSkipped = "未放行"
+)
 
 // ChunkEntry 一路分块下载（分块段一行）。
 type ChunkEntry struct {
@@ -120,16 +138,10 @@ type DownloadBlock struct {
 	AvgBPS float64
 	// Elapsed 已耗时。
 	Elapsed time.Duration
-	// Polls 本周期新增的候选尝试（逐行）；为空时渲染折叠行。
+	// Polls 全部候选尝试（每个面板周期全量逐行输出；不折叠、不截断）。
 	Polls []PollEntry
-	// PollTotal 本下载累计候选尝试次数（折叠行用）。
+	// PollTotal 本下载累计候选尝试次数（含「未放行」补记条目）。
 	PollTotal int
-	// PollsFolded 本周期没有新增尝试（渲染「本轮无新增」折叠行）。
-	PollsFolded bool
-	// LastPoll 折叠行里的最近一次尝试结果（PollsFolded 时用）。
-	LastPoll PollEntry
-	// HasLastPoll 是否存在可展示的最近一次尝试。
-	HasLastPoll bool
 	// Chunks 分块（逐行，最多 8 行）；单源直连时为空且 SingleSource=true。
 	Chunks []ChunkEntry
 	// ChunkTotal 源总数。
@@ -231,21 +243,12 @@ func RenderDownload(b DownloadBlock) string {
 	if b.Result != "" {
 		sb.WriteString(panelLine("结果", b.Result))
 	}
-	// 轮询段：本周期有新增尝试就逐行，否则折叠成一行。
+	// 轮询段：先一行状态汇总，随后把**全部**候选尝试逐行列出（不折叠、不截断、每条带原因）。
 	if len(b.Polls) > 0 {
-		for i, p := range b.Polls {
-			label := "轮询"
-			if i > 0 {
-				label = ""
-			}
-			sb.WriteString(panelLine(label, pollText(p)))
+		sb.WriteString(panelLine("轮询", pollSummaryText(b.Polls)))
+		for _, p := range b.Polls {
+			sb.WriteString(panelLine("", pollText(p)))
 		}
-	} else if b.PollsFolded && b.PollTotal > 0 {
-		recent := "—"
-		if b.HasLastPoll {
-			recent = pollText(b.LastPoll)
-		}
-		sb.WriteString(panelLine("轮询", fmt.Sprintf("本轮无新增 · 累计 %d 次 · 最近 %s", b.PollTotal, recent)))
 	}
 	// 分块段：单源直连一行；多源逐行（带远端 host）。
 	if b.SingleSource {
@@ -305,36 +308,36 @@ func RenderSummary(s SummaryBlock) string {
 
 // jsonDownloadJSON 是 JSON 模式的下载块（字段名全英文短键、数值保持原始字节）。
 type jsonDownloadJSON struct {
-	Type          string         `json:"type"`
-	TS            string         `json:"ts"`
-	DL            uint64         `json:"dl"`
-	Mode          string         `json:"mode"`
-	Image         string         `json:"image,omitempty"`
-	Digest        string         `json:"digest,omitempty"`
-	Method        string         `json:"method,omitempty"`
-	Target        string         `json:"target,omitempty"`
-	Req           string         `json:"req,omitempty"`
-	Via           string         `json:"via"`
-	Total         int64          `json:"total"`
-	TotalSrc      string         `json:"total_src"`
-	ClientBytes   int64          `json:"client_bytes"`
-	UpstreamBytes int64          `json:"upstream_bytes"`
-	Percent       int            `json:"percent"`
-	SpeedBPS      int64          `json:"speed_bps"`
-	ClientSpeedBPS int64         `json:"client_speed_bps"`
-	AvgBPS        int64          `json:"avg_bps"`
-	ETASeconds    int64          `json:"eta_s"`
-	Elapsed       float64        `json:"elapsed_s"`
-	Client        string         `json:"client"`
-	Partial       *jsonPartial   `json:"partial,omitempty"`
-	Polls         []jsonPoll     `json:"polls,omitempty"`
-	PollTotal     int            `json:"poll_total"`
-	Chunks        []jsonChunk    `json:"chunks,omitempty"`
-	Cursor        int64          `json:"cursor"`
-	Gap           int64          `json:"gap"`
-	Alive         int            `json:"alive"`
-	Sources       int            `json:"sources"`
-	Result        string         `json:"result,omitempty"`
+	Type           string       `json:"type"`
+	TS             string       `json:"ts"`
+	DL             uint64       `json:"dl"`
+	Mode           string       `json:"mode"`
+	Image          string       `json:"image,omitempty"`
+	Digest         string       `json:"digest,omitempty"`
+	Method         string       `json:"method,omitempty"`
+	Target         string       `json:"target,omitempty"`
+	Req            string       `json:"req,omitempty"`
+	Via            string       `json:"via"`
+	Total          int64        `json:"total"`
+	TotalSrc       string       `json:"total_src"`
+	ClientBytes    int64        `json:"client_bytes"`
+	UpstreamBytes  int64        `json:"upstream_bytes"`
+	Percent        int          `json:"percent"`
+	SpeedBPS       int64        `json:"speed_bps"`
+	ClientSpeedBPS int64        `json:"client_speed_bps"`
+	AvgBPS         int64        `json:"avg_bps"`
+	ETASeconds     int64        `json:"eta_s"`
+	Elapsed        float64      `json:"elapsed_s"`
+	Client         string       `json:"client"`
+	Partial        *jsonPartial `json:"partial,omitempty"`
+	Polls          []jsonPoll   `json:"polls,omitempty"`
+	PollTotal      int          `json:"poll_total"`
+	Chunks         []jsonChunk  `json:"chunks,omitempty"`
+	Cursor         int64        `json:"cursor"`
+	Gap            int64        `json:"gap"`
+	Alive          int          `json:"alive"`
+	Sources        int          `json:"sources"`
+	Result         string       `json:"result,omitempty"`
 }
 
 type jsonPartial struct {
@@ -345,24 +348,28 @@ type jsonPartial struct {
 }
 
 type jsonPoll struct {
-	N        int    `json:"n"`
-	Cand     string `json:"cand"`
-	Status   string `json:"status,omitempty"`
-	CostMS   int64  `json:"cost_ms"`
-	Result   string `json:"result"`
+	N      int    `json:"n"`
+	Cand   string `json:"cand"`
+	Status string `json:"status,omitempty"`
+	CostMS int64  `json:"cost_ms"`
+	Result string `json:"result"`
+	// Reason 结果原因（选中 / 超时 / EOF / 状态码未过 success-check / hard_fail=… /
+	// 其他候选胜出（#N host）/ 扫描总预算到期（Ns）/ 请求结束 / 未放行）。
+	// 只新增字段：既有键名与结构完全不变，老消费者不受影响。
+	Reason   string `json:"reason,omitempty"`
 	HardFail string `json:"hard_fail,omitempty"`
 }
 
 type jsonChunk struct {
-	N        int     `json:"n"`
-	Start    int64   `json:"start"`
-	End      int64   `json:"end,omitempty"`
-	Remote   string  `json:"remote,omitempty"`
-	Got      int64   `json:"got"`
-	State    string  `json:"state"`
-	SpeedBPS int64   `json:"speed_bps"`
-	Reason   string  `json:"reason,omitempty"`
-	At       int64   `json:"at,omitempty"`
+	N        int    `json:"n"`
+	Start    int64  `json:"start"`
+	End      int64  `json:"end,omitempty"`
+	Remote   string `json:"remote,omitempty"`
+	Got      int64  `json:"got"`
+	State    string `json:"state"`
+	SpeedBPS int64  `json:"speed_bps"`
+	Reason   string `json:"reason,omitempty"`
+	At       int64  `json:"at,omitempty"`
 }
 
 // JSONDownload 把一个下载块渲染成一行 JSON（JSONL，供 LOG_TYPE=json 使用）。
@@ -373,7 +380,7 @@ func JSONDownload(b DownloadBlock) string {
 		Image: b.Image, Digest: b.Digest, Method: b.Method, Target: b.Target, Req: b.Req,
 		Via: viaLabel(b.Via), Total: b.Total, TotalSrc: totalSrcLabel(b.TotalSrc),
 		ClientBytes: b.ClientBytes, UpstreamBytes: b.UpstreamBytes,
-		Percent: percentOf(b.UpstreamBytes, b.Total),
+		Percent:  percentOf(b.UpstreamBytes, b.Total),
 		SpeedBPS: int64(b.UpstreamSpeedBPS), ClientSpeedBPS: int64(b.SpeedBPS),
 		AvgBPS: int64(b.AvgBPS), ETASeconds: etaSeconds(b.UpstreamBytes, b.Total, b.AvgBPS),
 		Elapsed: b.Elapsed.Seconds(), Client: b.ClientState,
@@ -385,7 +392,8 @@ func JSONDownload(b DownloadBlock) string {
 	}
 	for _, p := range b.Polls {
 		costMS := parseCostMS(p.Cost)
-		v.Polls = append(v.Polls, jsonPoll{N: p.N, Cand: p.Host, Status: p.Status, CostMS: costMS, Result: p.Result, HardFail: p.HardFail})
+		v.Polls = append(v.Polls, jsonPoll{N: p.N, Cand: p.Host, Status: p.Status, CostMS: costMS,
+			Result: p.Result, Reason: p.Reason, HardFail: p.HardFail})
 	}
 	for _, c := range b.Chunks {
 		v.Chunks = append(v.Chunks, jsonChunk{N: c.N, Start: c.Start, End: c.End, Remote: c.Remote,
@@ -400,15 +408,15 @@ func JSONDownload(b DownloadBlock) string {
 
 // jsonSummaryJSON 是 JSON 模式的汇总块。
 type jsonSummaryJSON struct {
-	Type    string             `json:"type"`
-	TS      string             `json:"ts"`
-	Active  int                `json:"active"`
-	ByS     map[string]int     `json:"by_source"`
-	BPS     map[string]int64   `json:"throughput_bps"`
-	New     int                `json:"new"`
-	Done    int                `json:"done"`
-	Failed  int                `json:"failed"`
-	Written int64              `json:"cache_written_bytes"`
+	Type    string           `json:"type"`
+	TS      string           `json:"ts"`
+	Active  int              `json:"active"`
+	ByS     map[string]int   `json:"by_source"`
+	BPS     map[string]int64 `json:"throughput_bps"`
+	New     int              `json:"new"`
+	Done    int              `json:"done"`
+	Failed  int              `json:"failed"`
+	Written int64            `json:"cache_written_bytes"`
 }
 
 // JSONSummary 把汇总块渲染成一行 JSON。
@@ -594,7 +602,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh%dm", h, m)
 }
 
-// pollText 渲染一行轮询结果：`#1 ✔ host 206 0.31s 选中`。
+// pollText 渲染一行轮询结果：`#1 ✔ host 206 0.31s 选中  reason=…`。
 func pollText(p PollEntry) string {
 	icon := "✘"
 	if p.OK {
@@ -604,9 +612,58 @@ func pollText(p PollEntry) string {
 	if status == "" {
 		status = "—"
 	}
-	return fmt.Sprintf("#%d %s %s %s %s %s", p.N, icon, emptyDash(p.Host), status,
+	line := fmt.Sprintf("#%d %s %s %s %s %s", p.N, icon, emptyDash(p.Host), status,
 		emptyDash(p.Cost), emptyDash(p.Result))
+	// 原因行内跟在判定后面：面板规范要求每个候选都带原因（不许只给「已取消」三个字）
+	if reason := strings.TrimSpace(p.Reason); reason != "" {
+		line += "  reason=" + reason
+	}
+	return line
 }
+
+// //////////////////  轮询段汇总（分类统计）  start  ////////////////////////////////////////
+
+// 轮询段状态分类名（汇总行按此顺序输出）。
+const (
+	pollCatOK         = "成功"
+	pollCatFail       = "失败"
+	pollCatCancel     = "取消"
+	pollCatUnreleased = "未放行"
+)
+
+// pollSummaryText 轮询段首行汇总：`共 5 · 成功 1 · 失败 3 · 取消 1`（未放行非 0 时追加
+// `· 未放行 N`）——先给一眼能看的账，再逐行给明细（用户明确要求：先汇总再逐个列出）。
+func pollSummaryText(polls []PollEntry) string {
+	counts := map[string]int{}
+	for _, p := range polls {
+		counts[pollCategory(p)]++
+	}
+	parts := []string{fmt.Sprintf("共 %d", len(polls))}
+	for _, cat := range []string{pollCatOK, pollCatFail, pollCatCancel} {
+		parts = append(parts, fmt.Sprintf("%s %d", cat, counts[cat]))
+	}
+	if n := counts[pollCatUnreleased]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%s %d", pollCatUnreleased, n))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// pollCategory 把一个候选尝试归类到汇总用的状态：OK 或「选中」恒为成功；「已取消」「未放行」
+// 按字面归类；其余（失败 / 硬失败 / 自引用 / 未过判据）一律算失败。
+func pollCategory(p PollEntry) string {
+	if p.OK || p.Result == PollResultSelected {
+		return pollCatOK
+	}
+	switch p.Result {
+	case PollResultCanceled:
+		return pollCatCancel
+	case PollResultSkipped:
+		return pollCatUnreleased
+	}
+	return pollCatFail
+}
+
+// //////////////////  轮询段汇总（分类统计）  end  //////////////////////////////////////////
 
 // chunkText 渲染一行分块：`#1 [0.0B – 30.9MB]  ← host  ● 74KB/s  已收 30.9MB  EOF`。
 func chunkText(c ChunkEntry) string {

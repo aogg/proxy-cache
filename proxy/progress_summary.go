@@ -136,8 +136,6 @@ type progressSummaryEntry struct {
 	}
 	// lastPanelFingerprint 上次已输出的面板指纹（变化检测：无变化整轮跳过）。
 	lastPanelFingerprint string
-	// lastPanelPolls 上次面板输出时已展示的轮询条数（只输出本周期新增尝试）。
-	lastPanelPolls int
 }
 
 // progressSummaryRow 一轮汇总快照的一行：锁内算好 bytes/total/区间速率素材，锁外只做
@@ -264,13 +262,19 @@ func (e *progressSummaryEntry) unregister() {
 	// 面板收尾块：仅在面板模式下追加（text 模式零额外行为），带结果才追加
 	var fb *logging.DownloadBlock
 	if e.resultTagged() && e.reg.panelEnabled.Load() {
-		via, totalSrc, requestID, result, partial, _, _, _ := e.panelState()
+		via, totalSrc, requestID, result, partial, _, _, rec := e.panelState()
 		b := logging.DownloadBlock{
 			ID: e.id, Mode: e.source, Image: e.image, Digest: e.digest, Method: e.method,
 			Target: e.target, Req: requestID, Via: via, TotalSrc: totalSrc,
 			ClientBytes: e.written.Load(), UpstreamBytes: e.written.Load(),
 			ClientState: "ok", Partial: partial, Result: result,
 			Elapsed: time.Since(e.startedAt),
+		}
+		// 轮询段：收尾块同样带**全部**候选尝试——否则下载一结束面板就只剩进度数字，
+		// 恰好丢掉「谁试过、谁失败、谁被取消、为什么」（用户抱怨的正是这个信息丢失点）
+		if rec != nil {
+			b.Polls = rec.snapshot()
+			b.PollTotal = len(b.Polls)
 		}
 		if b.Total = e.totalLength(); b.Total > 0 {
 			b.UpstreamBytes = b.Total

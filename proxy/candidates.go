@@ -19,6 +19,11 @@
 //   - 上游明确 4xx 载荷（见 upstream_status.go）：候选判据不过且状态码为 4xx（401 除外）
 //     时把「状态码+响应头+body（探测量级）」装进该候选失败错误；全部候选失败后随最终
 //     错误上浮，由客户端出口透传给 docker（网络/超时类失败与扫描预算耗尽不带载荷，仍 502）。
+//   - 面板轮询留痕（LOG_TYPE=line|json，见 log_panel.go）：每个候选的每次尝试都在面板
+//     「轮询」段留一条且必须带 reason——成功=选中；失败=超时 / EOF / 状态码未过
+//     success-check / hard_fail=…；已取消=其他候选胜出（#N host）/ 扫描总预算 Ns 到期 /
+//     客户端断开或请求结束；未轮到的候选补一条「未放行」。旧版把它们合并成一句无法分辨
+//     的 Debug（「其他候选胜出或扫描预算到期」），面板上只剩「已取消」三个字。
 
 package proxy
 
@@ -26,8 +31,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -115,6 +122,121 @@ type candidateOutcome struct {
 	won bool
 	// slot 该候选在本轮内的放行序号（用于胜出时豁免其自身的取消）。
 	slot int
+	// pollN 该候选在面板轮询段的序号（胜出时回填：#N，供其他候选的「已取消」原因引用）。
+	pollN int
+}
+
+// //////////////////  取消原因（面板轮询段 reason 的数据源）  start  //////////////////////////
+
+// scanCancelCause 记录本轮候选扫描的取消来源，供被取消的候选在面板上写清原因：
+//   - 其他候选胜出（写明胜出候选的面板序号 #N 与 host）；
+//   - 候选扫描总预算到期（写明预算大小）；
+//   - 客户端断开或请求结束（没有显式取消来源时的兜底）——注意当前实现里扫描 ctx 用
+//     WithoutCancel 与客户端断开解耦，这条分支平时不会命中，保留给「取消来源未登记的
+//     新增路径」，避免将来又退回到无法分辨的「已取消」。
+//
+// 写入顺序：胜出分支与预算定时器都在**真正调用 cancel 之前**写 cause，被取消的候选在
+// 观察到 ctx 已取消之后读取——先后顺序由 cancel/Done 的通道同步保证，因此读不到空原因。
+// 旧版把这两种情况合并成一句 Debug「其他候选胜出或扫描预算到期」，面板上只剩「已取消」
+// 三个字，用户无法判断是别人赢了还是预算掐的（正是要修的诊断断点）。
+type scanCancelCause struct {
+	mu sync.Mutex
+	// kind 取消来源：cancelCauseWinner / cancelCauseBudget / 空（未知，按客户端断开兜底）。
+	kind string
+	// winnerN 胜出候选在面板轮询段的序号（面板行 #N）。
+	winnerN int
+	// winnerHost 胜出候选的远端 host（面板行展示用）。
+	winnerHost string
+	// budget 候选扫描总预算（kind=cancelCauseBudget 时写进原因）。
+	budget time.Duration
+}
+
+// 取消来源枚举（scanCancelCause.kind）。
+const (
+	// cancelCauseWinner 其他候选胜出导致取消。
+	cancelCauseWinner = "winner"
+	// cancelCauseBudget 候选扫描总预算到期导致取消。
+	cancelCauseBudget = "budget"
+)
+
+// setWinner 记录「其他候选胜出」（胜出分支取消其余候选**之前**调用）。
+func (c *scanCancelCause) setWinner(n int, host string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.kind, c.winnerN, c.winnerHost = cancelCauseWinner, n, host
+	c.mu.Unlock()
+}
+
+// setBudget 记录「候选扫描总预算到期」（预算定时器触发时、cancel 之前调用）。
+func (c *scanCancelCause) setBudget(d time.Duration) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.kind, c.budget = cancelCauseBudget, d
+	c.mu.Unlock()
+}
+
+// text 返回面向人的取消原因（面板 reason=… 直接用，要求能一眼分辨三种来源）。
+func (c *scanCancelCause) text() string {
+	if c == nil {
+		return "客户端断开或请求结束"
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.kind {
+	case cancelCauseWinner:
+		return fmt.Sprintf("其他候选胜出（#%d %s 已命中）", c.winnerN, c.winnerHost)
+	case cancelCauseBudget:
+		return fmt.Sprintf("候选扫描总预算 %s（%d 秒）到期", c.budget, int(c.budget.Seconds()))
+	default:
+		return "客户端断开或请求结束"
+	}
+}
+
+// //////////////////  取消原因  end  ////////////////////////////////////////////////////////
+
+// candidateFailureReason 把一次候选尝试的失败错误翻成面板可读原因：规范要求写清要点
+// （超时 / EOF / 状态码未过 success-check / hard_fail=<reason>），不能只留一个「失败」。
+func candidateFailureReason(err error, hardFail string) string {
+	if err == nil {
+		return "失败（无错误信息）"
+	}
+	if hardFail != "" {
+		return "hard_fail=" + hardFail + "：" + truncate(err.Error(), 140)
+	}
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(lower, "probe-timeout") ||
+		strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
+		return "超时：" + truncate(msg, 160)
+	case errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || strings.Contains(lower, "eof"):
+		return "EOF（上游提前断流）：" + truncate(msg, 160)
+	}
+	return truncate(msg, 200)
+}
+
+// recordUnreleasedPolls 给「本轮从未放行」的候选补记「未放行」条目：扫描在胜出 / 预算
+// 到期时结束，排在后面的候选一次都没打过上游，本来不会产生任何尝试记录——不补记的话
+// 面板上的条目数会少于配置的候选数，看起来像候选凭空消失（用户要求：每个候选都要列出来，
+// 未轮到的也要写清为什么没轮到）。
+//
+// released 为最后一轮已放行的 slot 数（调用方在 schedMu 下读取后传入），start 为本轮
+// round-robin 起始下标（slot -> 候选下标 = (start+slot) % n）。
+func recordUnreleasedPolls(ctx context.Context, candidates []candidate, start, released int, cause *scanCancelCause) {
+	n := len(candidates)
+	why := cause.text()
+	for slot := released; slot < n; slot++ {
+		cand := candidates[(start+slot)%n]
+		recordPanelPoll(ctx, logging.PollEntry{
+			Host:   hostOf(cand.url),
+			Result: logging.PollResultSkipped,
+			Reason: "扫描在轮到本候选前结束：" + why,
+		})
+	}
 }
 
 // selectCandidate 在候选列表上执行「探测提速管线」，返回首个通过成功判据的候选探测
@@ -158,7 +280,13 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 	// 总预算按目标类型取：非 blob 20s（旧版一致）、docker blob 放大（见 candidateScanBudgetFor）
 	scanBudget := candidateScanBudgetFor(target, n, eff)
 	base, cancelBase := context.WithCancel(context.WithoutCancel(r.Context()))
-	scanTimer := time.AfterFunc(scanBudget, cancelBase)
+	// cause 记录「谁取消了这次扫描」：面板上每个「已取消」候选都要写明是「其他候选胜出
+	//（#N host）」还是「扫描总预算 Ns 到期」，不再合并成一句无法分辨的 Debug
+	cause := &scanCancelCause{}
+	scanTimer := time.AfterFunc(scanBudget, func() {
+		cause.setBudget(scanBudget) // 先记原因再 cancel：被取消者一定读得到
+		cancelBase()
+	})
 
 	var (
 		schedMu       sync.Mutex
@@ -197,6 +325,14 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 			}
 		}()
 		candLast := error(nil)
+		// recorded 本候选是否已写过面板轮询条目：用于兜底——已放行但一次尝试都没发出就被
+		// 取消时，也要留一条「已取消」，否则面板上该候选会凭空消失
+		recorded := false
+		// record 写一条面板轮询条目（返回面板序号，胜出时回填给其他候选的取消原因用）
+		record := func(p logging.PollEntry) int {
+			recorded = true
+			return recordPanelPoll(ctx, p)
+		}
 		if cand.selfRef {
 			// 自引用候选（路径目标下展开结果指向本次请求自身，如 docker 规则的
 			// template: $1——入站 Host 就是本代理）：回源等于请求本代理自己、必然递归
@@ -207,7 +343,8 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 			s.log.Debug("url-redirect 自引用候选跳过（展开后指向本次请求自身，回源会递归请求本代理）",
 				"round", roundNo, "round_total", totalRounds,
 				"index", idx, "template", tpl, "candidate", cand.url)
-			recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Result: "self-ref"})
+			record(logging.PollEntry{Host: hostOf(cand.url), Result: logging.PollResultFailed,
+				Reason: "自引用候选（展开后指向本次请求自身，回源会递归请求本代理），已跳过本节候选"})
 			done <- candidateOutcome{err: candLast, slot: slot}
 			return
 		}
@@ -224,18 +361,24 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 			cost := time.Since(candStart).Round(time.Millisecond)
 			if err != nil {
 				if ctx.Err() != nil {
-					// 被取消导致的失败（其他候选胜出/预算到期）：降为 Debug，避免噪音
-					s.log.Debug("url-redirect 候选已取消（其他候选胜出或扫描预算到期）",
-						"index", idx, "template", tpl, "candidate", cand.url)
-					recordPanelPoll(ctx, logging.PollEntry{Host: hostOf(cand.url), Cost: cost.String(), Result: "已取消"})
+					// 被取消导致的失败：原因由 scanCancelCause 给出——面板上必须能分辨
+					// 「其他候选胜出（谁、#几）」/「扫描总预算 Ns 到期」/「请求结束」，
+					// 旧版只留一句合并的 Debug（面板上只有「已取消」三个字）
+					reason := cause.text()
+					s.log.Debug("url-redirect 候选已取消",
+						"index", idx, "template", tpl, "candidate", cand.url, "reason", reason)
+					record(logging.PollEntry{Host: hostOf(cand.url), Cost: cost.String(),
+						Result: logging.PollResultCanceled, Reason: reason})
 					break
 				}
 				candLast = err
-				pe := logging.PollEntry{Host: hostOf(cand.url), Cost: cost.String(), Result: "失败"}
+				pe := logging.PollEntry{Host: hostOf(cand.url), Cost: cost.String(),
+					Result: logging.PollResultFailed}
 				if hard {
-					pe.Result, pe.HardFail = "hard_fail="+hardReason, hardReason
+					pe.HardFail = hardReason
 				}
-				recordPanelPoll(ctx, pe)
+				pe.Reason = candidateFailureReason(err, pe.HardFail)
+				record(pe)
 				s.log.Warn("url-redirect 候选请求失败",
 					"round", roundNo, "round_total", totalRounds,
 					"attempt", attempt, "attempt_total", itemTotalAttempts,
@@ -275,11 +418,16 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 					"index", idx, "template", tpl, "candidate", cand.url,
 					"check", eff.SuccessCheck, "status", res.status, "body_bytes", len(res.first))
 				pe := logging.PollEntry{Host: hostOf(cand.url), Status: strconv.Itoa(res.status),
-					Cost: cost.String(), Result: "未过判据"}
+					Cost: cost.String(), Result: logging.PollResultFailed}
 				if hard {
-					pe.Result, pe.HardFail = "hard_fail="+hardReason, hardReason
+					pe.HardFail = hardReason
+					pe.Reason = fmt.Sprintf("hard_fail=%s：状态码 %d 未过 success-check=%s（body %d 字节）",
+						hardReason, res.status, eff.SuccessCheck, len(res.first))
+				} else {
+					pe.Reason = fmt.Sprintf("状态码 %d 未过 success-check=%s（body %d 字节）",
+						res.status, eff.SuccessCheck, len(res.first))
 				}
-				recordPanelPoll(ctx, pe)
+				record(pe)
 				res.Close()
 				if hard {
 					s.log.Warn("url-redirect 候选硬失败，跳过原地重试直接下一候选",
@@ -297,12 +445,21 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 				"attempt", attempt, "attempt_total", itemTotalAttempts,
 				"index", idx, "template", tpl, "candidate", cand.url, "status", res.status,
 				"bytes", len(res.first), "cost", cost.String())
-			recordPanelPoll(ctx, logging.PollEntry{OK: true, Host: hostOf(cand.url),
-				Status: strconv.Itoa(res.status), Cost: cost.String(), Result: "选中"})
+			pollN := record(logging.PollEntry{OK: true, Host: hostOf(cand.url),
+				Status: strconv.Itoa(res.status), Cost: cost.String(),
+				Result: logging.PollResultSelected,
+				Reason: fmt.Sprintf("第一个通过 success-check=%s 的候选（状态码 %d）",
+					eff.SuccessCheck, res.status)})
 			res.onClose(cancel) // 该候选 ctx 的回收随流结束/放弃执行
 			handOff = true
-			done <- candidateOutcome{res: res, won: true, slot: slot}
+			done <- candidateOutcome{res: res, won: true, slot: slot, pollN: pollN}
 			return
+		}
+		// 兜底：已放行但一次尝试都没有发出（放行瞬间就被取消）——仍要留一条「已取消」
+		// 并写清原因，否则面板上该候选凭空消失
+		if !recorded {
+			record(logging.PollEntry{Host: hostOf(cand.url), Result: logging.PollResultCanceled,
+				Reason: cause.text()})
 		}
 		done <- candidateOutcome{err: candLast, slot: slot}
 	}
@@ -417,6 +574,8 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 			hedgeTimer.Stop()
 			hedgeTimer = nil
 		}
+		// 先记「谁胜出」再取消其余候选：被取消者的面板原因要写清 #N 与胜出 host
+		cause.setWinner(winner.pollN, hostOf(candidates[(start+winner.slot)%n].url))
 		for slot, c := range cancels {
 			if c != nil && slot != winner.slot {
 				c()
@@ -426,6 +585,7 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 		// 其中「竞速并列同时胜出」的极端并发下落在本通道里的胜出探测结果（活体 body +
 		// 看门狗/超时预算）必须在这里统一释放，否则连接与计时器泄漏
 		remain := released - received
+		releasedFinal := released
 		schedMu.Unlock()
 		for i := 0; i < remain; i++ {
 			oc := <-done
@@ -433,6 +593,8 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 				oc.res.Close()
 			}
 		}
+		// 未放行补记：胜出时排在后面的候选一次都没轮到，也要在面板上出现并写清原因
+		recordUnreleasedPolls(r.Context(), candidates, start, releasedFinal, cause)
 		winner.res.onClose(cancelBase)
 		return winner.res, nil
 	}
@@ -445,8 +607,12 @@ func (s *Server) selectCandidate(r *http.Request, candidates []candidate, eff co
 		hedgeTimer.Stop()
 		hedgeTimer = nil
 	}
+	releasedFinal := released
 	schedMu.Unlock()
 	cancelBase()
+	// 未放行补记：预算到期时没轮到 / 没跑完的候选同样要在面板上出现（自然全败时 released==n，
+	// 本调用不产生任何条目）
+	recordUnreleasedPolls(r.Context(), candidates, start, releasedFinal, cause)
 	if budgetExhausted {
 		// 扫描总预算耗尽按超时语义：剥离可能存在的 4xx 透传载荷（载荷只允许在
 		// 「拿到了明确上游响应」的失败上浮；预算到期属超时类失败，维持 502）

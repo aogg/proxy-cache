@@ -43,33 +43,31 @@ import (
 type panelRecorderKey struct{}
 
 // panelRecorder 记录一个请求的全部候选尝试（面板轮询段的数据源）。
-// 面板只展示「本周期新增」的尝试：entries 全量保留（有上限），entry 侧记住上次已展示
-// 的条数，渲染时取新增部分。
+// 面板每个周期都把**全部**尝试逐行输出（不折叠、不截断）：条目数天然有界——候选数 ×
+// （1+item 原地重试）×(1+整轮重试) + 「未放行」补记，因此不再设丢弃上限（旧版
+// maxPanelPolls=64 会在候选多 / 重试多的配置下把第 65 条起悄悄丢掉，这本身就是
+// 用户抱怨的「信息丢失」的一部分）。
 type panelRecorder struct {
 	mu    sync.Mutex
 	polls []logging.PollEntry
 }
 
-// maxPanelPolls 单个下载保留的候选尝试上限（防病态配置下无限增长；超出丢弃最早的）。
-const maxPanelPolls = 64
-
 // newPanelRecorder 创建记录器。
 func newPanelRecorder() *panelRecorder { return &panelRecorder{} }
 
-// record 追加一条候选尝试。
-func (r *panelRecorder) record(p logging.PollEntry) {
+// record 追加一条候选尝试并返回其面板序号（1 基；序号由记录器统一分配，跨轮次递增）。
+// 返回值供调用方回填「谁胜出」——面板上其他候选的「已取消」原因要写清胜出者的 #N。
+func (r *panelRecorder) record(p logging.PollEntry) int {
 	if r == nil {
-		return
+		return 0
 	}
 	r.mu.Lock()
-	if len(r.polls) >= maxPanelPolls {
-		r.polls = append(r.polls[:0], r.polls[len(r.polls)-maxPanelPolls+1:]...)
-	}
+	defer r.mu.Unlock()
 	if p.N <= 0 {
 		p.N = len(r.polls) + 1 // 序号由记录器统一分配（跨轮次递增）
 	}
 	r.polls = append(r.polls, p)
-	r.mu.Unlock()
+	return p.N
 }
 
 // snapshot 返回全部尝试的快照（拷贝，锁外渲染）。
@@ -381,7 +379,6 @@ func (s *Server) buildDownloadBlock(e *progressSummaryEntry, now time.Time) (log
 		upstream int64
 		at       time.Time
 	}{written: written, upstream: upstream, at: now}
-	lastPolls := e.lastPanelPolls
 	e.panelMu.Unlock()
 
 	elapsed := now.Sub(e.startedAt)
@@ -389,23 +386,10 @@ func (s *Server) buildDownloadBlock(e *progressSummaryEntry, now time.Time) (log
 	if elapsed > 0 {
 		avg = float64(written) / elapsed.Seconds()
 	}
-	// 轮询：只展示上次面板之后新增的尝试；没有新增则折叠成「累计 N 次 · 最近 …」
+	// 轮询：全部候选尝试每个周期都全量输出（不折叠成「本轮无新增」、不截断只留最近 8 条）
 	var polls []logging.PollEntry
-	pollTotal := 0
 	if rec != nil {
-		all := rec.snapshot()
-		pollTotal = len(all)
-		if lastPolls < len(all) {
-			polls = all[lastPolls:]
-			if len(polls) > 8 {
-				polls = polls[len(polls)-8:]
-			}
-		}
-	}
-	hasLast := pollTotal > 0
-	var lastPoll logging.PollEntry
-	if hasLast {
-		lastPoll = rec.snapshot()[pollTotal-1]
+		polls = rec.snapshot()
 	}
 	block := logging.DownloadBlock{
 		ID: e.id, Mode: e.source, Image: e.image, Digest: e.digest,
@@ -415,8 +399,7 @@ func (s *Server) buildDownloadBlock(e *progressSummaryEntry, now time.Time) (log
 		ClientState: "ok", Partial: partial,
 		SpeedBPS: clientBPS, UpstreamSpeedBPS: upstreamBPS, AvgBPS: avg,
 		Elapsed: elapsed,
-		Polls:   polls, PollTotal: pollTotal, PollsFolded: len(polls) == 0,
-		LastPoll: lastPoll, HasLastPoll: hasLast,
+		Polls:   polls, PollTotal: len(polls),
 		Chunks: chunks, ChunkTotal: total, ChunkAlive: alive, ChunkPruned: pruned,
 		SingleSource: total <= 1, SourceHost: singleHost,
 		Cursor: cursor, Gap: gap, GapOff: gapOff,
@@ -438,11 +421,10 @@ func (s *Server) buildDownloadBlock(e *progressSummaryEntry, now time.Time) (log
 		block.ChunkFoldedEOF = eof
 	}
 	// 变化检测：字节数/代理侧/结果/候选新增/分块状态任一变化即视为「本轮有变化」
-	fingerprint := fmt.Sprintf("%d|%d|%s|%d|%s", written, upstream, result, pollTotal, chunkState)
+	fingerprint := fmt.Sprintf("%d|%d|%s|%d|%s", written, upstream, result, len(polls), chunkState)
 	e.panelMu.Lock()
 	changed := fingerprint != e.lastPanelFingerprint
 	e.lastPanelFingerprint = fingerprint
-	e.lastPanelPolls = pollTotal
 	e.panelMu.Unlock()
 	return block, changed
 }
@@ -552,13 +534,14 @@ func (e *progressSummaryEntry) resultTagged() bool {
 	return e.result != ""
 }
 
-// recordPanelPoll 把一次候选尝试写进请求上下文里的记录器（无记录器时静默跳过）。
-func recordPanelPoll(ctx context.Context, p logging.PollEntry) {
+// recordPanelPoll 把一次候选尝试写进请求上下文里的记录器（无记录器时静默跳过），
+// 返回该条目的面板序号（1 基；无记录器时返回 0）。
+func recordPanelPoll(ctx context.Context, p logging.PollEntry) int {
 	rec := panelRecorderFrom(ctx)
 	if rec == nil {
-		return
+		return 0
 	}
-	rec.record(p)
+	return rec.record(p)
 }
 
 // hostOf 从候选/源 URL 取 host（面板只显示远端 host，不显示整条长 URL）；

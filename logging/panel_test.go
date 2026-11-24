@@ -2,6 +2,7 @@ package logging
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -99,7 +100,7 @@ func TestRenderChunkShowsRemote(t *testing.T) {
 // TestRenderChunkFolded 超过 8 个源折叠成一行统计。
 func TestRenderChunkFolded(t *testing.T) {
 	b := DownloadBlock{ID: 1, Mode: "client", Total: 1000,
-		Chunks: []ChunkEntry{{N: 1, Start: 0, HasEnd: true, End: 100, Remote: "a.example", State: "下载中"}},
+		Chunks:       []ChunkEntry{{N: 1, Start: 0, HasEnd: true, End: 100, Remote: "a.example", State: "下载中"}},
 		ChunksFolded: 7, ChunkFoldedIdle: 5, ChunkFoldedEOF: 2, ChunkPruned: 2,
 		ChunkTotal: 15, Cursor: 1000}
 	out := RenderDownload(b)
@@ -108,10 +109,92 @@ func TestRenderChunkFolded(t *testing.T) {
 	}
 }
 
+// TestRenderPollsAllListedWithReason 轮询段新语义：先一行状态汇总，随后**全部**候选尝试
+// 逐行列出且每条都带 reason——不折叠成「本轮无新增」、不截断只留最近 8 条、不省略原因。
+// 现场原型：docker 拉 adockero/tinc 的一层 blob，11 个候选里只有 5 个真被尝试过，
+// 面板却只留「累计 5 次 · 最近 #5 …已取消」，用户看不到谁赢、谁为什么取消。
+func TestRenderPollsAllListedWithReason(t *testing.T) {
+	winner := "其他候选胜出（#3 docker.1ms.run 已命中）"
+	polls := []PollEntry{
+		{N: 1, Host: "registry-proxy-cache.linkease.net:5480", Result: PollResultFailed,
+			Reason: "自引用候选（展开后指向本次请求自身，回源会递归请求本代理），已跳过本节候选"},
+		{N: 2, Host: "mirror.houlang.cloud", Status: "200", Cost: "89ms", Result: PollResultFailed,
+			HardFail: "html-error-page",
+			Reason:   "hard_fail=html-error-page：状态码 200 未过 success-check=content（body 3914 字节）"},
+		{N: 3, OK: true, Host: "docker.1ms.run", Status: "206", Cost: "4.304s", Result: PollResultSelected,
+			Reason: "第一个通过 success-check=content 的候选（状态码 206）"},
+		{N: 4, Host: "docker.1panel.live", Cost: "213ms", Result: PollResultCanceled, Reason: winner},
+		{N: 5, Host: "kspeeder.common-all:5443", Cost: "2.214s", Result: PollResultCanceled, Reason: winner},
+	}
+	for i := 6; i <= 11; i++ {
+		polls = append(polls, PollEntry{N: i, Host: fmt.Sprintf("mirror-%d.example", i),
+			Result: PollResultSkipped, Reason: "扫描在轮到本候选前结束：" + winner})
+	}
+	out := RenderDownload(DownloadBlock{ID: 28, Mode: "client", Total: 45880718, TotalSrc: "upstream",
+		ClientBytes: 1000000, UpstreamBytes: 1000000, Polls: polls, PollTotal: len(polls)})
+
+	// 折叠行与旧文案必须彻底消失
+	for _, banned := range []string{"本轮无新增", "累计", "最近 #"} {
+		if strings.Contains(out, banned) {
+			t.Fatalf("轮询段不应再出现折叠行 %q:\n%s", banned, out)
+		}
+	}
+	wants := []string{
+		// 第一行：状态汇总（按实际结果统计；未放行非 0 才追加）
+		"轮询    共 11 · 成功 1 · 失败 2 · 取消 2 · 未放行 6",
+		// 每条候选一行，且都带原因
+		"#1 ✘ registry-proxy-cache.linkease.net:5480 — — 失败  reason=自引用候选",
+		"#2 ✘ mirror.houlang.cloud 200 89ms 失败  reason=hard_fail=html-error-page",
+		"#3 ✔ docker.1ms.run 206 4.304s 选中  reason=第一个通过 success-check=content 的候选",
+		"#4 ✘ docker.1panel.live — 213ms 已取消  reason=" + winner,
+		"#5 ✘ kspeeder.common-all:5443 — 2.214s 已取消  reason=" + winner,
+		"#11 ✘ mirror-11.example — — 未放行  reason=扫描在轮到本候选前结束：" + winner,
+	}
+	for _, want := range wants {
+		if !strings.Contains(out, want) {
+			t.Fatalf("轮询段缺少 %q:\n%s", want, out)
+		}
+	}
+	// 11 个候选一个都不能少
+	if got := strings.Count(out, "✘") + strings.Count(out, "✔"); got != len(polls) {
+		t.Fatalf("应逐行渲染 %d 个候选，实际 %d:\n%s", len(polls), got, out)
+	}
+	t.Logf("轮询段真实渲染输出:\n%s", out)
+}
+
+// TestRenderPollsSummaryNoUnreleased 未放行为 0 时汇总行不追加该项（保持行短）。
+func TestRenderPollsSummaryNoUnreleased(t *testing.T) {
+	out := RenderDownload(DownloadBlock{ID: 1, Mode: "client",
+		Polls: []PollEntry{
+			{N: 1, OK: true, Host: "a.example", Status: "206", Cost: "1ms", Result: PollResultSelected, Reason: "选中"},
+		}})
+	if !strings.Contains(out, "轮询    共 1 · 成功 1 · 失败 0 · 取消 0\n") {
+		t.Fatalf("未放行为 0 时汇总行不应带该项:\n%s", out)
+	}
+}
+
+// TestPollSummaryTextCategories pollSummaryText 的分类：OK 与「选中」都算成功，「已取消」
+// 算取消，「未放行」算未放行，其余（失败/硬失败/自引用）一律算失败。
+func TestPollSummaryTextCategories(t *testing.T) {
+	got := pollSummaryText([]PollEntry{
+		{N: 1, OK: true, Result: PollResultSelected},
+		{N: 2, Result: PollResultSelected}, // OK 漏填也按「选中」算成功
+		{N: 3, Result: PollResultFailed},
+		{N: 4, Result: "hard_fail=upstream-403"},
+		{N: 5, Result: "self-ref"},
+		{N: 6, Result: PollResultCanceled},
+		{N: 7, Result: PollResultSkipped},
+	})
+	want := "共 7 · 成功 2 · 失败 3 · 取消 1 · 未放行 1"
+	if got != want {
+		t.Fatalf("pollSummaryText = %q, 期望 %q", got, want)
+	}
+}
+
 // TestRenderSummary 总总结块：活跃数按来源分布、吞吐、本轮计数。
 func TestRenderSummary(t *testing.T) {
 	out := RenderSummary(SummaryBlock{
-		Time: time.Date(2026, 11, 21, 18, 47, 17, 0, time.Local),
+		Time:   time.Date(2026, 11, 21, 18, 47, 17, 0, time.Local),
 		Active: 4, Client: 1, Ridealong: 1, Resume: 1, Prefetch: 1,
 		ClientBPS: 75997, PrefetchBPS: 8808038, TotalBPS: 8884035,
 		New: 2, Done: 1, Failed: 1, CacheWritten: 566231040,
@@ -137,8 +220,9 @@ func TestJSONDownloadKeySet(t *testing.T) {
 		ClientBytes: 58216448, UpstreamBytes: 131072000, ClientState: "ok",
 		SpeedBPS: 75997, UpstreamSpeedBPS: 100000, AvgBPS: 105000, Elapsed: 572 * time.Second,
 		Partial: PartialInfo{Present: true, Bytes: 58216448},
-		Polls:   []PollEntry{{N: 1, OK: true, Host: "docker.1panel.live", Status: "206", Cost: "0.31s", Result: "选中"}},
-		Chunks:  []ChunkEntry{{N: 1, Start: 0, End: 32400998, HasEnd: true, Remote: "docker.1panel.live", State: "EOF", Got: 32400998, SpeedBPS: 75776}},
+		Polls: []PollEntry{{N: 1, OK: true, Host: "docker.1panel.live", Status: "206", Cost: "0.31s",
+			Result: PollResultSelected, Reason: "第一个通过 success-check=content 的候选（状态码 206）"}},
+		Chunks:    []ChunkEntry{{N: 1, Start: 0, End: 32400998, HasEnd: true, Remote: "docker.1panel.live", State: "EOF", Got: 32400998, SpeedBPS: 75776}},
 		PollTotal: 1, Cursor: 58216448, ChunkTotal: 1, ChunkAlive: 1,
 	})
 	var m map[string]any
@@ -161,6 +245,11 @@ func TestJSONDownloadKeySet(t *testing.T) {
 	chunks := m["chunks"].([]any)
 	if remote := chunks[0].(map[string]any)["remote"]; remote != "docker.1panel.live" {
 		t.Fatalf("chunks[0].remote 不符: %v", remote)
+	}
+	// polls[].reason：JSON 模式同样要带原因（只新增字段，既有键一个不少）
+	polls := m["polls"].([]any)
+	if reason, _ := polls[0].(map[string]any)["reason"].(string); !strings.Contains(reason, "success-check=content") {
+		t.Fatalf("polls[0].reason 应带上原因，实际 %v", polls[0])
 	}
 }
 
